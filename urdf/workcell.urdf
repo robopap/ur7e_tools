@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+
+<robot name="workcell">
+
+  <link name="world"/>
+
+  <link name="table">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh
+          filename="package://ur7e_tools/meshes/table.stl"
+          scale="0.001 0.001 0.001"/>
+      </geometry>
+    
+      <material name="workcell_gray">
+        <color rgba="0.45 0.45 0.45 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="world_to_table" type="fixed">
+    <parent link="world"/>
+    <child link="table"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>
