@@ -19,6 +19,7 @@ from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractScrollArea,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -32,11 +33,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QStyle,
     QVBoxLayout,
     QWidget,
 )
+
+from ur7e_tools.nansense_live_widget import NansenseLiveWidget
 
 
 FORCE_BAR_LIMIT = 50.0
@@ -1069,6 +1073,69 @@ class WorkcellUI(QMainWindow):
         )
 
         # =====================================================
+        # LOWER WORKSPACE
+        # Left: F/T + ROS output
+        # Right: live NANSENSE skeleton
+        # =====================================================
+
+        lower_workspace = QWidget()
+        lower_workspace_layout = QHBoxLayout(lower_workspace)
+        lower_workspace_layout.setContentsMargins(0, 0, 0, 0)
+        lower_workspace_layout.setSpacing(10)
+
+        sensor_column = QWidget()
+        sensor_layout = QVBoxLayout(sensor_column)
+        sensor_layout.setContentsMargins(0, 0, 0, 0)
+        sensor_layout.setSpacing(7)
+
+        # Keep expanding sensor/ROS sections from changing the
+        # top-level window minimum height. If the left column needs
+        # more vertical space, it scrolls inside its own half instead.
+        sensor_scroll = QScrollArea()
+        sensor_scroll.setObjectName("sensorScroll")
+        sensor_scroll.setWidget(sensor_column)
+        sensor_scroll.setWidgetResizable(True)
+        sensor_scroll.setFrameShape(QFrame.NoFrame)
+        sensor_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+
+        # QScrollArea has its own viewport, which otherwise uses the
+        # desktop/default palette (white on this system).
+        sensor_scroll.setStyleSheet(
+            """
+            QScrollArea#sensorScroll {
+                background: #202124;
+                border: 0px;
+            }
+
+            QScrollArea#sensorScroll > QWidget > QWidget {
+                background: #202124;
+            }
+            """
+        )
+        sensor_scroll.setSizeAdjustPolicy(
+            QAbstractScrollArea.AdjustIgnored
+        )
+
+        self.nansense_widget = NansenseLiveWidget()
+        self.nansense_widget.setMinimumWidth(520)
+
+        lower_workspace_layout.addWidget(
+            sensor_scroll,
+            1,
+        )
+        lower_workspace_layout.addWidget(
+            self.nansense_widget,
+            1,
+        )
+
+        main_layout.addWidget(
+            lower_workspace,
+            1,
+        )
+
+        # =====================================================
         # F/T RECORDING FOLDER + COLLAPSIBLE MONITORS
         # Visible only for Dual UR7e + Real Robot(s)
         # =====================================================
@@ -1125,7 +1192,7 @@ class WorkcellUI(QMainWindow):
             self.recording_folder_button
         )
 
-        main_layout.addWidget(
+        sensor_layout.addWidget(
             self.recording_folder_frame
         )
 
@@ -1154,18 +1221,17 @@ class WorkcellUI(QMainWindow):
                 "robot2",
                 "Robot 2 — Internal F/T",
             ),
-            0,
             1,
+            0,
         )
 
         internal_wrench_layout.setColumnStretch(0, 1)
-        internal_wrench_layout.setColumnStretch(1, 1)
 
         self.internal_wrench_section.body_layout.addLayout(
             internal_wrench_layout
         )
 
-        main_layout.addWidget(
+        sensor_layout.addWidget(
             self.internal_wrench_section
         )
 
@@ -1183,7 +1249,7 @@ class WorkcellUI(QMainWindow):
             )
         )
 
-        main_layout.addWidget(
+        sensor_layout.addWidget(
             self.external_wrench_section
         )
 
@@ -1208,11 +1274,11 @@ class WorkcellUI(QMainWindow):
             self.log_output
         )
 
-        main_layout.addWidget(
+        sensor_layout.addWidget(
             self.ros_output_section
         )
 
-        main_layout.addStretch(1)
+        sensor_layout.addStretch(1)
 
     # =========================================================
     # Wrench monitoring UI
@@ -3463,6 +3529,12 @@ class WorkcellUI(QMainWindow):
             "wrench_refresh_timer",
         ):
             self.wrench_refresh_timer.stop()
+
+        if hasattr(
+            self,
+            "nansense_widget",
+        ):
+            self.nansense_widget.shutdown()
 
         if hasattr(self, "wrench_listener"):
             self.stop_all_wrench_recordings(silent=True)
