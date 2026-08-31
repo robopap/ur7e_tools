@@ -377,10 +377,7 @@ def launch_setup(context, *args, **kwargs):
         ],
     )
 
-    if (
-        use_fake_hardware.perform(context).lower() == "true"
-        and use_2fg7.perform(context).lower() == "true"
-    ):
+    if use_2fg7.perform(context).lower() == "true":
         rsp_joint_states_topic = "visual_joint_states"
     else:
         rsp_joint_states_topic = "joint_states"

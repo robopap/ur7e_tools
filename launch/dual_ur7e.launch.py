@@ -49,7 +49,6 @@ def generate_launch_description():
                     "robot1_gripper_gripper_joint"
             }
         ],
-        condition=IfCondition(use_fake_hardware),
     )
 
     gripper_visualizer_robot2 = Node(
@@ -64,7 +63,6 @@ def generate_launch_description():
                     "robot2_gripper_gripper_joint"
             }
         ],
-        condition=IfCondition(use_fake_hardware),
     )
 
     rviz_config = os.path.join(    own_share,    "config",    "dual_ur7e.rviz",)
