@@ -4,11 +4,12 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
 
 
-OPEN_POSITION = 0.0305
 CLOSED_POSITION = 0.0115
+OPEN_POSITION = 0.0305
 
 
 class GripperVisualizer(Node):
@@ -27,12 +28,9 @@ class GripperVisualizer(Node):
             .string_value
         )
 
-        self.gripper_position = OPEN_POSITION
+        self.normalized_position = 1.0
         self.latest_robot_state = None
 
-        # IMPORTANT:
-        # We READ the controller joint_states.
-        # We NEVER write back to joint_states.
         self.subscription = self.create_subscription(
             JointState,
             "joint_states",
@@ -40,13 +38,20 @@ class GripperVisualizer(Node):
             10,
         )
 
-        # Combined state used only for visualization.
         self.publisher = self.create_publisher(
             JointState,
             "visual_joint_states",
             10,
         )
 
+        self.position_subscription = self.create_subscription(
+            Float64,
+            "gripper_visual/position",
+            self.position_callback,
+            10,
+        )
+
+        # Keep OPEN/CLOSE services for compatibility with older UI versions.
         self.create_service(
             Trigger,
             "gripper_visual/open",
@@ -60,12 +65,25 @@ class GripperVisualizer(Node):
         )
 
         self.get_logger().info(
-            f"2FG7 simulation visualizer ready: "
-            f"{self.gripper_joint_name}"
+            f"2FG7 visualizer ready: {self.gripper_joint_name}"
+        )
+
+    def normalized_to_joint_position(self):
+        return (
+            CLOSED_POSITION
+            + self.normalized_position
+            * (OPEN_POSITION - CLOSED_POSITION)
         )
 
     def joint_state_callback(self, msg):
         self.latest_robot_state = msg
+        self.publish_combined_state()
+
+    def position_callback(self, msg):
+        self.normalized_position = max(
+            0.0,
+            min(1.0, float(msg.data)),
+        )
         self.publish_combined_state()
 
     def publish_combined_state(self):
@@ -74,33 +92,28 @@ class GripperVisualizer(Node):
             return
 
         original = self.latest_robot_state
+        original_names = list(original.name)
 
         msg = JointState()
-
-        # Fresh timestamp for robot_state_publisher
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = original.header.frame_id
-
-        original_names = list(original.name)
 
         msg.name = list(original.name)
         msg.position = list(original.position)
 
-        # Preserve velocity/effort only if structurally valid.
         if len(original.velocity) == len(original_names):
             msg.velocity = list(original.velocity)
 
         if len(original.effort) == len(original_names):
             msg.effort = list(original.effort)
 
-        # Normally the gripper joint is NOT in the UR controller state.
-        # Handle both cases safely anyway.
-        if self.gripper_joint_name in msg.name:
+        gripper_position = self.normalized_to_joint_position()
 
+        if self.gripper_joint_name in msg.name:
             index = msg.name.index(self.gripper_joint_name)
 
             if index < len(msg.position):
-                msg.position[index] = self.gripper_position
+                msg.position[index] = gripper_position
 
             if len(msg.velocity) == len(msg.name):
                 msg.velocity[index] = 0.0
@@ -109,9 +122,8 @@ class GripperVisualizer(Node):
                 msg.effort[index] = 0.0
 
         else:
-
             msg.name.append(self.gripper_joint_name)
-            msg.position.append(self.gripper_position)
+            msg.position.append(gripper_position)
 
             if len(msg.velocity) == len(original_names):
                 msg.velocity.append(0.0)
@@ -122,39 +134,29 @@ class GripperVisualizer(Node):
         self.publisher.publish(msg)
 
     def open_callback(self, request, response):
-
-        self.gripper_position = OPEN_POSITION
-
-        # Update RViz immediately.
+        self.normalized_position = 1.0
         self.publish_combined_state()
 
         response.success = True
-        response.message = "2FG7 opened"
-
+        response.message = "2FG7 visualization opened"
         return response
 
     def close_callback(self, request, response):
-
-        self.gripper_position = CLOSED_POSITION
-
-        # Update RViz immediately.
+        self.normalized_position = 0.0
         self.publish_combined_state()
 
         response.success = True
-        response.message = "2FG7 closed"
-
+        response.message = "2FG7 visualization closed"
         return response
 
 
 def main(args=None):
 
     rclpy.init(args=args)
-
     node = GripperVisualizer()
 
     try:
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         pass
 
