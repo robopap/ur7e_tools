@@ -42,9 +42,6 @@
     tcp_pose_broadcaster:
       type: pose_broadcaster/PoseBroadcaster
 
-    passthrough_trajectory_controller:
-      type: ur_controllers/PassthroughTrajectoryController
-
     ur_configuration_controller:
       type: ur_controllers/URConfigurationController
 
