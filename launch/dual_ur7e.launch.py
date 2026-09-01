@@ -92,6 +92,9 @@ def generate_launch_description():
     robot1_controllers = os.path.join(own_share, "config", "robot1_ur_controllers.yaml")
     robot2_controllers = os.path.join(own_share, "config", "robot2_ur_controllers.yaml")
 
+    robot1_kinematics = os.path.join(own_share, "config", "calibration", "robot1_ur7e_calibration.yaml")
+    robot2_kinematics = os.path.join(own_share, "config", "calibration", "robot2_ur7e_calibration.yaml")
+
     ur_launch = os.path.join(
         own_share,
         "launch",
@@ -118,6 +121,7 @@ def generate_launch_description():
                     "base_yaw": robot1_yaw,
 
                     "controllers_file": robot1_controllers,
+                    "kinematics_params_file": robot1_kinematics,
 
                     "use_fake_hardware": use_fake_hardware,
                     "fake_sensor_commands": "true",
@@ -156,6 +160,7 @@ def generate_launch_description():
                     "base_yaw": robot2_yaw,
 
                     "controllers_file": robot2_controllers,
+                    "kinematics_params_file": robot2_kinematics,
 
                     "use_fake_hardware": use_fake_hardware,
                     "fake_sensor_commands": "true",

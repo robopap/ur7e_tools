@@ -276,7 +276,7 @@ def launch_setup(context, *args, **kwargs):
         executable="ros2_control_node",
         parameters=[
             robot_description,
-            update_rate_config_file,
+            {"update_rate": update_rate},
             ParameterFile(initial_joint_controllers, allow_substs=True),
             {"verify_payload_on_set": NotSubstitution(use_fake_hardware)},
         ],
@@ -289,7 +289,7 @@ def launch_setup(context, *args, **kwargs):
         executable="ur_ros2_control_node",
         parameters=[
             robot_description,
-            update_rate_config_file,
+            {"update_rate": update_rate},
             ParameterFile(initial_joint_controllers, allow_substs=True),
             {"verify_payload_on_set": NotSubstitution(use_fake_hardware)},
         ],
@@ -425,6 +425,10 @@ def launch_setup(context, *args, **kwargs):
                 "controller_manager",
                 "--controller-manager-timeout",
                 controller_spawner_timeout,
+                "--service-call-timeout",
+                "30",
+                "--switch-timeout",
+                "10",
             ]
             + inactive_flags
             + controllers,
