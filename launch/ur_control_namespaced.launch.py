@@ -42,7 +42,10 @@ from launch.actions import (
     IncludeLaunchDescription,
     OpaqueFunction,
     ExecuteProcess,
+    RegisterEventHandler,
 )
+
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import (
@@ -415,16 +418,32 @@ def launch_setup(context, *args, **kwargs):
     )
 
     # Spawn controllers
-    def controller_spawner(controllers, active=True):
+    controller_spawner_timeout_value = controller_spawner_timeout.perform(context)
+    current_ros_namespace = context.launch_configurations.get(
+        "ros_namespace",
+        ""
+    )
+
+    if current_ros_namespace:
+        current_ros_namespace = "/" + current_ros_namespace.strip("/")
+    else:
+        current_ros_namespace = "/"
+
+    def controller_spawner(
+        controllers,
+        active=True,
+        namespace=None,
+    ):
         inactive_flags = ["--inactive"] if not active else []
         return Node(
             package="controller_manager",
             executable="spawner",
+            namespace=namespace,
             arguments=[
                 "--controller-manager",
                 "controller_manager",
                 "--controller-manager-timeout",
-                controller_spawner_timeout,
+                controller_spawner_timeout_value,
                 "--service-call-timeout",
                 "30",
                 "--switch-timeout",
@@ -461,10 +480,21 @@ def launch_setup(context, *args, **kwargs):
     if use_fake_hardware.perform(context) == "true":
         controllers_active.remove("tcp_pose_broadcaster")
 
-    controller_spawners = [
-        controller_spawner(controllers_active),
-        controller_spawner(controllers_inactive, active=False),
-    ]
+    active_controller_spawner = controller_spawner(controllers_active)
+
+    inactive_controller_spawner = controller_spawner(
+        controllers_inactive,
+        active=False,
+        namespace=current_ros_namespace,
+    )
+
+    start_inactive_controllers_after_active = RegisterEventHandler(
+        OnProcessExit(
+            target_action=active_controller_spawner,
+            on_exit=[inactive_controller_spawner],
+        )
+    )
+
 
     nodes_to_start = [
         control_node,
@@ -477,7 +507,9 @@ def launch_setup(context, *args, **kwargs):
         robot_state_publisher_node,
         rviz_node,
         trajectory_until_node,
-    ] + controller_spawners
+        active_controller_spawner,
+        start_inactive_controllers_after_active,
+    ]
 
     return nodes_to_start
 
