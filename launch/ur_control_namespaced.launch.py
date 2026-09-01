@@ -425,6 +425,10 @@ def launch_setup(context, *args, **kwargs):
                 "controller_manager",
                 "--controller-manager-timeout",
                 controller_spawner_timeout,
+                "--service-call-timeout",
+                "30",
+                "--switch-timeout",
+                "10",
             ]
             + inactive_flags
             + controllers,
