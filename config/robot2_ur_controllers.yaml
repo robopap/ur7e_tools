@@ -42,9 +42,6 @@
     tcp_pose_broadcaster:
       type: pose_broadcaster/PoseBroadcaster
 
-    passthrough_trajectory_controller:
-      type: ur_controllers/PassthroughTrajectoryController
-
     ur_configuration_controller:
       type: ur_controllers/URConfigurationController
 
@@ -95,6 +92,7 @@
     state_publish_rate: 100.0
     action_monitor_rate: 20.0
     allow_partial_joints_goal: false
+    allow_nonzero_velocity_at_trajectory_end: false
     constraints:
       stopped_velocity_tolerance: 0.2
       goal_time: 0.0
@@ -123,6 +121,7 @@
     state_publish_rate: 100.0
     action_monitor_rate: 20.0
     allow_partial_joints_goal: false
+    allow_nonzero_velocity_at_trajectory_end: false
     constraints:
       stopped_velocity_tolerance: 0.2
       goal_time: 0.0
