@@ -377,6 +377,7 @@ def launch_setup(context, *args, **kwargs):
                     "speed_scaling_state_broadcaster",
                     "tcp_pose_broadcaster",
                     "ur_configuration_controller",
+                    "friction_model_controller",
                 ]
             },
         ],
