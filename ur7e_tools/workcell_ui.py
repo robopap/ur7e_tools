@@ -2,19 +2,24 @@
 
 import csv
 import ipaddress
+import glob
 import os
 import shlex
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import Bool
+from ur_dashboard_msgs.msg import RobotMode
 
 from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QPainter
@@ -48,6 +53,166 @@ FORCE_BAR_LIMIT = 50.0
 TORQUE_BAR_LIMIT = 5.0
 WRENCH_UI_REFRESH_MS = 50
 WRENCH_STALE_SEC = 0.5
+
+
+# -------------------------------------------------------------------------
+# Workcell supervisor preflight
+# -------------------------------------------------------------------------
+#
+# The UI itself owns one ROS 2 participant (the wrench/program listener).
+# Therefore FastDDS cleanup must happen BEFORE rclpy.init().
+#
+# We only remove FastDDS shared-memory files when no workcell ROS processes
+# are running. This prevents a stale previous run from contaminating the next
+# UI session while avoiding deletion of resources used by a live workcell.
+#
+WORKCELL_PROCESS_MARKERS = (
+    "dual_ur7e.launch.py",
+    "single_ur5.launch.py",
+    "ur_ros2_control_node",
+    "controller_stopper_node",
+    "robot_state_publisher",
+    "dashboard_client",
+    "urscript_interface",
+    "trajectory_until_node",
+    "gripper_visualizer",
+    "rviz2",
+    "ft_sensor",
+    "/controller_manager/spawner",
+)
+
+
+def _process_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, PermissionError):
+        return ""
+
+    return raw.replace(b"\0", b" ").decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
+
+def find_running_workcell_processes():
+    """Return live ROS/workcell processes, excluding this UI process."""
+
+    current_pid = os.getpid()
+    found = []
+
+    for proc_path in Path("/proc").iterdir():
+        if not proc_path.name.isdigit():
+            continue
+
+        pid = int(proc_path.name)
+        if pid == current_pid:
+            continue
+
+        cmdline = _process_cmdline(pid)
+        if not cmdline:
+            continue
+
+        if any(marker in cmdline for marker in WORKCELL_PROCESS_MARKERS):
+            found.append((pid, cmdline))
+
+    return sorted(found, key=lambda item: item[0])
+
+
+def _fastdds_shared_memory_paths():
+    patterns = (
+        "/dev/shm/fastrtps_*",
+        "/dev/shm/sem.fastrtps_*",
+        "/dev/shm/fastdds_*",
+        "/dev/shm/sem.fastdds_*",
+    )
+
+    paths = set()
+    for pattern in patterns:
+        paths.update(glob.glob(pattern))
+
+    return sorted(paths)
+
+
+def stop_ros2_daemon_quietly():
+    """Stop only the ROS 2 CLI daemon; never kill arbitrary ROS processes."""
+
+    ros2_executable = shutil.which("ros2")
+    if not ros2_executable:
+        return False, "ros2 executable not found"
+
+    try:
+        result = subprocess.run(
+            [ros2_executable, "daemon", "stop"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+    return result.returncode == 0, result.stdout.strip()
+
+
+def perform_startup_fastdds_preflight():
+    """Safely clean stale FastDDS SHM before the UI creates its ROS node."""
+
+    report = {
+        "state": "CLEAN",
+        "message": "No stale FastDDS state detected.",
+        "removed": 0,
+        "blocked_processes": [],
+    }
+
+    # The ros2 CLI daemon is not part of the robot workcell. Stop it first so
+    # it cannot keep old FastDDS shared-memory ports locked during cleanup.
+    stop_ros2_daemon_quietly()
+    time.sleep(0.2)
+
+    # Cleanup is allowed only when no workcell ROS process is alive.
+    blockers = find_running_workcell_processes()
+    if blockers:
+        report["state"] = "BLOCKED"
+        report["blocked_processes"] = blockers
+        report["message"] = (
+            "A workcell ROS process is running; "
+            "FastDDS cleanup was not attempted."
+        )
+        return report
+
+    removed = 0
+    errors = []
+
+    for path_string in _fastdds_shared_memory_paths():
+        path = Path(path_string)
+
+        try:
+            # Only remove files owned by the current Linux user.
+            if path.stat().st_uid != os.getuid():
+                continue
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+
+    report["removed"] = removed
+
+    if errors:
+        report["state"] = "WARNING"
+        report["message"] = (
+            f"Removed {removed} stale FastDDS file(s), "
+            f"but {len(errors)} item(s) could not be removed."
+        )
+    elif removed:
+        report["state"] = "CLEANED"
+        report["message"] = (
+            f"Removed {removed} stale FastDDS shared-memory file(s)."
+        )
+
+    return report
 
 
 class CenteredBar(QWidget):
@@ -192,6 +357,11 @@ class WrenchListenerNode(Node):
         "robot2": "/robot2/io_and_status_controller/robot_program_running",
     }
 
+    ROBOT_MODE_TOPICS = {
+        "robot1": "/robot1/io_and_status_controller/robot_mode",
+        "robot2": "/robot2/io_and_status_controller/robot_mode",
+    }
+
     # All three currently verified wrench streams run at approximately 100 Hz.
     # Lower CSV rates are obtained by deterministic sample decimation while
     # leaving the ROS acquisition/control streams untouched at full rate.
@@ -203,6 +373,7 @@ class WrenchListenerNode(Node):
         self._lock = threading.Lock()
         self._latest = {}
         self._program_states = {}
+        self._robot_modes = {}
         self._recordings = {}
         self._subscriptions = []
 
@@ -216,15 +387,29 @@ class WrenchListenerNode(Node):
             )
             self._subscriptions.append(subscription)
 
-        # Use a VOLATILE depth-1 subscriber here. The UR publisher is
-        # TRANSIENT_LOCAL, but the UI must not become READY from a retained
-        # value from before the current START SYSTEM session.
+        # Use VOLATILE depth-1 subscriptions for runtime robot state.
+        # Readiness accepts only samples received after START SYSTEM, so a
+        # retained state from an older launch cannot make the UI READY.
         for key, topic in self.PROGRAM_TOPICS.items():
             subscription = self.create_subscription(
                 Bool,
                 topic,
                 lambda msg, robot_key=key:
                     self._program_running_callback(robot_key, msg),
+                1,
+            )
+            self._subscriptions.append(subscription)
+
+        # robot_program_running may not publish a sample until the PolyScope
+        # program is actually started. robot_mode is available earlier, so it
+        # lets the supervisor distinguish "driver/controller is alive and
+        # waiting for PLAY" from "robot state has not appeared yet".
+        for key, topic in self.ROBOT_MODE_TOPICS.items():
+            subscription = self.create_subscription(
+                RobotMode,
+                topic,
+                lambda msg, robot_key=key:
+                    self._robot_mode_callback(robot_key, msg),
                 1,
             )
             self._subscriptions.append(subscription)
@@ -239,6 +424,17 @@ class WrenchListenerNode(Node):
     def program_snapshot(self):
         with self._lock:
             return dict(self._program_states)
+
+    def _robot_mode_callback(self, key, msg):
+        with self._lock:
+            self._robot_modes[key] = (
+                time.monotonic(),
+                int(msg.mode),
+            )
+
+    def robot_mode_snapshot(self):
+        with self._lock:
+            return dict(self._robot_modes)
 
     def _wrench_callback(self, key, msg):
         values = (
@@ -417,8 +613,19 @@ class WrenchListenerNode(Node):
 
 class WorkcellUI(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, startup_preflight_report=None):
         super().__init__()
+
+        self.startup_preflight_report = (
+            startup_preflight_report
+            if startup_preflight_report is not None
+            else {
+                "state": "UNKNOWN",
+                "message": "Startup preflight was not run.",
+                "removed": 0,
+                "blocked_processes": [],
+            }
+        )
 
         self.setWindowTitle("Robot Workcell Control")
         self.resize(1340, 780)
@@ -605,6 +812,7 @@ class WorkcellUI(QMainWindow):
         self.build_ui()
         self.apply_style()
         self.update_setup_view()
+        self.apply_startup_preflight_report()
 
         # UI display is intentionally throttled to 20 Hz.
         # The ROS topics themselves remain at their native rates (~100 Hz).
@@ -743,6 +951,19 @@ class WorkcellUI(QMainWindow):
             "robotSummaryUnknown"
         )
         setup_layout.addWidget(self.robots_ready_label)
+
+        setup_layout.addSpacing(6)
+        setup_layout.addWidget(QLabel("Preflight:"))
+
+        self.preflight_status_label = QLabel("UNKNOWN")
+        self.preflight_status_label.setObjectName(
+            "connectionUnknown"
+        )
+        self.preflight_status_label.setToolTip(
+            "Startup check for leftover workcell processes and stale "
+            "FastDDS shared-memory state."
+        )
+        setup_layout.addWidget(self.preflight_status_label)
 
         self.start_guard_label = QLabel("")
         self.start_guard_label.setObjectName("systemWarning")
@@ -2596,6 +2817,150 @@ class WorkcellUI(QMainWindow):
         self.update_external_ft_controls()
 
     # =========================================================
+    # Supervisor preflight
+    # =========================================================
+
+    def set_preflight_status(self, text, state, tooltip=None):
+        if not hasattr(self, "preflight_status_label"):
+            return
+
+        self.preflight_status_label.setText(text)
+
+        object_names = {
+            "clean": "connectionReachable",
+            "cleaned": "connectionReachable",
+            "checking": "connectionTesting",
+            "warning": "connectionTesting",
+            "blocked": "connectionOffline",
+            "unknown": "connectionUnknown",
+        }
+
+        self.preflight_status_label.setObjectName(
+            object_names.get(state, "connectionUnknown")
+        )
+
+        if tooltip is not None:
+            self.preflight_status_label.setToolTip(tooltip)
+
+        self.preflight_status_label.style().unpolish(
+            self.preflight_status_label
+        )
+        self.preflight_status_label.style().polish(
+            self.preflight_status_label
+        )
+
+    def apply_startup_preflight_report(self):
+        report = self.startup_preflight_report
+        state = report.get("state", "UNKNOWN")
+        message = report.get("message", "")
+
+        if state == "CLEAN":
+            self.set_preflight_status(
+                "CLEAN",
+                "clean",
+                message,
+            )
+        elif state == "CLEANED":
+            self.set_preflight_status(
+                "CLEANED",
+                "cleaned",
+                message,
+            )
+        elif state == "BLOCKED":
+            blockers = report.get("blocked_processes", [])
+            details = "\n".join(
+                f"PID {pid}: {cmdline}"
+                for pid, cmdline in blockers[:8]
+            )
+            tooltip = message
+            if details:
+                tooltip += "\n\n" + details
+
+            self.set_preflight_status(
+                "BLOCKED",
+                "blocked",
+                tooltip,
+            )
+        elif state == "WARNING":
+            self.set_preflight_status(
+                "WARNING",
+                "warning",
+                message,
+            )
+        else:
+            self.set_preflight_status(
+                "UNKNOWN",
+                "unknown",
+                message,
+            )
+
+    def preflight_before_start(self):
+        """Fail closed if another workcell ROS stack is already running."""
+
+        self.set_preflight_status(
+            "CHECKING...",
+            "checking",
+            "Checking for existing workcell ROS processes.",
+        )
+        QApplication.processEvents()
+
+        startup_state = self.startup_preflight_report.get(
+            "state",
+            "UNKNOWN",
+        )
+
+        # If startup cleanup could not establish a clean FastDDS state, fail
+        # closed. The safe recovery is to stop the old ROS process(es), close
+        # this UI, and reopen it so cleanup happens before rclpy.init().
+        if startup_state not in ("CLEAN", "CLEANED"):
+            self.set_preflight_status(
+                "RESTART REQUIRED",
+                "blocked",
+                "Startup FastDDS cleanup was not completed safely. "
+                "Stop old ROS/workcell processes, close this UI, "
+                "and open it again.",
+            )
+            self.start_guard_label.setText(
+                "Preflight requires a clean UI restart before START SYSTEM."
+            )
+            self.start_guard_label.setVisible(True)
+            return False
+
+        blockers = find_running_workcell_processes()
+
+        if blockers:
+            details = "\n".join(
+                f"PID {pid}: {cmdline}"
+                for pid, cmdline in blockers[:8]
+            )
+
+            self.set_preflight_status(
+                "BLOCKED",
+                "blocked",
+                "Existing workcell ROS processes detected.\n\n"
+                + details,
+            )
+
+            self.start_guard_label.setText(
+                "Preflight blocked: another workcell ROS process is "
+                "already running. Stop it before START SYSTEM."
+            )
+            self.start_guard_label.setVisible(True)
+            return False
+
+        # A ros2 CLI daemon is safe to stop and does not control the robots.
+        # Keeping it out of the launch transition also reduces stale FastDDS
+        # shared-memory participants between repeated sessions.
+        stop_ros2_daemon_quietly()
+
+        self.set_preflight_status(
+            "CLEAN",
+            "clean",
+            "No existing workcell ROS processes detected.",
+        )
+        return True
+
+    # =========================================================
     # Setup visibility
     # =========================================================
 
@@ -3012,25 +3377,45 @@ class WorkcellUI(QMainWindow):
             return
 
         program_states = self.wrench_listener.program_snapshot()
+        robot_modes = self.wrench_listener.robot_mode_snapshot()
         controls_changed = False
 
         for robot in ("robot1", "robot2"):
-            sample = program_states.get(robot)
+            program_sample = program_states.get(robot)
+            mode_sample = robot_modes.get(robot)
 
-            # Only accept program-running messages received after START SYSTEM.
-            # This prevents a retained/old state from a previous session from
-            # making a robot READY.
-            if (
-                sample is None
-                or sample[0] < self.system_session_started_at
-            ):
+            # Only accept state received after the current START SYSTEM.
+            # robot_program_running is not guaranteed to emit an initial False
+            # before PLAY, while robot_mode is already published by the active
+            # io_and_status_controller. A current-session robot_mode sample is
+            # therefore enough to display WAITING FOR PLAY, but never READY.
+            program_current = (
+                program_sample is not None
+                and program_sample[0] >= self.system_session_started_at
+            )
+            mode_current = (
+                mode_sample is not None
+                and mode_sample[0] >= self.system_session_started_at
+            )
+
+            if not program_current:
                 desired_ready = False
-                desired_status = "NOT STARTED"
+
+                if mode_current:
+                    desired_status = "WAITING FOR PLAY"
+                else:
+                    desired_status = "NOT STARTED"
             else:
-                program_running = bool(sample[1])
+                program_running = bool(program_sample[1])
 
                 if not program_running:
-                    self.robot_reverse_ready_seen[robot] = False
+                    # Do not clear reverse readiness here. The Bool callback and
+                    # the UR client log are asynchronous and can arrive in either
+                    # order during STOP -> PLAY. Clearing here can erase a fresh
+                    # reverse-interface READY event if a delayed False sample is
+                    # processed immediately afterwards. Reverse readiness is
+                    # cleared explicitly from fresh current-session UR client
+                    # events ("dropped" / "requested program") instead.
                     desired_ready = False
                     desired_status = "WAITING FOR PLAY"
                 elif self.robot_reverse_ready_seen[robot]:
@@ -3079,6 +3464,25 @@ class WorkcellUI(QMainWindow):
         # This call comes only from the current UI-owned ros_process output,
         # so it is a fresh reverse-interface confirmation for this launch.
         self.robot_reverse_ready_seen[robot] = True
+        self.refresh_robot_readiness()
+
+    def mark_reverse_interface_not_ready(self, robot):
+
+        if robot not in ("robot1", "robot2"):
+            return
+
+        if (
+            self.setup_combo.currentText() != "Dual UR7e"
+            or self.mode_combo.currentText() != "Real Robot(s)"
+            or self.status_label.text() != "RUNNING"
+            or self.system_session_started_at is None
+        ):
+            return
+
+        # A fresh "connection dropped" or "robot requested program" message
+        # belongs to this UI-owned launch and starts a new reverse-interface
+        # handshake generation. READY must therefore be earned again.
+        self.robot_reverse_ready_seen[robot] = False
         self.refresh_robot_readiness()
 
     def show_robot_not_ready_warning(self, robot):
@@ -3606,6 +4010,13 @@ class WorkcellUI(QMainWindow):
         if (
             self.setup_combo.currentText() == "Dual UR7e"
             and self.mode_combo.currentText() == "Real Robot(s)"
+            and not self.preflight_before_start()
+        ):
+            return
+
+        if (
+            self.setup_combo.currentText() == "Dual UR7e"
+            and self.mode_combo.currentText() == "Real Robot(s)"
         ):
             robot1_ready = (
                 self.robot1_connection_status.text()
@@ -3874,27 +4285,67 @@ class WorkcellUI(QMainWindow):
                 text.rstrip()
             )
 
-            # QProcess output can split a ROS log line across reads, so keep
-            # a small line buffer before looking for the reverse-interface
-            # confirmation. Only output from this current ros_process can set
-            # robot_reverse_ready_seen=True.
+            # QProcess can split a ROS log message anywhere, including before
+            # the final newline. Keep a rolling buffer and parse both complete
+            # lines and the current unterminated tail. This is important after
+            # a STOP -> PLAY reconnect, where the reverse-interface READY line
+            # can otherwise remain buffered forever if no later output arrives.
             self._ros_output_parse_buffer += text
+
+            ready_phrase = (
+                "Robot connected to reverse interface. "
+                "Ready to receive control commands."
+            )
+            dropped_phrase = "Connection to reverse interface dropped."
+            requested_phrase = "Robot requested program"
+
+            def parse_reverse_interface_message(message):
+                robot = None
+
+                if "UR_Client_Library:robot1_" in message:
+                    robot = "robot1"
+                elif "UR_Client_Library:robot2_" in message:
+                    robot = "robot2"
+
+                if robot is None:
+                    return False
+
+                # Parse state-reset events before READY. This makes each PLAY
+                # a fresh handshake and avoids carrying READY across cycles.
+                if dropped_phrase in message:
+                    self.mark_reverse_interface_not_ready(robot)
+                    return True
+
+                if requested_phrase in message:
+                    self.mark_reverse_interface_not_ready(robot)
+                    return True
+
+                if ready_phrase in message:
+                    self.mark_reverse_interface_ready(robot)
+                    return True
+
+                return False
 
             while "\n" in self._ros_output_parse_buffer:
                 line, self._ros_output_parse_buffer = (
                     self._ros_output_parse_buffer.split("\n", 1)
                 )
+                parse_reverse_interface_message(line)
 
-                ready_phrase = (
-                    "Robot connected to reverse interface. "
-                    "Ready to receive control commands."
+            # Do not wait for a newline if a complete reverse-interface event
+            # is already present in the tail. This also covers reconnects where
+            # the final READY line is the last output produced for a while.
+            if parse_reverse_interface_message(
+                self._ros_output_parse_buffer
+            ):
+                self._ros_output_parse_buffer = ""
+
+            # Bound the tail in case an unexpected process writes a very long
+            # line without newlines. The READY marker is much shorter than this.
+            if len(self._ros_output_parse_buffer) > 8192:
+                self._ros_output_parse_buffer = (
+                    self._ros_output_parse_buffer[-4096:]
                 )
-
-                if ready_phrase in line:
-                    if "UR_Client_Library:robot1_" in line:
-                        self.mark_reverse_interface_ready("robot1")
-                    elif "UR_Client_Library:robot2_" in line:
-                        self.mark_reverse_interface_ready("robot2")
 
             scrollbar = (
                 self.log_output.verticalScrollBar()
@@ -4360,11 +4811,17 @@ class WorkcellUI(QMainWindow):
 
 def main(args=None):
 
+    startup_preflight_report = (
+        perform_startup_fastdds_preflight()
+    )
+
     app = QApplication(
         sys.argv
     )
 
-    window = WorkcellUI()
+    window = WorkcellUI(
+        startup_preflight_report=startup_preflight_report
+    )
     window.show()
 
     sys.exit(
