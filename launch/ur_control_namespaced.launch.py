@@ -43,9 +43,11 @@ from launch.actions import (
     OpaqueFunction,
     ExecuteProcess,
     RegisterEventHandler,
+    EmitEvent,
 )
 
 from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import (
@@ -488,10 +490,31 @@ def launch_setup(context, *args, **kwargs):
         namespace=current_ros_namespace,
     )
 
+    def handle_active_spawner_exit(event, context):
+        """Continue only after a successful active-controller spawn.
+
+        If the active spawner fails, stop the whole launch instead of
+        starting the inactive-controller spawner on a half-configured robot.
+        """
+        if event.returncode == 0:
+            return [inactive_controller_spawner]
+
+        return [
+            EmitEvent(
+                event=Shutdown(
+                    reason=(
+                        "Active controller spawner failed in "
+                        f"{current_ros_namespace} "
+                        f"(exit code {event.returncode})"
+                    )
+                )
+            )
+        ]
+
     start_inactive_controllers_after_active = RegisterEventHandler(
         OnProcessExit(
             target_action=active_controller_spawner,
-            on_exit=[inactive_controller_spawner],
+            on_exit=handle_active_spawner_exit,
         )
     )
 
@@ -652,8 +675,8 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "controller_spawner_timeout",
-            default_value="10",
-            description="Timeout used when spawning controllers.",
+            default_value="30",
+            description="Timeout used when waiting for the controller manager during startup.",
         )
     )
     declared_arguments.append(

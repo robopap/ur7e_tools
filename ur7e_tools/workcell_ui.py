@@ -14,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import WrenchStamped
+from std_msgs.msg import Bool
 
 from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QPainter
@@ -186,6 +187,11 @@ class WrenchListenerNode(Node):
         "external": "/external_ft",
     }
 
+    PROGRAM_TOPICS = {
+        "robot1": "/robot1/io_and_status_controller/robot_program_running",
+        "robot2": "/robot2/io_and_status_controller/robot_program_running",
+    }
+
     # All three currently verified wrench streams run at approximately 100 Hz.
     # Lower CSV rates are obtained by deterministic sample decimation while
     # leaving the ROS acquisition/control streams untouched at full rate.
@@ -196,6 +202,7 @@ class WrenchListenerNode(Node):
 
         self._lock = threading.Lock()
         self._latest = {}
+        self._program_states = {}
         self._recordings = {}
         self._subscriptions = []
 
@@ -208,6 +215,30 @@ class WrenchListenerNode(Node):
                 qos_profile_sensor_data,
             )
             self._subscriptions.append(subscription)
+
+        # Use a VOLATILE depth-1 subscriber here. The UR publisher is
+        # TRANSIENT_LOCAL, but the UI must not become READY from a retained
+        # value from before the current START SYSTEM session.
+        for key, topic in self.PROGRAM_TOPICS.items():
+            subscription = self.create_subscription(
+                Bool,
+                topic,
+                lambda msg, robot_key=key:
+                    self._program_running_callback(robot_key, msg),
+                1,
+            )
+            self._subscriptions.append(subscription)
+
+    def _program_running_callback(self, key, msg):
+        with self._lock:
+            self._program_states[key] = (
+                time.monotonic(),
+                bool(msg.data),
+            )
+
+    def program_snapshot(self):
+        with self._lock:
+            return dict(self._program_states)
 
     def _wrench_callback(self, key, msg):
         values = (
@@ -473,6 +504,21 @@ class WorkcellUI(QMainWindow):
         self.active_gripper_command = None
 
         # -----------------------------------------------------
+        # Per-robot readiness state for the current UI-owned launch
+        # -----------------------------------------------------
+
+        self.system_session_started_at = None
+        self.robot_ready = {
+            "robot1": False,
+            "robot2": False,
+        }
+        self.robot_reverse_ready_seen = {
+            "robot1": False,
+            "robot2": False,
+        }
+        self._ros_output_parse_buffer = ""
+
+        # -----------------------------------------------------
         # External Robotiq F/T process
         # -----------------------------------------------------
 
@@ -571,6 +617,14 @@ class WorkcellUI(QMainWindow):
         )
         self.wrench_refresh_timer.start()
 
+        # Robot READY state is refreshed independently from the wrench UI.
+        self.robot_state_timer = QTimer(self)
+        self.robot_state_timer.setInterval(100)
+        self.robot_state_timer.timeout.connect(
+            self.refresh_robot_readiness
+        )
+        self.robot_state_timer.start()
+
     # =========================================================
     # UI
     # =========================================================
@@ -605,8 +659,14 @@ class WorkcellUI(QMainWindow):
         # -----------------------------------------------------
 
         setup_group = QGroupBox("System configuration")
-        setup_layout = QHBoxLayout(setup_group)
+
+        setup_group_layout = QVBoxLayout(setup_group)
+        setup_group_layout.setSpacing(4)
+
+        setup_layout = QHBoxLayout()
         setup_layout.setSpacing(8)
+
+        setup_group_layout.addLayout(setup_layout)
 
         setup_layout.addWidget(QLabel("Setup:"))
 
@@ -674,6 +734,23 @@ class WorkcellUI(QMainWindow):
         )
 
         setup_layout.addWidget(self.status_label)
+
+        setup_layout.addSpacing(6)
+        setup_layout.addWidget(QLabel("Robots:"))
+
+        self.robots_ready_label = QLabel("0/2 READY")
+        self.robots_ready_label.setObjectName(
+            "robotSummaryUnknown"
+        )
+        setup_layout.addWidget(self.robots_ready_label)
+
+        self.start_guard_label = QLabel("")
+        self.start_guard_label.setObjectName("systemWarning")
+        self.start_guard_label.setVisible(False)
+
+        setup_group_layout.addWidget(
+            self.start_guard_label
+        )
 
         main_layout.addWidget(setup_group)
 
@@ -819,7 +896,7 @@ class WorkcellUI(QMainWindow):
         robot1_header.addWidget(QLabel("IP:"))
 
         self.robot1_ip = QLineEdit(
-            "10.0.0.2"
+            "10.0.0.1"
         )
         robot1_header.addWidget(
             self.robot1_ip,
@@ -846,6 +923,15 @@ class WorkcellUI(QMainWindow):
         )
         robot1_header.addWidget(
             self.robot1_connection_status
+        )
+
+        robot1_header.addWidget(QLabel("Robot:"))
+        self.robot1_ready_status = QLabel("NOT STARTED")
+        self.robot1_ready_status.setObjectName(
+            "robotStateStopped"
+        )
+        robot1_header.addWidget(
+            self.robot1_ready_status
         )
 
         robot1_layout.addLayout(robot1_header)
@@ -954,7 +1040,7 @@ class WorkcellUI(QMainWindow):
         robot2_header.addWidget(QLabel("IP:"))
 
         self.robot2_ip = QLineEdit(
-            "20.0.0.2"
+            "10.0.0.2"
         )
         robot2_header.addWidget(
             self.robot2_ip,
@@ -981,6 +1067,15 @@ class WorkcellUI(QMainWindow):
         )
         robot2_header.addWidget(
             self.robot2_connection_status
+        )
+
+        robot2_header.addWidget(QLabel("Robot:"))
+        self.robot2_ready_status = QLabel("NOT STARTED")
+        self.robot2_ready_status.setObjectName(
+            "robotStateStopped"
+        )
+        robot2_header.addWidget(
+            self.robot2_ready_status
         )
 
         robot2_layout.addLayout(robot2_header)
@@ -1070,6 +1165,20 @@ class WorkcellUI(QMainWindow):
 
         main_layout.addWidget(
             self.dual_group
+        )
+
+        self.robot1_ip.textChanged.connect(
+            lambda _text: self.set_connection_status(
+                self.robot1_connection_status,
+                "NOT TESTED",
+            )
+        )
+
+        self.robot2_ip.textChanged.connect(
+            lambda _text: self.set_connection_status(
+                self.robot2_connection_status,
+                "NOT TESTED",
+            )
         )
 
         # =====================================================
@@ -2505,6 +2614,13 @@ class WorkcellUI(QMainWindow):
             not single
         )
 
+        if hasattr(self, "robots_ready_label"):
+            self.robots_ready_label.setVisible(not single)
+
+        if hasattr(self, "start_guard_label"):
+            self.start_guard_label.clear()
+            self.start_guard_label.setVisible(False)
+
         dual_real = (
             not single
             and self.mode_combo.currentText()
@@ -2683,8 +2799,12 @@ class WorkcellUI(QMainWindow):
 
     def test_robot1_connection(self):
 
+        self.robot1_tested_ip = (
+            self.robot1_ip.text().strip()
+        )
+
         self.start_ping(
-            self.robot1_ip.text().strip(),
+            self.robot1_tested_ip,
             self.robot1_ping_process,
             self.robot1_connection_status,
         )
@@ -2695,12 +2815,23 @@ class WorkcellUI(QMainWindow):
         exit_status
     ):
 
+        if (
+            self.robot1_ip.text().strip()
+            != self.robot1_tested_ip
+        ):
+            self.set_connection_status(
+                self.robot1_connection_status,
+                "NOT TESTED"
+            )
+            return
+
         if exit_code == 0:
 
             self.set_connection_status(
                 self.robot1_connection_status,
                 "REACHABLE"
             )
+            self.clear_connection_test_warning_if_ready()
 
         else:
 
@@ -2715,8 +2846,12 @@ class WorkcellUI(QMainWindow):
 
     def test_robot2_connection(self):
 
+        self.robot2_tested_ip = (
+            self.robot2_ip.text().strip()
+        )
+
         self.start_ping(
-            self.robot2_ip.text().strip(),
+            self.robot2_tested_ip,
             self.robot2_ping_process,
             self.robot2_connection_status,
         )
@@ -2727,12 +2862,23 @@ class WorkcellUI(QMainWindow):
         exit_status
     ):
 
+        if (
+            self.robot2_ip.text().strip()
+            != self.robot2_tested_ip
+        ):
+            self.set_connection_status(
+                self.robot2_connection_status,
+                "NOT TESTED"
+            )
+            return
+
         if exit_code == 0:
 
             self.set_connection_status(
                 self.robot2_connection_status,
                 "REACHABLE"
             )
+            self.clear_connection_test_warning_if_ready()
 
         else:
 
@@ -2740,6 +2886,211 @@ class WorkcellUI(QMainWindow):
                 self.robot2_connection_status,
                 "OFFLINE"
             )
+
+    def clear_connection_test_warning_if_ready(self):
+
+        both_reachable = (
+            self.robot1_connection_status.text() == "REACHABLE"
+            and self.robot2_connection_status.text() == "REACHABLE"
+        )
+
+        if (
+            both_reachable
+            and self.start_guard_label.text().startswith(
+                "Press TEST for both robot connections"
+            )
+        ):
+            self.start_guard_label.clear()
+            self.start_guard_label.setVisible(False)
+
+    # =========================================================
+    # Robot program / reverse-interface readiness
+    # =========================================================
+
+    def set_robot_ready_status(self, robot, status):
+
+        label = (
+            self.robot1_ready_status
+            if robot == "robot1"
+            else self.robot2_ready_status
+        )
+
+        label.setText(status)
+
+        object_names = {
+            "READY": "robotStateReady",
+            "WAITING FOR PLAY": "robotStateWaiting",
+            "CONNECTING...": "robotStateConnecting",
+            "DISCONNECTED": "robotStateDisconnected",
+            "NOT STARTED": "robotStateStopped",
+        }
+
+        label.setObjectName(
+            object_names.get(status, "robotStateStopped")
+        )
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def update_robot_ready_summary(self):
+
+        if not hasattr(self, "robots_ready_label"):
+            return
+
+        ready_count = sum(
+            1 for ready in self.robot_ready.values()
+            if ready
+        )
+
+        self.robots_ready_label.setText(
+            f"{ready_count}/2 READY"
+        )
+
+        if ready_count == 2:
+            object_name = "robotSummaryReady"
+        elif ready_count > 0:
+            object_name = "robotSummaryPartial"
+        else:
+            object_name = "robotSummaryUnknown"
+
+        self.robots_ready_label.setObjectName(object_name)
+        self.robots_ready_label.style().unpolish(
+            self.robots_ready_label
+        )
+        self.robots_ready_label.style().polish(
+            self.robots_ready_label
+        )
+
+    def reset_robot_readiness(self, status="NOT STARTED"):
+
+        for robot in ("robot1", "robot2"):
+            self.robot_ready[robot] = False
+            self.robot_reverse_ready_seen[robot] = False
+
+            if hasattr(self, f"{robot}_ready_status"):
+                self.set_robot_ready_status(robot, status)
+
+        self.update_robot_ready_summary()
+
+        if hasattr(self, "home_process"):
+            self.update_home_buttons()
+
+        if hasattr(self, "gripper_process"):
+            self.update_gripper_buttons()
+
+    def refresh_robot_readiness(self):
+
+        if (
+            self.setup_combo.currentText() != "Dual UR7e"
+        ):
+            return
+
+        system_running = (
+            self.status_label.text() == "RUNNING"
+        )
+
+        if not system_running:
+            return
+
+        # Simulation has no pendant/External Control handshake. Preserve the
+        # existing behavior by treating both simulated robots as ready once
+        # the launch process is running.
+        if self.mode_combo.currentText() == "Simulation":
+            changed = False
+            for robot in ("robot1", "robot2"):
+                if not self.robot_ready[robot]:
+                    self.robot_ready[robot] = True
+                    changed = True
+                self.set_robot_ready_status(robot, "READY")
+
+            if changed:
+                self.update_home_buttons()
+                self.update_gripper_buttons()
+            self.update_robot_ready_summary()
+            return
+
+        if self.system_session_started_at is None:
+            return
+
+        program_states = self.wrench_listener.program_snapshot()
+        controls_changed = False
+
+        for robot in ("robot1", "robot2"):
+            sample = program_states.get(robot)
+
+            # Only accept program-running messages received after START SYSTEM.
+            # This prevents a retained/old state from a previous session from
+            # making a robot READY.
+            if (
+                sample is None
+                or sample[0] < self.system_session_started_at
+            ):
+                desired_ready = False
+                desired_status = "NOT STARTED"
+            else:
+                program_running = bool(sample[1])
+
+                if not program_running:
+                    self.robot_reverse_ready_seen[robot] = False
+                    desired_ready = False
+                    desired_status = "WAITING FOR PLAY"
+                elif self.robot_reverse_ready_seen[robot]:
+                    desired_ready = True
+                    desired_status = "READY"
+                else:
+                    desired_ready = False
+                    desired_status = "CONNECTING..."
+
+            if self.robot_ready[robot] != desired_ready:
+                self.robot_ready[robot] = desired_ready
+                controls_changed = True
+
+            self.set_robot_ready_status(
+                robot,
+                desired_status,
+            )
+
+        self.update_robot_ready_summary()
+
+        if (
+            self.robot_ready["robot1"]
+            and self.robot_ready["robot2"]
+            and self.start_guard_label.isVisible()
+        ):
+            self.start_guard_label.clear()
+            self.start_guard_label.setVisible(False)
+
+        if controls_changed:
+            self.update_home_buttons()
+            self.update_gripper_buttons()
+
+    def mark_reverse_interface_ready(self, robot):
+
+        if robot not in ("robot1", "robot2"):
+            return
+
+        if (
+            self.setup_combo.currentText() != "Dual UR7e"
+            or self.mode_combo.currentText() != "Real Robot(s)"
+            or self.status_label.text() != "RUNNING"
+            or self.system_session_started_at is None
+        ):
+            return
+
+        # This call comes only from the current UI-owned ros_process output,
+        # so it is a fresh reverse-interface confirmation for this launch.
+        self.robot_reverse_ready_seen[robot] = True
+        self.refresh_robot_readiness()
+
+    def show_robot_not_ready_warning(self, robot):
+
+        display_name = (
+            "Robot 1" if robot == "robot1" else "Robot 2"
+        )
+        self.start_guard_label.setText(
+            f"{display_name} is not ready. Press PLAY on the "
+            f"{display_name} pendant."
+        )
+        self.start_guard_label.setVisible(True)
 
     # =========================================================
     # HOME motion
@@ -2767,16 +3118,34 @@ class WorkcellUI(QMainWindow):
             and single
         )
 
+        dual_real = (
+            not single
+            and self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        robot1_ready = (
+            self.robot_ready["robot1"]
+            if dual_real
+            else True
+        )
+        robot2_ready = (
+            self.robot_ready["robot2"]
+            if dual_real
+            else True
+        )
+
         self.robot1_home_button.setEnabled(
             system_running
             and home_idle
             and not single
+            and robot1_ready
         )
 
         self.robot2_home_button.setEnabled(
             system_running
             and home_idle
             and not single
+            and robot2_ready
         )
 
     def move_to_home(self, target):
@@ -2788,6 +3157,19 @@ class WorkcellUI(QMainWindow):
             self.home_process.state()
             != QProcess.NotRunning
         ):
+            return
+
+        dual_real_target = (
+            target in ("robot1", "robot2")
+            and self.setup_combo.currentText() == "Dual UR7e"
+            and self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        if (
+            dual_real_target
+            and not self.robot_ready[target]
+        ):
+            self.show_robot_not_ready_warning(target)
             return
 
         # Require explicit confirmation on real hardware.
@@ -2811,6 +3193,15 @@ class WorkcellUI(QMainWindow):
             )
 
             if answer != QMessageBox.Yes:
+                return
+
+            # Re-check after the confirmation dialog. PLAY may have been
+            # stopped while the dialog was open.
+            if (
+                dual_real_target
+                and not self.robot_ready[target]
+            ):
+                self.show_robot_not_ready_warning(target)
                 return
 
         workspace_setup = os.path.expanduser(
@@ -2915,14 +3306,31 @@ class WorkcellUI(QMainWindow):
             == QProcess.NotRunning
         )
 
-        enabled = (
+        base_enabled = (
             system_running
             and dual
             and command_idle
         )
 
-        self.robot1_gripper_move_button.setEnabled(enabled)
-        self.robot2_gripper_move_button.setEnabled(enabled)
+        dual_real = (
+            dual
+            and self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        self.robot1_gripper_move_button.setEnabled(
+            base_enabled
+            and (
+                not dual_real
+                or self.robot_ready["robot1"]
+            )
+        )
+        self.robot2_gripper_move_button.setEnabled(
+            base_enabled
+            and (
+                not dual_real
+                or self.robot_ready["robot2"]
+            )
+        )
 
         slider_enabled = dual and command_idle
         self.robot1_gripper_slider.setEnabled(slider_enabled)
@@ -2943,6 +3351,13 @@ class WorkcellUI(QMainWindow):
             return
 
         if robot not in ("robot1", "robot2"):
+            return
+
+        if (
+            self.mode_combo.currentText() == "Real Robot(s)"
+            and not self.robot_ready[robot]
+        ):
+            self.show_robot_not_ready_warning(robot)
             return
 
         value = max(0.0, min(1.0, float(value)))
@@ -3188,6 +3603,36 @@ class WorkcellUI(QMainWindow):
         if not self.validate_configuration():
             return
 
+        if (
+            self.setup_combo.currentText() == "Dual UR7e"
+            and self.mode_combo.currentText() == "Real Robot(s)"
+        ):
+            robot1_ready = (
+                self.robot1_connection_status.text()
+                == "REACHABLE"
+            )
+            robot2_ready = (
+                self.robot2_connection_status.text()
+                == "REACHABLE"
+            )
+
+            if not (robot1_ready and robot2_ready):
+                self.start_guard_label.setText(
+                    "Press TEST for both robot connections before "
+                    "starting the system."
+                )
+                self.start_guard_label.setVisible(True)
+                return
+
+        self.start_guard_label.clear()
+        self.start_guard_label.setVisible(False)
+
+        # Begin a fresh readiness session before launching ROS. Any
+        # robot_program_running sample from before this point is ignored.
+        self.system_session_started_at = time.monotonic()
+        self._ros_output_parse_buffer = ""
+        self.reset_robot_readiness("NOT STARTED")
+
         command = (
             self.build_ros_command()
         )
@@ -3249,6 +3694,8 @@ class WorkcellUI(QMainWindow):
         self.set_status(
             "STOPPING"
         )
+
+        self.reset_robot_readiness("NOT STARTED")
 
         pid = int(
             self.ros_process.processId()
@@ -3335,6 +3782,16 @@ class WorkcellUI(QMainWindow):
             False
         )
 
+        if self.setup_combo.currentText() == "Dual UR7e":
+            if self.mode_combo.currentText() == "Simulation":
+                for robot in ("robot1", "robot2"):
+                    self.robot_ready[robot] = True
+                    self.robot_reverse_ready_seen[robot] = True
+                    self.set_robot_ready_status(robot, "READY")
+                self.update_robot_ready_summary()
+            else:
+                self.reset_robot_readiness("NOT STARTED")
+
         self.update_home_buttons()
         self.update_gripper_buttons()
         self.refresh_wrench_display()
@@ -3381,6 +3838,10 @@ class WorkcellUI(QMainWindow):
             True
         )
 
+        self.system_session_started_at = None
+        self._ros_output_parse_buffer = ""
+        self.reset_robot_readiness("NOT STARTED")
+
         self.ur5_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
@@ -3412,6 +3873,28 @@ class WorkcellUI(QMainWindow):
             self.log_output.appendPlainText(
                 text.rstrip()
             )
+
+            # QProcess output can split a ROS log line across reads, so keep
+            # a small line buffer before looking for the reverse-interface
+            # confirmation. Only output from this current ros_process can set
+            # robot_reverse_ready_seen=True.
+            self._ros_output_parse_buffer += text
+
+            while "\n" in self._ros_output_parse_buffer:
+                line, self._ros_output_parse_buffer = (
+                    self._ros_output_parse_buffer.split("\n", 1)
+                )
+
+                ready_phrase = (
+                    "Robot connected to reverse interface. "
+                    "Ready to receive control commands."
+                )
+
+                if ready_phrase in line:
+                    if "UR_Client_Library:robot1_" in line:
+                        self.mark_reverse_interface_ready("robot1")
+                    elif "UR_Client_Library:robot2_" in line:
+                        self.mark_reverse_interface_ready("robot2")
 
             scrollbar = (
                 self.log_output.verticalScrollBar()
@@ -3529,6 +4012,12 @@ class WorkcellUI(QMainWindow):
             "wrench_refresh_timer",
         ):
             self.wrench_refresh_timer.stop()
+
+        if hasattr(
+            self,
+            "robot_state_timer",
+        ):
+            self.robot_state_timer.stop()
 
         if hasattr(
             self,
@@ -3791,6 +4280,71 @@ class WorkcellUI(QMainWindow):
                 padding: 2px 6px;
                 color: #9aa0a6;
                 font-weight: 700;
+            }
+
+            QLabel#systemWarning {
+                color: #fdd663;
+                font-weight: 700;
+                padding: 2px 4px;
+            }
+
+            QLabel#robotStateReady,
+            QLabel#robotSummaryReady {
+                background: #254c32;
+                border-radius: 5px;
+                padding: 2px 6px;
+                color: #81c995;
+                font-weight: 700;
+            }
+
+            QLabel#robotStateWaiting,
+            QLabel#robotStateConnecting,
+            QLabel#robotSummaryPartial {
+                background: #55491f;
+                border-radius: 5px;
+                padding: 2px 6px;
+                color: #fdd663;
+                font-weight: 700;
+            }
+
+            QLabel#robotStateDisconnected {
+                background: #542b29;
+                border-radius: 5px;
+                padding: 2px 6px;
+                color: #f28b82;
+                font-weight: 700;
+            }
+
+            QLabel#robotStateStopped,
+            QLabel#robotSummaryUnknown {
+                background: #303134;
+                border-radius: 5px;
+                padding: 2px 6px;
+                color: #9aa0a6;
+                font-weight: 700;
+            }
+
+            QMessageBox {
+                background-color: #202124;
+            }
+
+            QMessageBox QLabel {
+                color: #e8eaed;
+                font-size: 13px;
+            }
+
+            QMessageBox QPushButton {
+                min-width: 70px;
+                min-height: 28px;
+                background-color: #3c4043;
+                color: #ffffff;
+                border: 1px solid #5f6368;
+                border-radius: 5px;
+                padding: 3px 10px;
+            }
+
+            QMessageBox QPushButton:hover {
+                background-color: #4a4d51;
             }
 
             QFrame#separator {
