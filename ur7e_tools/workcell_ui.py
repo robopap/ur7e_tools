@@ -17,8 +17,11 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import Bool
+from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
 
 from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
@@ -53,6 +56,44 @@ FORCE_BAR_LIMIT = 50.0
 TORQUE_BAR_LIMIT = 5.0
 WRENCH_UI_REFRESH_MS = 50
 WRENCH_STALE_SEC = 0.5
+
+# Workcell health-gate timing.
+HEALTH_PROBE_PERIOD_SEC = 0.5
+HEALTH_SNAPSHOT_STALE_SEC = 2.0
+CONTROLLER_RESPONSE_STALE_SEC = 8.0
+PROGRAM_CONTROLLER_TRANSITION_GRACE_SEC = 2.0
+CONTROLLER_PROBE_INTERVAL_SEC = 0.75
+HEALTH_STARTUP_GRACE_SEC = 20.0
+
+EXPECTED_GRAPH_NODES = (
+    "/workcell/robot_state_publisher",
+    "/robot1/robot_state_publisher",
+    "/robot2/robot_state_publisher",
+)
+
+TF_BASE_FRAMES = {
+    "robot1": "robot1_base",
+    "robot2": "robot2_base",
+}
+
+SUPPORT_CONTROLLERS = (
+    "joint_state_broadcaster",
+    "io_and_status_controller",
+    "speed_scaling_state_broadcaster",
+    "force_torque_sensor_broadcaster",
+    "tcp_pose_broadcaster",
+    "ur_configuration_controller",
+    "friction_model_controller",
+)
+
+MOTION_CONTROLLERS = (
+    "joint_trajectory_controller",
+    "scaled_joint_trajectory_controller",
+    "forward_velocity_controller",
+    "forward_position_controller",
+)
+
+PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 
 
 # -------------------------------------------------------------------------
@@ -377,6 +418,43 @@ class WrenchListenerNode(Node):
         self._recordings = {}
         self._subscriptions = []
 
+        # Health probes run inside this ROS node's spin thread so the GUI never
+        # blocks on controller-manager, graph, or TF calls.
+        self._health_enabled = False
+        self._health_reset_requested = False
+        self._health_state = self._new_health_state()
+
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(
+            self._tf_buffer,
+            self,
+            spin_thread=False,
+        )
+
+        self._controller_clients = {
+            robot: self.create_client(
+                ListControllers,
+                f"/{robot}/controller_manager/list_controllers",
+            )
+            for robot in ("robot1", "robot2")
+        }
+        self._controller_futures = {
+            "robot1": None,
+            "robot2": None,
+        }
+        self._controller_last_request = {
+            "robot1": 0.0,
+            "robot2": 0.0,
+        }
+        self._controller_request_started = {
+            "robot1": None,
+            "robot2": None,
+        }
+        self._controller_cache = {
+            robot: self._new_controller_health()
+            for robot in ("robot1", "robot2")
+        }
+
         for key, topic in self.TOPICS.items():
             subscription = self.create_subscription(
                 WrenchStamped,
@@ -414,6 +492,11 @@ class WrenchListenerNode(Node):
             )
             self._subscriptions.append(subscription)
 
+        self._health_timer = self.create_timer(
+            HEALTH_PROBE_PERIOD_SEC,
+            self._health_timer_callback,
+        )
+
     def _program_running_callback(self, key, msg):
         with self._lock:
             self._program_states[key] = (
@@ -435,6 +518,247 @@ class WrenchListenerNode(Node):
     def robot_mode_snapshot(self):
         with self._lock:
             return dict(self._robot_modes)
+
+    # -----------------------------------------------------
+    # Workcell health probes
+    # -----------------------------------------------------
+
+    @staticmethod
+    def _new_controller_health():
+        return {
+            "service_ready": False,
+            "response_stamp": None,
+            "states": {},
+            "error": "",
+            "pending_since": None,
+        }
+
+    @classmethod
+    def _new_health_state(cls):
+        return {
+            "stamp": None,
+            "graph_ok": False,
+            "graph_missing": list(EXPECTED_GRAPH_NODES),
+            "graph_duplicates": [],
+            "tf_ok": {
+                "robot1": False,
+                "robot2": False,
+            },
+            "controllers": {
+                "robot1": cls._new_controller_health(),
+                "robot2": cls._new_controller_health(),
+            },
+        }
+
+    def request_health_reset(self):
+        # The actual reset is performed by the ROS spin thread on the next
+        # health timer tick. This also clears the TF buffer so old transforms
+        # from a previous UI-owned launch cannot satisfy a new session.
+        with self._lock:
+            self._health_enabled = False
+            self._health_reset_requested = True
+            self._health_state = self._new_health_state()
+
+    def set_health_monitor_enabled(self, enabled):
+        with self._lock:
+            self._health_enabled = bool(enabled)
+
+    def health_snapshot(self):
+        with self._lock:
+            state = self._health_state
+            return {
+                "stamp": state["stamp"],
+                "graph_ok": bool(state["graph_ok"]),
+                "graph_missing": list(state["graph_missing"]),
+                "graph_duplicates": list(state["graph_duplicates"]),
+                "tf_ok": dict(state["tf_ok"]),
+                "controllers": {
+                    robot: {
+                        "service_ready": bool(
+                            state["controllers"][robot]["service_ready"]
+                        ),
+                        "response_stamp": (
+                            state["controllers"][robot]["response_stamp"]
+                        ),
+                        "states": dict(
+                            state["controllers"][robot]["states"]
+                        ),
+                        "error": state["controllers"][robot]["error"],
+                        "pending_since": (
+                            state["controllers"][robot]["pending_since"]
+                        ),
+                    }
+                    for robot in ("robot1", "robot2")
+                },
+            }
+
+    def _apply_health_reset(self):
+        try:
+            clear = getattr(self._tf_buffer, "clear", None)
+            if callable(clear):
+                clear()
+        except Exception:
+            # The state is still reset below. A missing/unclear TF path will
+            # remain fail-closed until current-session TF is observed again.
+            pass
+
+        self._controller_futures = {
+            "robot1": None,
+            "robot2": None,
+        }
+        self._controller_last_request = {
+            "robot1": 0.0,
+            "robot2": 0.0,
+        }
+        self._controller_request_started = {
+            "robot1": None,
+            "robot2": None,
+        }
+        self._controller_cache = {
+            robot: self._new_controller_health()
+            for robot in ("robot1", "robot2")
+        }
+
+    def _health_timer_callback(self):
+        with self._lock:
+            reset_requested = self._health_reset_requested
+            enabled = self._health_enabled
+            if reset_requested:
+                self._health_reset_requested = False
+
+        if reset_requested:
+            self._apply_health_reset()
+
+        if not enabled:
+            return
+
+        now = time.monotonic()
+
+        # ROS graph: every required robot_state_publisher must appear exactly
+        # once. This deliberately rejects duplicate stale graph entries.
+        node_counts = {}
+        try:
+            for node_name, namespace in self.get_node_names_and_namespaces():
+                namespace = namespace or "/"
+                if namespace == "/":
+                    full_name = f"/{node_name}"
+                else:
+                    full_name = (
+                        f"{namespace.rstrip('/')}/{node_name}"
+                    )
+                node_counts[full_name] = node_counts.get(full_name, 0) + 1
+        except Exception:
+            node_counts = {}
+
+        graph_missing = [
+            name
+            for name in EXPECTED_GRAPH_NODES
+            if node_counts.get(name, 0) == 0
+        ]
+        graph_duplicates = [
+            name
+            for name in EXPECTED_GRAPH_NODES
+            if node_counts.get(name, 0) > 1
+        ]
+        graph_ok = not graph_missing and not graph_duplicates
+
+        # TF: require a current transform path for each robot base.
+        tf_ok = {}
+        for robot, base_frame in TF_BASE_FRAMES.items():
+            try:
+                tf_ok[robot] = bool(
+                    self._tf_buffer.can_transform(
+                        "world",
+                        base_frame,
+                        Time(),
+                    )
+                )
+            except Exception:
+                tf_ok[robot] = False
+
+        # Controller managers: issue one non-blocking list_controllers call per
+        # robot and never stack another request while one is still pending.
+        for robot in ("robot1", "robot2"):
+            self._update_controller_probe(robot, now)
+
+        controller_snapshot = {
+            robot: {
+                "service_ready": bool(
+                    self._controller_cache[robot]["service_ready"]
+                ),
+                "response_stamp": (
+                    self._controller_cache[robot]["response_stamp"]
+                ),
+                "states": dict(
+                    self._controller_cache[robot]["states"]
+                ),
+                "error": self._controller_cache[robot]["error"],
+                "pending_since": (
+                    self._controller_cache[robot]["pending_since"]
+                ),
+            }
+            for robot in ("robot1", "robot2")
+        }
+
+        with self._lock:
+            self._health_state = {
+                "stamp": now,
+                "graph_ok": graph_ok,
+                "graph_missing": graph_missing,
+                "graph_duplicates": graph_duplicates,
+                "tf_ok": tf_ok,
+                "controllers": controller_snapshot,
+            }
+
+    def _update_controller_probe(self, robot, now):
+        client = self._controller_clients[robot]
+        future = self._controller_futures[robot]
+        cache = self._controller_cache[robot]
+
+        if future is not None and future.done():
+            try:
+                response = future.result()
+                cache["states"] = {
+                    controller.name: controller.state
+                    for controller in response.controller
+                }
+                cache["response_stamp"] = now
+                cache["error"] = ""
+            except Exception as exc:
+                cache["error"] = str(exc)
+
+            cache["pending_since"] = None
+            self._controller_futures[robot] = None
+            future = None
+
+        if future is not None:
+            cache["service_ready"] = True
+            cache["pending_since"] = self._controller_request_started[robot]
+            return
+
+        if (
+            now - self._controller_last_request[robot]
+            < CONTROLLER_PROBE_INTERVAL_SEC
+        ):
+            return
+
+        self._controller_last_request[robot] = now
+        cache["service_ready"] = bool(client.service_is_ready())
+
+        if not cache["service_ready"]:
+            cache["pending_since"] = None
+            if cache["response_stamp"] is None:
+                cache["error"] = "list_controllers service unavailable"
+            return
+
+        try:
+            future = client.call_async(ListControllers.Request())
+            self._controller_futures[robot] = future
+            self._controller_request_started[robot] = now
+            cache["pending_since"] = now
+        except Exception as exc:
+            cache["error"] = str(exc)
+            cache["pending_since"] = None
 
     def _wrench_callback(self, key, msg):
         values = (
@@ -723,6 +1047,10 @@ class WorkcellUI(QMainWindow):
             "robot1": False,
             "robot2": False,
         }
+        self.robot_core_health = {
+            "robot1": "checking",
+            "robot2": "checking",
+        }
         self._ros_output_parse_buffer = ""
 
         # -----------------------------------------------------
@@ -944,9 +1272,22 @@ class WorkcellUI(QMainWindow):
         setup_layout.addWidget(self.status_label)
 
         setup_layout.addSpacing(6)
+        setup_layout.addWidget(QLabel("Health:"))
+
+        self.health_status_label = QLabel("STOPPED")
+        self.health_status_label.setObjectName(
+            "connectionUnknown"
+        )
+        self.health_status_label.setToolTip(
+            "ROS graph, TF, controller-manager, controller state, "
+            "robot mode, and readiness health gates."
+        )
+        setup_layout.addWidget(self.health_status_label)
+
+        setup_layout.addSpacing(6)
         setup_layout.addWidget(QLabel("Robots:"))
 
-        self.robots_ready_label = QLabel("0/2 READY")
+        self.robots_ready_label = QLabel("NOT READY")
         self.robots_ready_label.setObjectName(
             "robotSummaryUnknown"
         )
@@ -2982,6 +3323,9 @@ class WorkcellUI(QMainWindow):
         if hasattr(self, "robots_ready_label"):
             self.robots_ready_label.setVisible(not single)
 
+        if hasattr(self, "health_status_label"):
+            self.health_status_label.setVisible(not single)
+
         if hasattr(self, "start_guard_label"):
             self.start_guard_label.clear()
             self.start_guard_label.setVisible(False)
@@ -3272,7 +3616,7 @@ class WorkcellUI(QMainWindow):
     # Robot program / reverse-interface readiness
     # =========================================================
 
-    def set_robot_ready_status(self, robot, status):
+    def set_robot_ready_status(self, robot, status, tooltip=None):
 
         label = (
             self.robot1_ready_status
@@ -3286,6 +3630,8 @@ class WorkcellUI(QMainWindow):
             "READY": "robotStateReady",
             "WAITING FOR PLAY": "robotStateWaiting",
             "CONNECTING...": "robotStateConnecting",
+            "HEALTH CHECK...": "robotStateConnecting",
+            "HEALTH ERROR": "robotStateDisconnected",
             "DISCONNECTED": "robotStateDisconnected",
             "NOT STARTED": "robotStateStopped",
         }
@@ -3293,8 +3639,40 @@ class WorkcellUI(QMainWindow):
         label.setObjectName(
             object_names.get(status, "robotStateStopped")
         )
+
+        if tooltip is not None:
+            label.setToolTip(tooltip)
+
         label.style().unpolish(label)
         label.style().polish(label)
+
+    def set_health_status(self, text, state, tooltip=None):
+
+        if not hasattr(self, "health_status_label"):
+            return
+
+        self.health_status_label.setText(text)
+
+        object_names = {
+            "ok": "connectionReachable",
+            "checking": "connectionTesting",
+            "fault": "connectionOffline",
+            "stopped": "connectionUnknown",
+        }
+
+        self.health_status_label.setObjectName(
+            object_names.get(state, "connectionUnknown")
+        )
+
+        if tooltip is not None:
+            self.health_status_label.setToolTip(tooltip)
+
+        self.health_status_label.style().unpolish(
+            self.health_status_label
+        )
+        self.health_status_label.style().polish(
+            self.health_status_label
+        )
 
     def update_robot_ready_summary(self):
 
@@ -3306,17 +3684,17 @@ class WorkcellUI(QMainWindow):
             if ready
         )
 
-        self.robots_ready_label.setText(
-            f"{ready_count}/2 READY"
-        )
-
         if ready_count == 2:
+            summary = "WORKCELL READY"
             object_name = "robotSummaryReady"
-        elif ready_count > 0:
+        elif ready_count == 1:
+            summary = "1/2 READY"
             object_name = "robotSummaryPartial"
         else:
+            summary = "NOT READY"
             object_name = "robotSummaryUnknown"
 
+        self.robots_ready_label.setText(summary)
         self.robots_ready_label.setObjectName(object_name)
         self.robots_ready_label.style().unpolish(
             self.robots_ready_label
@@ -3330,9 +3708,14 @@ class WorkcellUI(QMainWindow):
         for robot in ("robot1", "robot2"):
             self.robot_ready[robot] = False
             self.robot_reverse_ready_seen[robot] = False
+            self.robot_core_health[robot] = "checking"
 
             if hasattr(self, f"{robot}_ready_status"):
-                self.set_robot_ready_status(robot, status)
+                self.set_robot_ready_status(
+                    robot,
+                    status,
+                    "Workcell health has not been established for this session.",
+                )
 
         self.update_robot_ready_summary()
 
@@ -3341,6 +3724,287 @@ class WorkcellUI(QMainWindow):
 
         if hasattr(self, "gripper_process"):
             self.update_gripper_buttons()
+
+    def _evaluate_robot_core_health(
+        self,
+        robot,
+        health,
+        now,
+        program_sample,
+        mode_sample,
+    ):
+        session_start = self.system_session_started_at
+        session_age = (
+            now - session_start
+            if session_start is not None
+            else 0.0
+        )
+        startup_waiting = (
+            session_age < HEALTH_STARTUP_GRACE_SEC
+        )
+
+        details = []
+        has_error = False
+        has_waiting = False
+
+        health_stamp = health.get("stamp")
+        health_snapshot_current = (
+            health_stamp is not None
+            and session_start is not None
+            and health_stamp >= session_start
+            and now - health_stamp <= HEALTH_SNAPSHOT_STALE_SEC
+        )
+
+        if not health_snapshot_current:
+            has_waiting = True
+            details.append("Health probe: WAITING")
+            return "checking", details
+
+        graph_ok = bool(health.get("graph_ok"))
+        graph_missing = health.get("graph_missing", [])
+        graph_duplicates = health.get("graph_duplicates", [])
+
+        if graph_duplicates:
+            has_error = True
+            details.append(
+                "ROS graph: ERROR (duplicate: "
+                + ", ".join(graph_duplicates)
+                + ")"
+            )
+        elif graph_missing:
+            if startup_waiting:
+                has_waiting = True
+                state = "WAITING"
+            else:
+                has_error = True
+                state = "ERROR"
+            details.append(
+                "ROS graph: "
+                + state
+                + " (missing: "
+                + ", ".join(graph_missing)
+                + ")"
+            )
+        else:
+            details.append("ROS graph: OK")
+
+        tf_ok = bool(
+            health.get("tf_ok", {}).get(robot, False)
+        )
+        if tf_ok:
+            details.append(
+                f"TF world -> {TF_BASE_FRAMES[robot]}: OK"
+            )
+        else:
+            if startup_waiting:
+                has_waiting = True
+                tf_state = "WAITING"
+            else:
+                has_error = True
+                tf_state = "ERROR"
+            details.append(
+                f"TF world -> {TF_BASE_FRAMES[robot]}: {tf_state}"
+            )
+
+        mode_current = (
+            mode_sample is not None
+            and session_start is not None
+            and mode_sample[0] >= session_start
+        )
+        robot_mode_running_value = int(
+            getattr(RobotMode, "RUNNING", 7)
+        )
+
+        if not mode_current:
+            if startup_waiting:
+                has_waiting = True
+                details.append("Robot mode: WAITING")
+            else:
+                has_error = True
+                details.append("Robot mode: ERROR (no current sample)")
+        else:
+            mode_value = int(mode_sample[1])
+            if mode_value == robot_mode_running_value:
+                details.append(
+                    f"Robot mode: RUNNING ({mode_value})"
+                )
+            else:
+                has_error = True
+                details.append(
+                    f"Robot mode: ERROR ({mode_value})"
+                )
+
+        controller_info = (
+            health.get("controllers", {}).get(robot, {})
+        )
+        response_stamp = controller_info.get(
+            "response_stamp"
+        )
+        states = controller_info.get("states", {})
+        controller_error = controller_info.get(
+            "error", ""
+        )
+
+        response_current = (
+            response_stamp is not None
+            and session_start is not None
+            and response_stamp >= session_start
+        )
+        response_fresh = (
+            response_current
+            and now - response_stamp
+            <= CONTROLLER_RESPONSE_STALE_SEC
+        )
+
+        if not response_fresh:
+            if startup_waiting or response_stamp is None:
+                has_waiting = True
+                manager_state = "WAITING"
+            else:
+                has_error = True
+                manager_state = "ERROR"
+
+            extra = ""
+            if controller_error:
+                extra = f" ({controller_error})"
+            details.append(
+                f"controller_manager: {manager_state}{extra}"
+            )
+        else:
+            age = now - response_stamp
+            details.append(
+                f"controller_manager: OK ({age:.1f}s)"
+            )
+
+            support_bad = [
+                name
+                for name in SUPPORT_CONTROLLERS
+                if states.get(name) != "active"
+            ]
+
+            if support_bad:
+                has_error = True
+                details.append(
+                    "Support controllers: ERROR ("
+                    + ", ".join(
+                        f"{name}={states.get(name, 'missing')}"
+                        for name in support_bad
+                    )
+                    + ")"
+                )
+            else:
+                details.append("Support controllers: OK")
+
+            program_current = (
+                program_sample is not None
+                and session_start is not None
+                and program_sample[0] >= session_start
+            )
+
+            if program_current:
+                program_running = bool(program_sample[1])
+                program_transition_stamp = program_sample[0]
+            else:
+                program_running = False
+                program_transition_stamp = session_start
+
+            # Do not compare controller states captured before the latest
+            # robot_program_running transition. Wait for a fresh response.
+            controller_after_transition = (
+                response_stamp is not None
+                and program_transition_stamp is not None
+                and response_stamp >= program_transition_stamp
+            )
+
+            if not controller_after_transition:
+                has_waiting = True
+                details.append(
+                    "Motion controllers: WAITING FOR FRESH STATE"
+                )
+            else:
+                expected = {
+                    name: "inactive"
+                    for name in MOTION_CONTROLLERS
+                }
+                if program_running:
+                    expected[
+                        PRIMARY_MOTION_CONTROLLER
+                    ] = "active"
+
+                motion_bad = [
+                    name
+                    for name, expected_state in expected.items()
+                    if states.get(name) != expected_state
+                ]
+
+                if motion_bad:
+                    transition_recent = (
+                        program_current
+                        and now - program_sample[0]
+                        < PROGRAM_CONTROLLER_TRANSITION_GRACE_SEC
+                    )
+
+                    if transition_recent:
+                        has_waiting = True
+                        details.append(
+                            "Motion controllers: SYNCING ("
+                            + ", ".join(
+                                f"{name}={states.get(name, 'missing')}"
+                                for name in motion_bad
+                            )
+                            + ")"
+                        )
+                    else:
+                        has_error = True
+                        details.append(
+                            "Motion controllers: ERROR ("
+                            + ", ".join(
+                                f"{name}={states.get(name, 'missing')}"
+                                for name in motion_bad
+                            )
+                            + ")"
+                        )
+                else:
+                    phase = (
+                        "PLAY"
+                        if program_running
+                        else "WAITING"
+                    )
+                    details.append(
+                        f"Motion controllers: OK ({phase})"
+                    )
+
+        program_current = (
+            program_sample is not None
+            and session_start is not None
+            and program_sample[0] >= session_start
+        )
+        if program_current:
+            details.append(
+                "Program: "
+                + (
+                    "RUNNING"
+                    if bool(program_sample[1])
+                    else "STOPPED"
+                )
+            )
+        else:
+            details.append("Program: NO CURRENT SAMPLE")
+
+        details.append(
+            "Reverse interface: "
+            + (
+                "READY"
+                if self.robot_reverse_ready_seen[robot]
+                else "WAITING"
+            )
+        )
+
+        if has_error:
+            return "error", details
+        if has_waiting:
+            return "checking", details
+        return "ok", details
 
     def refresh_robot_readiness(self):
 
@@ -3356,82 +4020,130 @@ class WorkcellUI(QMainWindow):
         if not system_running:
             return
 
-        # Simulation has no pendant/External Control handshake. Preserve the
-        # existing behavior by treating both simulated robots as ready once
-        # the launch process is running.
+        # Simulation has no pendant/External Control handshake or hardware
+        # controller-manager health path.
         if self.mode_combo.currentText() == "Simulation":
             changed = False
             for robot in ("robot1", "robot2"):
+                self.robot_core_health[robot] = "ok"
                 if not self.robot_ready[robot]:
                     self.robot_ready[robot] = True
                     changed = True
-                self.set_robot_ready_status(robot, "READY")
+                self.set_robot_ready_status(
+                    robot,
+                    "READY",
+                    "Simulation mode: hardware health gates are not required.",
+                )
+
+            self.set_health_status(
+                "SIMULATION",
+                "ok",
+                "Simulation mode: real-robot health gates are bypassed.",
+            )
 
             if changed:
                 self.update_home_buttons()
                 self.update_gripper_buttons()
+
             self.update_robot_ready_summary()
             return
 
         if self.system_session_started_at is None:
             return
 
+        now = time.monotonic()
         program_states = self.wrench_listener.program_snapshot()
         robot_modes = self.wrench_listener.robot_mode_snapshot()
+        health = self.wrench_listener.health_snapshot()
         controls_changed = False
+        health_tooltips = []
 
         for robot in ("robot1", "robot2"):
             program_sample = program_states.get(robot)
             mode_sample = robot_modes.get(robot)
 
-            # Only accept state received after the current START SYSTEM.
-            # robot_program_running is not guaranteed to emit an initial False
-            # before PLAY, while robot_mode is already published by the active
-            # io_and_status_controller. A current-session robot_mode sample is
-            # therefore enough to display WAITING FOR PLAY, but never READY.
+            core_state, details = (
+                self._evaluate_robot_core_health(
+                    robot,
+                    health,
+                    now,
+                    program_sample,
+                    mode_sample,
+                )
+            )
+            self.robot_core_health[robot] = core_state
+
             program_current = (
                 program_sample is not None
-                and program_sample[0] >= self.system_session_started_at
+                and program_sample[0]
+                >= self.system_session_started_at
             )
-            mode_current = (
-                mode_sample is not None
-                and mode_sample[0] >= self.system_session_started_at
+            program_running = (
+                bool(program_sample[1])
+                if program_current
+                else False
             )
 
-            if not program_current:
+            if core_state == "error":
                 desired_ready = False
-
-                if mode_current:
-                    desired_status = "WAITING FOR PLAY"
-                else:
-                    desired_status = "NOT STARTED"
+                desired_status = "HEALTH ERROR"
+            elif core_state == "checking":
+                desired_ready = False
+                desired_status = "HEALTH CHECK..."
+            elif not program_current or not program_running:
+                desired_ready = False
+                desired_status = "WAITING FOR PLAY"
+            elif self.robot_reverse_ready_seen[robot]:
+                desired_ready = True
+                desired_status = "READY"
             else:
-                program_running = bool(program_sample[1])
-
-                if not program_running:
-                    # Do not clear reverse readiness here. The Bool callback and
-                    # the UR client log are asynchronous and can arrive in either
-                    # order during STOP -> PLAY. Clearing here can erase a fresh
-                    # reverse-interface READY event if a delayed False sample is
-                    # processed immediately afterwards. Reverse readiness is
-                    # cleared explicitly from fresh current-session UR client
-                    # events ("dropped" / "requested program") instead.
-                    desired_ready = False
-                    desired_status = "WAITING FOR PLAY"
-                elif self.robot_reverse_ready_seen[robot]:
-                    desired_ready = True
-                    desired_status = "READY"
-                else:
-                    desired_ready = False
-                    desired_status = "CONNECTING..."
+                desired_ready = False
+                desired_status = "CONNECTING..."
 
             if self.robot_ready[robot] != desired_ready:
                 self.robot_ready[robot] = desired_ready
                 controls_changed = True
 
+            display_name = (
+                "Robot 1"
+                if robot == "robot1"
+                else "Robot 2"
+            )
+            tooltip = (
+                display_name
+                + " health gates\n"
+                + "\n".join(details)
+            )
+            health_tooltips.append(tooltip)
+
             self.set_robot_ready_status(
                 robot,
                 desired_status,
+                tooltip,
+            )
+
+        core_states = tuple(
+            self.robot_core_health[robot]
+            for robot in ("robot1", "robot2")
+        )
+
+        if all(state == "ok" for state in core_states):
+            self.set_health_status(
+                "OK",
+                "ok",
+                "\n\n".join(health_tooltips),
+            )
+        elif any(state == "error" for state in core_states):
+            self.set_health_status(
+                "FAULT",
+                "fault",
+                "\n\n".join(health_tooltips),
+            )
+        else:
+            self.set_health_status(
+                "CHECKING...",
+                "checking",
+                "\n\n".join(health_tooltips),
             )
 
         self.update_robot_ready_summary()
@@ -3490,10 +4202,26 @@ class WorkcellUI(QMainWindow):
         display_name = (
             "Robot 1" if robot == "robot1" else "Robot 2"
         )
-        self.start_guard_label.setText(
-            f"{display_name} is not ready. Press PLAY on the "
-            f"{display_name} pendant."
+        status_label = (
+            self.robot1_ready_status
+            if robot == "robot1"
+            else self.robot2_ready_status
         )
+        status = status_label.text()
+
+        if status in ("HEALTH ERROR", "HEALTH CHECK..."):
+            message = (
+                f"{display_name} health gates are not satisfied. "
+                f"Hover the {display_name} status or the Health indicator "
+                "for details."
+            )
+        else:
+            message = (
+                f"{display_name} is not ready. Press PLAY on the "
+                f"{display_name} pendant."
+            )
+
+        self.start_guard_label.setText(message)
         self.start_guard_label.setVisible(True)
 
     # =========================================================
@@ -4039,10 +4767,17 @@ class WorkcellUI(QMainWindow):
         self.start_guard_label.setVisible(False)
 
         # Begin a fresh readiness session before launching ROS. Any
-        # robot_program_running sample from before this point is ignored.
+        # robot_program_running/controller/TF state from before this point is
+        # ignored. The ROS spin thread also clears its health caches/TF buffer.
         self.system_session_started_at = time.monotonic()
         self._ros_output_parse_buffer = ""
+        self.wrench_listener.request_health_reset()
         self.reset_robot_readiness("NOT STARTED")
+        self.set_health_status(
+            "CHECKING...",
+            "checking",
+            "Waiting for current-session ROS/TF/controller health.",
+        )
 
         command = (
             self.build_ros_command()
@@ -4106,6 +4841,12 @@ class WorkcellUI(QMainWindow):
             "STOPPING"
         )
 
+        self.wrench_listener.set_health_monitor_enabled(False)
+        self.set_health_status(
+            "STOPPING",
+            "checking",
+            "Health monitoring paused during workcell shutdown.",
+        )
         self.reset_robot_readiness("NOT STARTED")
 
         pid = int(
@@ -4195,13 +4936,30 @@ class WorkcellUI(QMainWindow):
 
         if self.setup_combo.currentText() == "Dual UR7e":
             if self.mode_combo.currentText() == "Simulation":
+                self.wrench_listener.set_health_monitor_enabled(False)
                 for robot in ("robot1", "robot2"):
                     self.robot_ready[robot] = True
                     self.robot_reverse_ready_seen[robot] = True
-                    self.set_robot_ready_status(robot, "READY")
+                    self.robot_core_health[robot] = "ok"
+                    self.set_robot_ready_status(
+                        robot,
+                        "READY",
+                        "Simulation mode.",
+                    )
+                self.set_health_status(
+                    "SIMULATION",
+                    "ok",
+                    "Simulation mode: real-robot health gates are bypassed.",
+                )
                 self.update_robot_ready_summary()
             else:
                 self.reset_robot_readiness("NOT STARTED")
+                self.wrench_listener.set_health_monitor_enabled(True)
+                self.set_health_status(
+                    "CHECKING...",
+                    "checking",
+                    "Waiting for current-session ROS/TF/controller health.",
+                )
 
         self.update_home_buttons()
         self.update_gripper_buttons()
@@ -4249,9 +5007,15 @@ class WorkcellUI(QMainWindow):
             True
         )
 
+        self.wrench_listener.set_health_monitor_enabled(False)
         self.system_session_started_at = None
         self._ros_output_parse_buffer = ""
         self.reset_robot_readiness("NOT STARTED")
+        self.set_health_status(
+            "STOPPED",
+            "stopped",
+            "Workcell is stopped.",
+        )
 
         self.ur5_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
@@ -4457,6 +5221,9 @@ class WorkcellUI(QMainWindow):
             self.ft_zero_process.waitForFinished(
                 1000
             )
+
+        if hasattr(self, "wrench_listener"):
+            self.wrench_listener.set_health_monitor_enabled(False)
 
         if hasattr(
             self,
