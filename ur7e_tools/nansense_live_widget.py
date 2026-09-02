@@ -3,7 +3,9 @@ import socket
 import threading
 import time
 import sys
+import os
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 
@@ -11,7 +13,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox, QStackedWidget
+    QPushButton, QLabel, QComboBox, QDoubleSpinBox, QStackedWidget
 )
 
 from matplotlib.figure import Figure
@@ -24,6 +26,21 @@ except ImportError:
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 33333
+
+CALIBRATION_DEFAULTS = {
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "z_m": 0.0,
+    "yaw_deg": 0.0,
+}
+
+ZERO_TARGET_M = (0.60, -0.60, 0.0)
+LEFT_FOOT_JOINTS = (
+    "LeftFoot", "LeftToeBase", "LeftFootToe", "LeftFootToeTip",
+)
+RIGHT_FOOT_JOINTS = (
+    "RightFoot", "RightToeBase", "RightFootToe", "RightFootToeTip",
+)
 
 BODY_JOINTS = {
     "Hips","Spine","Spine1","Spine2","Spine3","Neck","Head","HeadTip",
@@ -193,6 +210,40 @@ def opengl_scene_positions(xyz):
         scene_xyz[:, 2] *= -1.0
     return scene_xyz
 
+def zero_calibration_from_feet(frame, target_m, yaw_deg):
+    """Return XYZ offsets that place the two lowest foot points at target."""
+    joints = frame["joints"]
+
+    def lowest_available(names):
+        available = [
+            joints[name]["position_world_cm"]
+            for name in names
+            if name in joints
+        ]
+        if not available:
+            return None
+        # NANSENSE PY is the upright ROS Z coordinate.
+        return min(available, key=lambda position: position[1])
+
+    left = lowest_available(LEFT_FOOT_JOINTS)
+    right = lowest_available(RIGHT_FOOT_JOINTS)
+    if left is None or right is None:
+        raise ValueError("both left and right foot joints are required")
+
+    foot_x_m = (left[0] + right[0]) * 0.005
+    foot_y_m = (left[2] + right[2]) * 0.005
+    floor_z_m = min(left[1], right[1]) * 0.01
+
+    yaw = np.deg2rad(yaw_deg)
+    rotated_x = np.cos(yaw) * foot_x_m - np.sin(yaw) * foot_y_m
+    rotated_y = np.sin(yaw) * foot_x_m + np.cos(yaw) * foot_y_m
+    return {
+        "x_m": float(target_m[0] - rotated_x),
+        "y_m": float(target_m[1] - rotated_y),
+        "z_m": float(target_m[2] - floor_z_m),
+        "yaw_deg": float(yaw_deg),
+    }
+
 class RenderRateMeter:
     """Rolling rate of frames confirmed as rendered by the GUI backend."""
     def __init__(self, window_sec=2.0):
@@ -216,9 +267,22 @@ class RenderRateMeter:
         self.timestamps.clear()
 
 class NansenseLiveWidget(QWidget):
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        frame_callback=None,
+        calibration_callback=None,
+    ):
         super().__init__(parent)
         self.receiver = LatestFrameReceiver()
+        self.frame_callback = frame_callback
+        self.calibration_callback = calibration_callback
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+        )
+        self.calibration_path = (
+            config_home / "ur7e_tools" / "nansense_calibration.yaml"
+        )
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(6, 6, 6, 6)
@@ -261,6 +325,48 @@ class NansenseLiveWidget(QWidget):
         top.addWidget(self.status_label)
 
         self.main_layout.addLayout(top)
+
+        calibration_row = QHBoxLayout()
+        calibration_row.addWidget(QLabel("RViz calibration:"))
+        self.calibration_spins = {}
+        for key, label, minimum, maximum in (
+            ("x_m", "X [m]", -20.0, 20.0),
+            ("y_m", "Y [m]", -20.0, 20.0),
+            ("z_m", "Z [m]", -5.0, 5.0),
+            ("yaw_deg", "Yaw [deg]", -360.0, 360.0),
+        ):
+            calibration_row.addWidget(QLabel(label))
+            spin = QDoubleSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setDecimals(3 if key != "yaw_deg" else 1)
+            spin.setSingleStep(0.05 if key != "yaw_deg" else 5.0)
+            spin.setValue(CALIBRATION_DEFAULTS[key])
+            self.calibration_spins[key] = spin
+            calibration_row.addWidget(spin)
+
+        self.apply_calibration_button = QPushButton("APPLY")
+        self.apply_calibration_button.clicked.connect(self.apply_calibration)
+        calibration_row.addWidget(self.apply_calibration_button)
+
+        self.save_calibration_button = QPushButton("SAVE")
+        self.save_calibration_button.clicked.connect(self.save_calibration)
+        calibration_row.addWidget(self.save_calibration_button)
+
+        self.zero_here_button = QPushButton("ZERO HERE")
+        self.zero_here_button.setToolTip(
+            "Place the feet at world X=0.60 m, Y=-0.60 m, Z=0.00 m; "
+            "the current yaw is preserved."
+        )
+        self.zero_here_button.clicked.connect(self.zero_here)
+        calibration_row.addWidget(self.zero_here_button)
+
+        self.calibration_status_label = QLabel("")
+        calibration_row.addWidget(self.calibration_status_label)
+        calibration_row.addStretch(1)
+        self.main_layout.addLayout(calibration_row)
+
+        self.load_calibration()
+        self.apply_calibration(show_status=False)
 
         self.render_stack = QStackedWidget()
         self.main_layout.addWidget(self.render_stack, stretch=1)
@@ -354,6 +460,81 @@ class NansenseLiveWidget(QWidget):
         self.timer.timeout.connect(self.update_plot)
         self.timer.start()
 
+    def calibration_values(self):
+        return {
+            key: spin.value()
+            for key, spin in self.calibration_spins.items()
+        }
+
+    def apply_calibration(self, _checked=False, show_status=True):
+        if self.calibration_callback is not None:
+            self.calibration_callback(self.calibration_values())
+        if show_status:
+            self.calibration_status_label.setText("Applied")
+
+    def load_calibration(self):
+        if not self.calibration_path.exists():
+            self.calibration_status_label.setText("Not saved")
+            return
+
+        values = dict(CALIBRATION_DEFAULTS)
+        try:
+            for raw_line in self.calibration_path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, separator, raw_value = line.partition(":")
+                if separator and key.strip() in values:
+                    values[key.strip()] = float(raw_value.strip())
+        except (OSError, ValueError) as exc:
+            self.calibration_status_label.setText(f"Load error: {exc}")
+            return
+
+        for key, value in values.items():
+            self.calibration_spins[key].setValue(value)
+        self.calibration_status_label.setText("Loaded")
+
+    def save_calibration(self):
+        self.apply_calibration(show_status=False)
+        values = self.calibration_values()
+        text = (
+            "# NANSENSE origin pose in the ROS world frame\n"
+            f"x_m: {values['x_m']:.6f}\n"
+            f"y_m: {values['y_m']:.6f}\n"
+            f"z_m: {values['z_m']:.6f}\n"
+            f"yaw_deg: {values['yaw_deg']:.6f}\n"
+        )
+        temporary_path = self.calibration_path.with_suffix(".yaml.tmp")
+        try:
+            self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(text)
+            os.replace(temporary_path, self.calibration_path)
+        except OSError as exc:
+            self.calibration_status_label.setText(f"Save error: {exc}")
+            return
+        self.calibration_status_label.setText("Saved")
+
+    def zero_here(self):
+        frame = self.receiver.get_latest()
+        if frame is None:
+            self.calibration_status_label.setText("No NANSENSE frame")
+            return
+
+        try:
+            values = zero_calibration_from_feet(
+                frame,
+                ZERO_TARGET_M,
+                self.calibration_spins["yaw_deg"].value(),
+            )
+        except ValueError:
+            self.calibration_status_label.setText("Both feet required")
+            return
+
+        for key, value in values.items():
+            self.calibration_spins[key].setValue(value)
+        self.apply_calibration(show_status=False)
+        self.calibration_status_label.setText("Zero applied; press SAVE")
+
     def toggle_connection(self):
         if self.receiver.running:
             self.disconnect_nansense()
@@ -372,6 +553,8 @@ class NansenseLiveWidget(QWidget):
 
     def disconnect_nansense(self):
         self.receiver.stop()
+        if self.frame_callback is not None:
+            self.frame_callback(None)
         self.connect_button.setText("CONNECT NANSENSE")
         self.status_label.setText("Disconnected")
         self.clear_plot()
@@ -453,6 +636,9 @@ class NansenseLiveWidget(QWidget):
             self.status_label.setText(f"Waiting for UDP :{UDP_PORT}...")
             return
 
+        if self.frame_callback is not None:
+            self.frame_callback(frame)
+
         chains = VIEW_CHAINS[self.view_combo.currentText()]
         self.clear_plot()
 
@@ -510,6 +696,8 @@ class NansenseLiveWidget(QWidget):
     def shutdown(self):
         self.timer.stop()
         self.receiver.stop()
+        if self.frame_callback is not None:
+            self.frame_callback(None)
 
     def closeEvent(self, event):
         self.shutdown()

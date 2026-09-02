@@ -3,6 +3,7 @@
 import csv
 import ipaddress
 import glob
+import math
 import os
 import shlex
 import shutil
@@ -15,14 +16,16 @@ from datetime import datetime
 from pathlib import Path
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from controller_manager_msgs.srv import ListControllers
-from geometry_msgs.msg import WrenchStamped
+from geometry_msgs.msg import Point, WrenchStamped
 from std_msgs.msg import Bool
 from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
+from visualization_msgs.msg import Marker, MarkerArray
 
 from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QPainter
@@ -49,13 +52,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ur7e_tools.nansense_live_widget import NansenseLiveWidget
+from ur7e_tools.nansense_live_widget import (
+    BODY_JOINTS,
+    VIEW_CHAINS,
+    NansenseLiveWidget,
+)
 
 
 FORCE_BAR_LIMIT = 50.0
 TORQUE_BAR_LIMIT = 5.0
 WRENCH_UI_REFRESH_MS = 50
 WRENCH_STALE_SEC = 0.5
+
+NANSENSE_MARKER_TOPIC = "/nansense/skeleton_markers"
+NANSENSE_MARKER_FRAME = "world"
+NANSENSE_MARKER_LIFETIME_SEC = 0.2
+
+# Initial, deliberately neutral calibration. These values describe the
+# NANSENSE origin in the ROS world frame and will become user-adjustable in
+# the calibration step after the first RViz geometry/orientation check.
+NANSENSE_DEFAULT_CALIBRATION = {
+    "x_m": 0.0,
+    "y_m": 0.0,
+    "z_m": 0.0,
+    "yaw_deg": 0.0,
+}
 
 # Workcell health-gate timing.
 HEALTH_PROBE_PERIOD_SEC = 0.5
@@ -417,6 +438,14 @@ class WrenchListenerNode(Node):
         self._robot_modes = {}
         self._recordings = {}
         self._subscriptions = []
+        self._nansense_lock = threading.Lock()
+        self._latest_nansense_frame = None
+        self._nansense_calibration = dict(NANSENSE_DEFAULT_CALIBRATION)
+        self._nansense_marker_publisher = self.create_publisher(
+            MarkerArray,
+            NANSENSE_MARKER_TOPIC,
+            1,
+        )
 
         # Health probes run inside this ROS node's spin thread so the GUI never
         # blocks on controller-manager, graph, or TF calls.
@@ -495,6 +524,115 @@ class WrenchListenerNode(Node):
         self._health_timer = self.create_timer(
             HEALTH_PROBE_PERIOD_SEC,
             self._health_timer_callback,
+        )
+        self._nansense_marker_timer = self.create_timer(
+            1.0 / 30.0,
+            self._publish_latest_nansense_markers,
+        )
+
+    def update_nansense_frame(self, frame):
+        with self._nansense_lock:
+            self._latest_nansense_frame = frame
+
+    def update_nansense_calibration(self, calibration):
+        with self._nansense_lock:
+            self._nansense_calibration = {
+                key: float(calibration[key])
+                for key in NANSENSE_DEFAULT_CALIBRATION
+            }
+
+    def _publish_latest_nansense_markers(self):
+        with self._nansense_lock:
+            frame = self._latest_nansense_frame
+            calibration = dict(self._nansense_calibration)
+        if frame is not None:
+            self.publish_nansense_markers(frame, calibration)
+
+    @staticmethod
+    def _nansense_point_in_world(position_world_cm, calibration):
+        """Map NANSENSE viewer axes to ROS metres, then apply calibration."""
+        # The accepted upright viewer convention is lateral PX, depth PZ,
+        # vertical PY. This changes only the published representation; the
+        # parsed NANSENSE values remain untouched.
+        x_m = position_world_cm[0] * 0.01
+        y_m = position_world_cm[2] * 0.01
+        z_m = position_world_cm[1] * 0.01
+
+        yaw = math.radians(calibration["yaw_deg"])
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        return Point(
+            x=(cos_yaw * x_m - sin_yaw * y_m)
+              + calibration["x_m"],
+            y=(sin_yaw * x_m + cos_yaw * y_m)
+              + calibration["y_m"],
+            z=z_m + calibration["z_m"],
+        )
+
+    def publish_nansense_markers(self, frame, calibration):
+        joints = frame.get("joints", {})
+        if not joints:
+            return
+
+        stamp = self.get_clock().now().to_msg()
+        lifetime = Duration(
+            seconds=NANSENSE_MARKER_LIFETIME_SEC
+        ).to_msg()
+
+        joint_marker = Marker()
+        joint_marker.header.frame_id = NANSENSE_MARKER_FRAME
+        joint_marker.header.stamp = stamp
+        joint_marker.ns = "nansense_joints"
+        joint_marker.id = 0
+        joint_marker.type = Marker.SPHERE_LIST
+        joint_marker.action = Marker.ADD
+        joint_marker.pose.orientation.w = 1.0
+        joint_marker.scale.x = 0.04
+        joint_marker.scale.y = 0.04
+        joint_marker.scale.z = 0.04
+        joint_marker.color.r = 1.0
+        joint_marker.color.g = 0.65
+        joint_marker.color.b = 0.15
+        joint_marker.color.a = 1.0
+        joint_marker.lifetime = lifetime
+        joint_marker.points = [
+            self._nansense_point_in_world(
+                joints[name]["position_world_cm"], calibration
+            )
+            for name in BODY_JOINTS
+            if name in joints
+        ]
+
+        bone_marker = Marker()
+        bone_marker.header.frame_id = NANSENSE_MARKER_FRAME
+        bone_marker.header.stamp = stamp
+        bone_marker.ns = "nansense_bones"
+        bone_marker.id = 1
+        bone_marker.type = Marker.LINE_LIST
+        bone_marker.action = Marker.ADD
+        bone_marker.pose.orientation.w = 1.0
+        bone_marker.scale.x = 0.025
+        bone_marker.color.r = 0.2
+        bone_marker.color.g = 0.75
+        bone_marker.color.b = 1.0
+        bone_marker.color.a = 1.0
+        bone_marker.lifetime = lifetime
+
+        for chain in VIEW_CHAINS["Full Body"]:
+            for parent_name, child_name in zip(chain, chain[1:]):
+                if parent_name not in joints or child_name not in joints:
+                    continue
+                bone_marker.points.extend([
+                    self._nansense_point_in_world(
+                        joints[parent_name]["position_world_cm"], calibration
+                    ),
+                    self._nansense_point_in_world(
+                        joints[child_name]["position_world_cm"], calibration
+                    ),
+                ])
+
+        self._nansense_marker_publisher.publish(
+            MarkerArray(markers=[joint_marker, bone_marker])
         )
 
     def _program_running_callback(self, key, msg):
@@ -1789,7 +1927,12 @@ class WorkcellUI(QMainWindow):
             QAbstractScrollArea.AdjustIgnored
         )
 
-        self.nansense_widget = NansenseLiveWidget()
+        self.nansense_widget = NansenseLiveWidget(
+            frame_callback=self.wrench_listener.update_nansense_frame,
+            calibration_callback=(
+                self.wrench_listener.update_nansense_calibration
+            ),
+        )
         self.nansense_widget.setMinimumWidth(520)
 
         lower_workspace_layout.addWidget(
