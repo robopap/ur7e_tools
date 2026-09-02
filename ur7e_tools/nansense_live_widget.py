@@ -3,15 +3,24 @@ import socket
 import threading
 import time
 import sys
+from collections import deque
+
+import numpy as np
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox
+    QPushButton, QLabel, QComboBox, QStackedWidget
 )
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+
+try:
+    import pyqtgraph.opengl as gl
+except ImportError:
+    gl = None
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 33333
@@ -177,6 +186,35 @@ def display_position(frame, joint_name):
     z = -(p[1] - hips[1])
     return x, y, z
 
+def opengl_scene_positions(xyz):
+    """Match Matplotlib's reversed display Z axis without changing source data."""
+    scene_xyz = np.array(xyz, dtype=float, copy=True)
+    if scene_xyz.size:
+        scene_xyz[:, 2] *= -1.0
+    return scene_xyz
+
+class RenderRateMeter:
+    """Rolling rate of frames confirmed as rendered by the GUI backend."""
+    def __init__(self, window_sec=2.0):
+        self.window_sec = window_sec
+        self.timestamps = deque()
+
+    def record(self, *_args):
+        now = time.monotonic()
+        self.timestamps.append(now)
+        cutoff = now - self.window_sec
+        while self.timestamps and self.timestamps[0] < cutoff:
+            self.timestamps.popleft()
+
+    def rate(self):
+        if len(self.timestamps) < 2:
+            return 0.0
+        elapsed = self.timestamps[-1] - self.timestamps[0]
+        return (len(self.timestamps) - 1) / elapsed if elapsed > 0 else 0.0
+
+    def reset(self):
+        self.timestamps.clear()
+
 class NansenseLiveWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -199,6 +237,24 @@ class NansenseLiveWidget(QWidget):
         self.view_combo.setCurrentText("Full Body")
         top.addWidget(self.view_combo)
 
+        top.addWidget(QLabel("Renderer:"))
+
+        self.renderer_combo = QComboBox()
+        self.renderer_combo.addItem("OpenGL", "opengl")
+        self.renderer_combo.addItem("Matplotlib", "matplotlib")
+        if gl is None:
+            self.renderer_combo.model().item(0).setEnabled(False)
+            self.renderer_combo.setCurrentIndex(1)
+            self.renderer_combo.setToolTip(
+                "Install pyqtgraph and PyOpenGL to enable OpenGL rendering"
+            )
+        self.renderer_combo.currentIndexChanged.connect(self.change_renderer)
+        top.addWidget(self.renderer_combo)
+
+        self.reset_view_button = QPushButton("RESET VIEW")
+        self.reset_view_button.clicked.connect(self.reset_view)
+        top.addWidget(self.reset_view_button)
+
         top.addStretch(1)
 
         self.status_label = QLabel("Disconnected")
@@ -206,10 +262,66 @@ class NansenseLiveWidget(QWidget):
 
         self.main_layout.addLayout(top)
 
+        self.render_stack = QStackedWidget()
+        self.main_layout.addWidget(self.render_stack, stretch=1)
+
+        self.opengl_view = None
+        self.opengl_grid = None
+        self.opengl_lines = []
+        self.opengl_points = []
+        self.opengl_render_rate = RenderRateMeter()
+        self.matplotlib_render_rate = RenderRateMeter()
+        self.opengl_render_pending = False
+        self.matplotlib_render_pending = False
+        if gl is not None:
+            self.opengl_view = gl.GLViewWidget()
+            self.opengl_view.setBackgroundColor((24, 26, 28, 255))
+            self.opengl_view.opts["center"] = QVector3D(0, 0, 0)
+            self.opengl_view.setCameraPosition(
+                distance=350, elevation=12, azimuth=-70
+            )
+
+            self.opengl_grid = gl.GLGridItem()
+            self.opengl_grid.setSize(220, 220)
+            self.opengl_grid.setSpacing(20, 20)
+            self.opengl_view.addItem(self.opengl_grid)
+
+            max_chains = max(len(chains) for chains in VIEW_CHAINS.values())
+            for _ in range(max_chains):
+                line = gl.GLLinePlotItem(
+                    pos=np.empty((0, 3), dtype=float),
+                    color=(0.2, 0.75, 1.0, 1.0),
+                    width=3,
+                    antialias=True,
+                    mode="line_strip",
+                )
+                points = gl.GLScatterPlotItem(
+                    pos=np.empty((0, 3), dtype=float),
+                    color=(1.0, 0.65, 0.15, 1.0),
+                    size=7,
+                    pxMode=True,
+                )
+                self.opengl_lines.append(line)
+                self.opengl_points.append(points)
+                self.opengl_view.addItem(line)
+                self.opengl_view.addItem(points)
+
+            self.render_stack.addWidget(self.opengl_view)
+            self.opengl_view.frameSwapped.connect(
+                self.record_opengl_frame
+            )
+
+        self.matplotlib_widget = QWidget()
+        matplotlib_layout = QVBoxLayout(self.matplotlib_widget)
+        matplotlib_layout.setContentsMargins(0, 0, 0, 0)
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
+        matplotlib_layout.addWidget(self.canvas)
         self.ax = self.figure.add_subplot(111, projection="3d")
-        self.main_layout.addWidget(self.canvas, stretch=1)
+        self.canvas.mpl_connect(
+            "draw_event", self.record_matplotlib_frame
+        )
+        self.render_stack.addWidget(self.matplotlib_widget)
 
         self.ax.set_xlim(-110, 110)
         self.ax.set_ylim(-110, 110)
@@ -234,6 +346,8 @@ class NansenseLiveWidget(QWidget):
             self.line_artists.append(line)
 
         self.canvas.draw_idle()
+
+        self.change_renderer()
 
         self.timer = QTimer(self)
         self.timer.setInterval(33)  # ~30 FPS visualization
@@ -261,12 +375,74 @@ class NansenseLiveWidget(QWidget):
         self.connect_button.setText("CONNECT NANSENSE")
         self.status_label.setText("Disconnected")
         self.clear_plot()
-        self.canvas.draw_idle()
+        if self.current_renderer() == "matplotlib":
+            self.canvas.draw_idle()
+
+    def current_renderer(self):
+        return self.renderer_combo.currentData()
+
+    def record_opengl_frame(self, *_args):
+        if self.opengl_render_pending:
+            self.opengl_render_rate.record()
+            self.opengl_render_pending = False
+
+    def record_matplotlib_frame(self, *_args):
+        if self.matplotlib_render_pending:
+            self.matplotlib_render_rate.record()
+            self.matplotlib_render_pending = False
+
+    def change_renderer(self, _index=None):
+        use_opengl = self.current_renderer() == "opengl" and self.opengl_view
+        self.render_stack.setCurrentWidget(
+            self.opengl_view if use_opengl else self.matplotlib_widget
+        )
+        self.clear_plot()
+        self.opengl_render_rate.reset()
+        self.matplotlib_render_rate.reset()
+        self.opengl_render_pending = False
+        self.matplotlib_render_pending = False
+        self.reset_view()
+        if not use_opengl:
+            self.canvas.draw_idle()
+
+    def reset_view(self):
+        frame = self.receiver.get_latest()
+        if self.current_renderer() == "opengl" and self.opengl_view:
+            center = QVector3D(0, 0, 0)
+            distance = 350.0
+            if frame is not None:
+                xyz = np.asarray([
+                    display_position(frame, joint)
+                    for joint in BODY_JOINTS
+                    if joint in frame["joints"]
+                ], dtype=float)
+                scene_xyz = opengl_scene_positions(xyz)
+                if len(scene_xyz):
+                    xyz_min = scene_xyz.min(axis=0)
+                    xyz_max = scene_xyz.max(axis=0)
+                    midpoint = (xyz_min + xyz_max) / 2.0
+                    center = QVector3D(*midpoint.tolist())
+                    distance = max(220.0, float(np.ptp(scene_xyz, axis=0).max()) * 2.2)
+            self.opengl_view.opts["center"] = center
+            self.opengl_view.setCameraPosition(
+                distance=distance, elevation=12, azimuth=-70
+            )
+            self.opengl_view.update()
+        else:
+            self.ax.set_xlim(-110, 110)
+            self.ax.set_ylim(-110, 110)
+            self.ax.set_zlim(110, -110)
+            self.ax.view_init(elev=12, azim=-70)
+            self.canvas.draw_idle()
 
     def clear_plot(self):
         for line in self.line_artists:
             line.set_data([], [])
             line.set_3d_properties([])
+        for line, points in zip(self.opengl_lines, self.opengl_points):
+            empty = np.empty((0, 3), dtype=float)
+            line.setData(pos=empty)
+            points.setData(pos=empty)
 
     def update_plot(self):
         if not self.receiver.running:
@@ -280,24 +456,56 @@ class NansenseLiveWidget(QWidget):
         chains = VIEW_CHAINS[self.view_combo.currentText()]
         self.clear_plot()
 
-        for line, chain in zip(self.line_artists, chains):
+        positions = []
+        for chain in chains:
             available_chain = [joint for joint in chain if joint in frame["joints"]]
             if len(available_chain) < 2:
+                positions.append(np.empty((0, 3), dtype=float))
                 continue
 
-            xyz = [display_position(frame, joint) for joint in available_chain]
-            xs = [p[0] for p in xyz]
-            ys = [p[1] for p in xyz]
-            zs = [p[2] for p in xyz]
+            positions.append(np.asarray([
+                display_position(frame, joint) for joint in available_chain
+            ], dtype=float))
 
-            line.set_data(xs, ys)
-            line.set_3d_properties(zs)
+        if self.current_renderer() == "opengl" and self.opengl_view:
+            self.opengl_render_pending = True
+            for line, points, xyz in zip(
+                self.opengl_lines, self.opengl_points, positions
+            ):
+                scene_xyz = opengl_scene_positions(xyz)
+                line.setData(pos=scene_xyz)
+                points.setData(pos=scene_xyz)
+
+            all_xyz = np.asarray([
+                display_position(frame, joint)
+                for joint in BODY_JOINTS
+                if joint in frame["joints"]
+            ], dtype=float)
+            scene_xyz = opengl_scene_positions(all_xyz)
+            if len(scene_xyz) and self.opengl_grid is not None:
+                floor_z = float(scene_xyz[:, 2].min()) - 5.0
+                self.opengl_grid.resetTransform()
+                self.opengl_grid.translate(0, 0, floor_z)
+        else:
+            self.matplotlib_render_pending = True
+            for line, xyz in zip(self.line_artists, positions):
+                if len(xyz) < 2:
+                    continue
+                line.set_data(xyz[:, 0], xyz[:, 1])
+                line.set_3d_properties(xyz[:, 2])
 
         age_ms = (time.time() - frame["receive_time"]) * 1000.0
-        self.status_label.setText(
-            f"Connected | UDP {self.receiver.rate:.1f} Hz | frame {age_ms:.1f} ms"
+        render_rate = (
+            self.opengl_render_rate.rate()
+            if self.current_renderer() == "opengl"
+            else self.matplotlib_render_rate.rate()
         )
-        self.canvas.draw_idle()
+        self.status_label.setText(
+            f"UDP {self.receiver.rate:.1f} Hz | "
+            f"render {render_rate:.1f} FPS | frame age {age_ms:.1f} ms"
+        )
+        if self.current_renderer() == "matplotlib":
+            self.canvas.draw_idle()
 
     def shutdown(self):
         self.timer.stop()
