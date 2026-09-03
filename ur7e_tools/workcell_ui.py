@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSplitter,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -76,6 +77,7 @@ NANSENSE_DEFAULT_CALIBRATION = {
     "y_m": 0.0,
     "z_m": 0.0,
     "yaw_deg": 0.0,
+    "mirror_lateral": True,
 }
 
 # Workcell health-gate timing.
@@ -537,8 +539,11 @@ class WrenchListenerNode(Node):
     def update_nansense_calibration(self, calibration):
         with self._nansense_lock:
             self._nansense_calibration = {
-                key: float(calibration[key])
-                for key in NANSENSE_DEFAULT_CALIBRATION
+                "x_m": float(calibration["x_m"]),
+                "y_m": float(calibration["y_m"]),
+                "z_m": float(calibration["z_m"]),
+                "yaw_deg": float(calibration["yaw_deg"]),
+                "mirror_lateral": bool(calibration["mirror_lateral"]),
             }
 
     def _publish_latest_nansense_markers(self):
@@ -554,7 +559,8 @@ class WrenchListenerNode(Node):
         # The accepted upright viewer convention is lateral PX, depth PZ,
         # vertical PY. This changes only the published representation; the
         # parsed NANSENSE values remain untouched.
-        x_m = position_world_cm[0] * 0.01
+        lateral_sign = -1.0 if calibration["mirror_lateral"] else 1.0
+        x_m = lateral_sign * position_world_cm[0] * 0.01
         y_m = position_world_cm[2] * 0.01
         z_m = position_world_cm[1] * 0.01
 
@@ -632,8 +638,61 @@ class WrenchListenerNode(Node):
                 ])
 
         self._nansense_marker_publisher.publish(
-            MarkerArray(markers=[joint_marker, bone_marker])
+            MarkerArray(markers=[
+                joint_marker,
+                bone_marker,
+                *self._nansense_hand_markers(
+                    joints, stamp, lifetime, calibration
+                ),
+            ])
         )
+
+    def _nansense_hand_markers(self, joints, stamp, lifetime, calibration):
+        """Add unambiguous semantic L/R cues independent of camera angle."""
+        markers = []
+        for marker_id, (joint_name, label, color) in enumerate((
+            ("LeftHand", "L", (1.0, 0.15, 0.15)),
+            ("RightHand", "R", (0.15, 1.0, 0.35)),
+        ), start=10):
+            if joint_name not in joints:
+                continue
+            point = self._nansense_point_in_world(
+                joints[joint_name]["position_world_cm"], calibration
+            )
+
+            hand = Marker()
+            hand.header.frame_id = NANSENSE_MARKER_FRAME
+            hand.header.stamp = stamp
+            hand.ns = "nansense_hand_identity"
+            hand.id = marker_id
+            hand.type = Marker.SPHERE
+            hand.action = Marker.ADD
+            hand.pose.position = point
+            hand.pose.orientation.w = 1.0
+            hand.scale.x = hand.scale.y = hand.scale.z = 0.09
+            hand.color.r, hand.color.g, hand.color.b = color
+            hand.color.a = 1.0
+            hand.lifetime = lifetime
+            markers.append(hand)
+
+            text = Marker()
+            text.header.frame_id = NANSENSE_MARKER_FRAME
+            text.header.stamp = stamp
+            text.ns = "nansense_hand_labels"
+            text.id = marker_id
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = point.x
+            text.pose.position.y = point.y
+            text.pose.position.z = point.z + 0.12
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.12
+            text.color.r, text.color.g, text.color.b = color
+            text.color.a = 1.0
+            text.text = label
+            text.lifetime = lifetime
+            markers.append(text)
+        return markers
 
     def _program_running_callback(self, key, msg):
         with self._lock:
@@ -1887,10 +1946,9 @@ class WorkcellUI(QMainWindow):
         # Right: live NANSENSE skeleton
         # =====================================================
 
-        lower_workspace = QWidget()
-        lower_workspace_layout = QHBoxLayout(lower_workspace)
-        lower_workspace_layout.setContentsMargins(0, 0, 0, 0)
-        lower_workspace_layout.setSpacing(10)
+        self.lower_workspace_splitter = QSplitter(Qt.Horizontal)
+        self.lower_workspace_splitter.setChildrenCollapsible(False)
+        self.lower_workspace_splitter.setHandleWidth(7)
 
         sensor_column = QWidget()
         sensor_layout = QVBoxLayout(sensor_column)
@@ -1933,19 +1991,21 @@ class WorkcellUI(QMainWindow):
                 self.wrench_listener.update_nansense_calibration
             ),
         )
-        self.nansense_widget.setMinimumWidth(520)
+        self.nansense_widget.setMinimumWidth(650)
 
-        lower_workspace_layout.addWidget(
-            sensor_scroll,
-            1,
-        )
-        lower_workspace_layout.addWidget(
-            self.nansense_widget,
-            1,
-        )
+        sensor_scroll.setMinimumWidth(430)
+        self.lower_workspace_splitter.addWidget(sensor_scroll)
+        self.lower_workspace_splitter.addWidget(self.nansense_widget)
+        self.lower_workspace_splitter.setStretchFactor(0, 42)
+        self.lower_workspace_splitter.setStretchFactor(1, 58)
+        saved_splitter = self.settings.value("lower_workspace_splitter")
+        if saved_splitter is not None:
+            self.lower_workspace_splitter.restoreState(saved_splitter)
+        else:
+            self.lower_workspace_splitter.setSizes([560, 780])
 
         main_layout.addWidget(
-            lower_workspace,
+            self.lower_workspace_splitter,
             1,
         )
 
@@ -5313,6 +5373,12 @@ class WorkcellUI(QMainWindow):
         event
     ):
 
+        if hasattr(self, "lower_workspace_splitter"):
+            self.settings.setValue(
+                "lower_workspace_splitter",
+                self.lower_workspace_splitter.saveState(),
+            )
+
         if (
             self.ros_process.state()
             != QProcess.NotRunning
@@ -5714,6 +5780,15 @@ class WorkcellUI(QMainWindow):
                 max-height: 1px;
                 margin-top: 8px;
                 margin-bottom: 8px;
+            }
+
+            QSplitter::handle {
+                background: #3c4043;
+                border-radius: 2px;
+            }
+
+            QSplitter::handle:hover {
+                background: #8ab4f8;
             }
             """
         )

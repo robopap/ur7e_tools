@@ -63,6 +63,8 @@ Visualization Manager:
       Name: NANSENSE Skeleton
       Namespaces:
         nansense_bones: true
+        nansense_hand_identity: true
+        nansense_hand_labels: true
         nansense_joints: true
       Queue Size: 1
       Value: true

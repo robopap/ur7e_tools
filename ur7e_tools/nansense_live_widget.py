@@ -13,16 +13,11 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QComboBox, QDoubleSpinBox, QStackedWidget
+    QPushButton, QLabel, QComboBox, QDoubleSpinBox,
+    QCheckBox, QFrame, QGridLayout
 )
 
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-
-try:
-    import pyqtgraph.opengl as gl
-except ImportError:
-    gl = None
+import pyqtgraph.opengl as gl
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 33333
@@ -63,6 +58,12 @@ VIEW_CHAINS = {
     "Left Arm": [LEFT_ARM_CHAIN],
     "Right Arm": [RIGHT_ARM_CHAIN],
 }
+
+SKELETON_COLOR = (0.2, 0.75, 1.0, 1.0)
+JOINT_COLOR = (1.0, 0.65, 0.15, 1.0)
+LEFT_COLOR = (1.0, 0.20, 0.20, 1.0)
+RIGHT_COLOR = (0.20, 1.0, 0.40, 1.0)
+
 
 def normalize_joint_name(name):
     name = name.strip()
@@ -185,7 +186,7 @@ class LatestFrameReceiver:
             self.latest_frame = None
         self.rate = 0.0
 
-def display_position(frame, joint_name):
+def display_position(frame, joint_name, mirror_lateral=False):
     """
     EXACT same viewer orientation as the last working standalone plot:
       viewer X = NANSENSE PX - Hips.PX
@@ -199,18 +200,22 @@ def display_position(frame, joint_name):
     hips = joints["Hips"]["position_world_cm"]
 
     x = p[0] - hips[0]
+    if mirror_lateral:
+        x = -x
     y = p[2] - hips[2]
     z = -(p[1] - hips[1])
     return x, y, z
 
 def opengl_scene_positions(xyz):
-    """Match Matplotlib's reversed display Z axis without changing source data."""
+    """Map viewer coordinates into the upright OpenGL scene."""
     scene_xyz = np.array(xyz, dtype=float, copy=True)
     if scene_xyz.size:
         scene_xyz[:, 2] *= -1.0
     return scene_xyz
 
-def zero_calibration_from_feet(frame, target_m, yaw_deg):
+def zero_calibration_from_feet(
+    frame, target_m, yaw_deg, mirror_lateral=False
+):
     """Return XYZ offsets that place the two lowest foot points at target."""
     joints = frame["joints"]
 
@@ -231,6 +236,8 @@ def zero_calibration_from_feet(frame, target_m, yaw_deg):
         raise ValueError("both left and right foot joints are required")
 
     foot_x_m = (left[0] + right[0]) * 0.005
+    if mirror_lateral:
+        foot_x_m = -foot_x_m
     foot_y_m = (left[2] + right[2]) * 0.005
     floor_z_m = min(left[1], right[1]) * 0.01
 
@@ -284,112 +291,211 @@ class NansenseLiveWidget(QWidget):
             config_home / "ur7e_tools" / "nansense_calibration.yaml"
         )
 
+        # Keep numeric controls readable both inside the dark workcell UI and
+        # when this widget is launched on its own.
+        self.setStyleSheet(
+            """
+            QDoubleSpinBox {
+                background: #303134;
+                color: #ffffff;
+                border: 1px solid #7a7f85;
+                border-radius: 4px;
+                padding: 3px 20px 3px 6px;
+                selection-background-color: #5f6368;
+                selection-color: #ffffff;
+            }
+            QDoubleSpinBox:focus { border-color: #8ab4f8; }
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                width: 16px;
+                background: #3c4043;
+                border-left: 1px solid #5f6368;
+            }
+            QFrame#calibrationCard {
+                background: #292a2d;
+                border: 1px solid #3c4043;
+                border-radius: 6px;
+            }
+            QLabel#calibrationHint { color: #9aa0a6; }
+            QLabel#telemetryBadge {
+                background: #303134;
+                color: #bdc1c6;
+                border-radius: 4px;
+                padding: 3px 7px;
+            }
+            QLabel#nansenseOnline {
+                background: #254c32; color: #81c995;
+                border-radius: 4px; padding: 3px 7px; font-weight: 700;
+            }
+            QLabel#nansenseOffline {
+                background: #542b29; color: #f28b82;
+                border-radius: 4px; padding: 3px 7px; font-weight: 700;
+            }
+            QLabel#calibrationSaved { color: #81c995; font-weight: 700; }
+            QLabel#calibrationPending { color: #fdd663; font-weight: 700; }
+            QLabel#calibrationError { color: #f28b82; font-weight: 700; }
+            QPushButton#placementButton {
+                background: #34506f;
+                border: 1px solid #5f83aa;
+            }
+            QPushButton#placementButton:hover { background: #41658c; }
+            QPushButton#saveCalibrationButton {
+                background: #245c34;
+                border: 1px solid #3f8051;
+            }
+            QPushButton#saveCalibrationButton:hover { background: #2f7543; }
+            """
+        )
+
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(6, 6, 6, 6)
         self.main_layout.setSpacing(6)
 
-        top = QHBoxLayout()
+        connection_row = QHBoxLayout()
 
         self.connect_button = QPushButton("CONNECT NANSENSE")
         self.connect_button.clicked.connect(self.toggle_connection)
-        top.addWidget(self.connect_button)
+        connection_row.addWidget(self.connect_button)
+        self.connection_badge = QLabel("DISCONNECTED")
+        self.connection_badge.setObjectName("nansenseOffline")
+        connection_row.addWidget(self.connection_badge)
+        connection_row.addStretch(1)
 
-        top.addWidget(QLabel("View:"))
+        self.udp_badge = QLabel("UDP -- Hz")
+        self.render_badge = QLabel("Render -- FPS")
+        self.age_badge = QLabel("Age -- ms")
+        for badge in (self.udp_badge, self.render_badge, self.age_badge):
+            badge.setObjectName("telemetryBadge")
+            connection_row.addWidget(badge)
+        self.main_layout.addLayout(connection_row)
+
+        controls_row = QHBoxLayout()
+
+        controls_row.addWidget(QLabel("View:"))
 
         self.view_combo = QComboBox()
         self.view_combo.addItems(VIEW_CHAINS.keys())
         self.view_combo.setCurrentText("Full Body")
-        top.addWidget(self.view_combo)
+        controls_row.addWidget(self.view_combo)
 
-        top.addWidget(QLabel("Renderer:"))
+        self.front_view_button = QPushButton("FRONT")
+        self.front_view_button.clicked.connect(
+            lambda: self.set_view_preset("front")
+        )
+        controls_row.addWidget(self.front_view_button)
+        self.side_view_button = QPushButton("SIDE")
+        self.side_view_button.clicked.connect(
+            lambda: self.set_view_preset("side")
+        )
+        controls_row.addWidget(self.side_view_button)
+        self.top_view_button = QPushButton("TOP")
+        self.top_view_button.clicked.connect(
+            lambda: self.set_view_preset("top")
+        )
+        controls_row.addWidget(self.top_view_button)
 
-        self.renderer_combo = QComboBox()
-        self.renderer_combo.addItem("OpenGL", "opengl")
-        self.renderer_combo.addItem("Matplotlib", "matplotlib")
-        if gl is None:
-            self.renderer_combo.model().item(0).setEnabled(False)
-            self.renderer_combo.setCurrentIndex(1)
-            self.renderer_combo.setToolTip(
-                "Install pyqtgraph and PyOpenGL to enable OpenGL rendering"
-            )
-        self.renderer_combo.currentIndexChanged.connect(self.change_renderer)
-        top.addWidget(self.renderer_combo)
-
-        self.reset_view_button = QPushButton("RESET VIEW")
+        self.reset_view_button = QPushButton("FIT")
+        self.reset_view_button.setToolTip(
+            "Fit the skeleton without changing the selected view direction."
+        )
         self.reset_view_button.clicked.connect(self.reset_view)
-        top.addWidget(self.reset_view_button)
+        controls_row.addWidget(self.reset_view_button)
 
-        top.addStretch(1)
+        self.swap_sides_checkbox = QCheckBox("Mirror lateral axis")
+        self.swap_sides_checkbox.setChecked(True)
+        self.swap_sides_checkbox.setToolTip(
+            "Reverse the NANSENSE lateral coordinate while preserving the "
+            "true Left*/Right* joint identities."
+        )
+        self.swap_sides_checkbox.toggled.connect(self.mark_calibration_modified)
+        controls_row.addWidget(self.swap_sides_checkbox)
+        controls_row.addStretch(1)
+        self.main_layout.addLayout(controls_row)
 
-        self.status_label = QLabel("Disconnected")
-        top.addWidget(self.status_label)
-
-        self.main_layout.addLayout(top)
-
-        calibration_row = QHBoxLayout()
-        calibration_row.addWidget(QLabel("RViz calibration:"))
+        calibration_card = QFrame()
+        calibration_card.setObjectName("calibrationCard")
+        calibration_grid = QGridLayout(calibration_card)
+        calibration_grid.setContentsMargins(9, 7, 9, 7)
+        calibration_grid.setHorizontalSpacing(7)
+        calibration_grid.addWidget(QLabel("RViz Skeleton Placement"), 0, 0, 1, 2)
+        target_label = QLabel("Feet target: X 0.60  Y -0.60  Z 0.00 m")
+        target_label.setObjectName("calibrationHint")
+        calibration_grid.addWidget(target_label, 0, 2, 1, 4)
         self.calibration_spins = {}
-        for key, label, minimum, maximum in (
+        for column, (key, label, minimum, maximum) in enumerate((
             ("x_m", "X [m]", -20.0, 20.0),
             ("y_m", "Y [m]", -20.0, 20.0),
             ("z_m", "Z [m]", -5.0, 5.0),
             ("yaw_deg", "Yaw [deg]", -360.0, 360.0),
-        ):
-            calibration_row.addWidget(QLabel(label))
+        )):
+            calibration_grid.addWidget(QLabel(label), 1, column)
             spin = QDoubleSpinBox()
             spin.setRange(minimum, maximum)
             spin.setDecimals(3 if key != "yaw_deg" else 1)
             spin.setSingleStep(0.05 if key != "yaw_deg" else 5.0)
             spin.setValue(CALIBRATION_DEFAULTS[key])
+            spin.setMinimumWidth(88 if key != "yaw_deg" else 96)
+            spin.valueChanged.connect(self.mark_calibration_modified)
             self.calibration_spins[key] = spin
-            calibration_row.addWidget(spin)
+            calibration_grid.addWidget(spin, 2, column)
 
         self.apply_calibration_button = QPushButton("APPLY")
         self.apply_calibration_button.clicked.connect(self.apply_calibration)
-        calibration_row.addWidget(self.apply_calibration_button)
+        calibration_grid.addWidget(self.apply_calibration_button, 2, 4)
 
         self.save_calibration_button = QPushButton("SAVE")
+        self.save_calibration_button.setObjectName("saveCalibrationButton")
+        self.save_calibration_button.setToolTip(
+            "Save the active placement and lateral-axis setting for the "
+            "next UI launch."
+        )
         self.save_calibration_button.clicked.connect(self.save_calibration)
-        calibration_row.addWidget(self.save_calibration_button)
+        calibration_grid.addWidget(self.save_calibration_button, 2, 5)
 
-        self.zero_here_button = QPushButton("ZERO HERE")
+        self.zero_here_button = QPushButton("PLACE FEET AT TARGET")
+        self.zero_here_button.setObjectName("placementButton")
         self.zero_here_button.setToolTip(
             "Place the feet at world X=0.60 m, Y=-0.60 m, Z=0.00 m; "
             "the current yaw is preserved."
         )
         self.zero_here_button.clicked.connect(self.zero_here)
-        calibration_row.addWidget(self.zero_here_button)
+        calibration_grid.addWidget(self.zero_here_button, 1, 4, 1, 2)
 
         self.calibration_status_label = QLabel("")
-        calibration_row.addWidget(self.calibration_status_label)
-        calibration_row.addStretch(1)
-        self.main_layout.addLayout(calibration_row)
+        self.calibration_status_label.setToolTip(str(self.calibration_path))
+        calibration_grid.addWidget(self.calibration_status_label, 3, 0, 1, 6)
+        self.main_layout.addWidget(calibration_card)
 
+        side_key = QLabel("Identity markers:  L = red   |   R = green")
+        side_key.setToolTip(
+            "The labels follow the Left*/Right* joint names received in the "
+            "NANSENSE packet; they are not inferred from the camera view."
+        )
+        self.main_layout.addWidget(side_key)
+
+        self._loading_calibration = True
         self.load_calibration()
+        self._loading_calibration = False
         self.apply_calibration(show_status=False)
-
-        self.render_stack = QStackedWidget()
-        self.main_layout.addWidget(self.render_stack, stretch=1)
 
         self.opengl_view = None
         self.opengl_grid = None
         self.opengl_lines = []
         self.opengl_points = []
+        self.opengl_hand_points = {}
         self.opengl_render_rate = RenderRateMeter()
-        self.matplotlib_render_rate = RenderRateMeter()
         self.opengl_render_pending = False
-        self.matplotlib_render_pending = False
+        self.current_view_preset = "front"
         if gl is not None:
             self.opengl_view = gl.GLViewWidget()
             self.opengl_view.setBackgroundColor((24, 26, 28, 255))
             self.opengl_view.opts["center"] = QVector3D(0, 0, 0)
             self.opengl_view.setCameraPosition(
-                distance=350, elevation=12, azimuth=-70
+                distance=350, elevation=5, azimuth=-90
             )
 
             self.opengl_grid = gl.GLGridItem()
             self.opengl_grid.setSize(220, 220)
-            self.opengl_grid.setSpacing(20, 20)
+            self.opengl_grid.setSpacing(40, 40)
             self.opengl_view.addItem(self.opengl_grid)
 
             max_chains = max(len(chains) for chains in VIEW_CHAINS.values())
@@ -412,48 +518,24 @@ class NansenseLiveWidget(QWidget):
                 self.opengl_view.addItem(line)
                 self.opengl_view.addItem(points)
 
-            self.render_stack.addWidget(self.opengl_view)
+            for joint_name, color in (
+                ("LeftHand", LEFT_COLOR),
+                ("RightHand", RIGHT_COLOR),
+            ):
+                hand_point = gl.GLScatterPlotItem(
+                    pos=np.empty((0, 3), dtype=float),
+                    color=color,
+                    size=16,
+                    pxMode=True,
+                )
+                self.opengl_hand_points[joint_name] = hand_point
+                self.opengl_view.addItem(hand_point)
+
+            self.main_layout.addWidget(self.opengl_view, stretch=1)
             self.opengl_view.frameSwapped.connect(
                 self.record_opengl_frame
             )
-
-        self.matplotlib_widget = QWidget()
-        matplotlib_layout = QVBoxLayout(self.matplotlib_widget)
-        matplotlib_layout.setContentsMargins(0, 0, 0, 0)
-        self.figure = Figure()
-        self.canvas = FigureCanvas(self.figure)
-        matplotlib_layout.addWidget(self.canvas)
-        self.ax = self.figure.add_subplot(111, projection="3d")
-        self.canvas.mpl_connect(
-            "draw_event", self.record_matplotlib_frame
-        )
-        self.render_stack.addWidget(self.matplotlib_widget)
-
-        self.ax.set_xlim(-110, 110)
-        self.ax.set_ylim(-110, 110)
-        self.ax.set_zlim(110, -110)
-        self.ax.set_xlabel("X [cm]")
-        self.ax.set_ylabel("Y [cm]")
-        self.ax.set_zlabel("Z [cm]")
-        self.ax.set_title("NANSENSE Live Skeleton")
-
-        try:
-            self.ax.set_box_aspect((1, 1, 1))
-        except AttributeError:
-            pass
-
-        # Keep the same camera direction as the screenshot you approved.
-        self.ax.view_init(elev=12, azim=-70)
-
-        max_chains = max(len(chains) for chains in VIEW_CHAINS.values())
-        self.line_artists = []
-        for _ in range(max_chains):
-            line, = self.ax.plot([], [], [], marker="o", linewidth=2, markersize=4)
-            self.line_artists.append(line)
-
-        self.canvas.draw_idle()
-
-        self.change_renderer()
+        self.reset_view()
 
         self.timer = QTimer(self)
         self.timer.setInterval(33)  # ~30 FPS visualization
@@ -461,20 +543,42 @@ class NansenseLiveWidget(QWidget):
         self.timer.start()
 
     def calibration_values(self):
-        return {
+        values = {
             key: spin.value()
             for key, spin in self.calibration_spins.items()
         }
+        values["mirror_lateral"] = self.swap_sides_checkbox.isChecked()
+        return values
+
+    def set_calibration_status(self, text, state="pending"):
+        object_names = {
+            "saved": "calibrationSaved",
+            "pending": "calibrationPending",
+            "error": "calibrationError",
+        }
+        self.calibration_status_label.setText(text)
+        self.calibration_status_label.setObjectName(object_names[state])
+        self.calibration_status_label.style().unpolish(
+            self.calibration_status_label
+        )
+        self.calibration_status_label.style().polish(
+            self.calibration_status_label
+        )
+
+    def mark_calibration_modified(self, *_args):
+        if getattr(self, "_loading_calibration", False):
+            return
+        self.set_calibration_status("Modified — press APPLY", "pending")
 
     def apply_calibration(self, _checked=False, show_status=True):
         if self.calibration_callback is not None:
             self.calibration_callback(self.calibration_values())
         if show_status:
-            self.calibration_status_label.setText("Applied")
+            self.set_calibration_status("Applied — press SAVE to keep", "pending")
 
     def load_calibration(self):
         if not self.calibration_path.exists():
-            self.calibration_status_label.setText("Not saved")
+            self.set_calibration_status("Using defaults — not saved", "pending")
             return
 
         values = dict(CALIBRATION_DEFAULTS)
@@ -484,15 +588,21 @@ class NansenseLiveWidget(QWidget):
                 if not line or line.startswith("#"):
                     continue
                 key, separator, raw_value = line.partition(":")
-                if separator and key.strip() in values:
-                    values[key.strip()] = float(raw_value.strip())
+                parsed_key = key.strip()
+                if separator and parsed_key in values:
+                    values[parsed_key] = float(raw_value.strip())
+                elif separator and parsed_key in (
+                    "mirror_lateral", "swap_left_right"
+                ):
+                    enabled = raw_value.strip().lower() in ("true", "1", "yes")
+                    self.swap_sides_checkbox.setChecked(enabled)
         except (OSError, ValueError) as exc:
-            self.calibration_status_label.setText(f"Load error: {exc}")
+            self.set_calibration_status(f"Load error: {exc}", "error")
             return
 
         for key, value in values.items():
             self.calibration_spins[key].setValue(value)
-        self.calibration_status_label.setText("Loaded")
+        self.set_calibration_status("Saved and active", "saved")
 
     def save_calibration(self):
         self.apply_calibration(show_status=False)
@@ -503,6 +613,7 @@ class NansenseLiveWidget(QWidget):
             f"y_m: {values['y_m']:.6f}\n"
             f"z_m: {values['z_m']:.6f}\n"
             f"yaw_deg: {values['yaw_deg']:.6f}\n"
+            f"mirror_lateral: {str(self.swap_sides_checkbox.isChecked()).lower()}\n"
         )
         temporary_path = self.calibration_path.with_suffix(".yaml.tmp")
         try:
@@ -510,14 +621,14 @@ class NansenseLiveWidget(QWidget):
             temporary_path.write_text(text)
             os.replace(temporary_path, self.calibration_path)
         except OSError as exc:
-            self.calibration_status_label.setText(f"Save error: {exc}")
+            self.set_calibration_status(f"Save error: {exc}", "error")
             return
-        self.calibration_status_label.setText("Saved")
+        self.set_calibration_status("Saved and active", "saved")
 
     def zero_here(self):
-        frame = self.receiver.get_latest()
+        frame = self.current_frame()
         if frame is None:
-            self.calibration_status_label.setText("No NANSENSE frame")
+            self.set_calibration_status("No NANSENSE frame", "error")
             return
 
         try:
@@ -525,15 +636,19 @@ class NansenseLiveWidget(QWidget):
                 frame,
                 ZERO_TARGET_M,
                 self.calibration_spins["yaw_deg"].value(),
+                self.swap_sides_checkbox.isChecked(),
             )
         except ValueError:
-            self.calibration_status_label.setText("Both feet required")
+            self.set_calibration_status("Both feet required", "error")
             return
 
         for key, value in values.items():
             self.calibration_spins[key].setValue(value)
         self.apply_calibration(show_status=False)
-        self.calibration_status_label.setText("Zero applied; press SAVE")
+        self.set_calibration_status("Applied — press SAVE to keep", "pending")
+
+    def current_frame(self):
+        return self.receiver.get_latest()
 
     def toggle_connection(self):
         if self.receiver.running:
@@ -542,60 +657,60 @@ class NansenseLiveWidget(QWidget):
             self.connect_nansense()
 
     def connect_nansense(self):
+        # Re-apply the values visible in the controls. Connecting never resets
+        # or replaces the calibration loaded during widget construction.
+        self.apply_calibration(show_status=False)
         try:
             self.receiver.start()
         except OSError as exc:
-            self.status_label.setText(f"Connection error: {exc}")
+            self.connection_badge.setText(f"ERROR: {exc}")
             return
 
         self.connect_button.setText("DISCONNECT")
-        self.status_label.setText(f"Listening UDP :{UDP_PORT}")
+        self.connection_badge.setText("CONNECTED")
+        self.connection_badge.setObjectName("nansenseOnline")
+        self.connection_badge.style().unpolish(self.connection_badge)
+        self.connection_badge.style().polish(self.connection_badge)
 
     def disconnect_nansense(self):
         self.receiver.stop()
         if self.frame_callback is not None:
             self.frame_callback(None)
         self.connect_button.setText("CONNECT NANSENSE")
-        self.status_label.setText("Disconnected")
+        self.connection_badge.setText("DISCONNECTED")
+        self.connection_badge.setObjectName("nansenseOffline")
+        self.connection_badge.style().unpolish(self.connection_badge)
+        self.connection_badge.style().polish(self.connection_badge)
         self.clear_plot()
-        if self.current_renderer() == "matplotlib":
-            self.canvas.draw_idle()
-
-    def current_renderer(self):
-        return self.renderer_combo.currentData()
 
     def record_opengl_frame(self, *_args):
         if self.opengl_render_pending:
             self.opengl_render_rate.record()
             self.opengl_render_pending = False
 
-    def record_matplotlib_frame(self, *_args):
-        if self.matplotlib_render_pending:
-            self.matplotlib_render_rate.record()
-            self.matplotlib_render_pending = False
-
-    def change_renderer(self, _index=None):
-        use_opengl = self.current_renderer() == "opengl" and self.opengl_view
-        self.render_stack.setCurrentWidget(
-            self.opengl_view if use_opengl else self.matplotlib_widget
-        )
-        self.clear_plot()
-        self.opengl_render_rate.reset()
-        self.matplotlib_render_rate.reset()
-        self.opengl_render_pending = False
-        self.matplotlib_render_pending = False
+    def set_view_preset(self, preset):
+        self.current_view_preset = preset
         self.reset_view()
-        if not use_opengl:
-            self.canvas.draw_idle()
+
+    def view_angles(self):
+        return {
+            "front": (5, -90),
+            "side": (5, 0),
+            "top": (90, -90),
+        }[self.current_view_preset]
 
     def reset_view(self):
-        frame = self.receiver.get_latest()
-        if self.current_renderer() == "opengl" and self.opengl_view:
+        frame = self.current_frame()
+        elevation, azimuth = self.view_angles()
+        if self.opengl_view:
             center = QVector3D(0, 0, 0)
             distance = 350.0
             if frame is not None:
                 xyz = np.asarray([
-                    display_position(frame, joint)
+                    display_position(
+                        frame, joint,
+                        self.swap_sides_checkbox.isChecked(),
+                    )
                     for joint in BODY_JOINTS
                     if joint in frame["joints"]
                 ], dtype=float)
@@ -608,32 +723,25 @@ class NansenseLiveWidget(QWidget):
                     distance = max(220.0, float(np.ptp(scene_xyz, axis=0).max()) * 2.2)
             self.opengl_view.opts["center"] = center
             self.opengl_view.setCameraPosition(
-                distance=distance, elevation=12, azimuth=-70
+                distance=distance, elevation=elevation, azimuth=azimuth
             )
             self.opengl_view.update()
-        else:
-            self.ax.set_xlim(-110, 110)
-            self.ax.set_ylim(-110, 110)
-            self.ax.set_zlim(110, -110)
-            self.ax.view_init(elev=12, azim=-70)
-            self.canvas.draw_idle()
 
     def clear_plot(self):
-        for line in self.line_artists:
-            line.set_data([], [])
-            line.set_3d_properties([])
         for line, points in zip(self.opengl_lines, self.opengl_points):
             empty = np.empty((0, 3), dtype=float)
             line.setData(pos=empty)
             points.setData(pos=empty)
+        for points in self.opengl_hand_points.values():
+            points.setData(pos=np.empty((0, 3), dtype=float))
 
     def update_plot(self):
         if not self.receiver.running:
             return
 
-        frame = self.receiver.get_latest()
+        frame = self.current_frame()
         if frame is None:
-            self.status_label.setText(f"Waiting for UDP :{UDP_PORT}...")
+            self.connection_badge.setText(f"WAITING UDP :{UDP_PORT}")
             return
 
         if self.frame_callback is not None:
@@ -644,26 +752,45 @@ class NansenseLiveWidget(QWidget):
 
         positions = []
         for chain in chains:
-            available_chain = [joint for joint in chain if joint in frame["joints"]]
+            available_chain = [
+                joint for joint in chain if joint in frame["joints"]
+            ]
             if len(available_chain) < 2:
                 positions.append(np.empty((0, 3), dtype=float))
                 continue
 
             positions.append(np.asarray([
-                display_position(frame, joint) for joint in available_chain
+                display_position(
+                    frame, joint,
+                    self.swap_sides_checkbox.isChecked(),
+                )
+                for joint in available_chain
             ], dtype=float))
 
-        if self.current_renderer() == "opengl" and self.opengl_view:
+        if self.opengl_view:
             self.opengl_render_pending = True
             for line, points, xyz in zip(
                 self.opengl_lines, self.opengl_points, positions
             ):
                 scene_xyz = opengl_scene_positions(xyz)
-                line.setData(pos=scene_xyz)
-                points.setData(pos=scene_xyz)
+                line.setData(pos=scene_xyz, color=SKELETON_COLOR)
+                points.setData(pos=scene_xyz, color=JOINT_COLOR)
+
+            for joint_name, points in self.opengl_hand_points.items():
+                if joint_name in frame["joints"]:
+                    xyz = np.asarray([
+                        display_position(
+                            frame, joint_name,
+                            self.swap_sides_checkbox.isChecked(),
+                        )
+                    ], dtype=float)
+                    points.setData(pos=opengl_scene_positions(xyz))
 
             all_xyz = np.asarray([
-                display_position(frame, joint)
+                display_position(
+                    frame, joint,
+                    self.swap_sides_checkbox.isChecked(),
+                )
                 for joint in BODY_JOINTS
                 if joint in frame["joints"]
             ], dtype=float)
@@ -672,26 +799,11 @@ class NansenseLiveWidget(QWidget):
                 floor_z = float(scene_xyz[:, 2].min()) - 5.0
                 self.opengl_grid.resetTransform()
                 self.opengl_grid.translate(0, 0, floor_z)
-        else:
-            self.matplotlib_render_pending = True
-            for line, xyz in zip(self.line_artists, positions):
-                if len(xyz) < 2:
-                    continue
-                line.set_data(xyz[:, 0], xyz[:, 1])
-                line.set_3d_properties(xyz[:, 2])
-
         age_ms = (time.time() - frame["receive_time"]) * 1000.0
-        render_rate = (
-            self.opengl_render_rate.rate()
-            if self.current_renderer() == "opengl"
-            else self.matplotlib_render_rate.rate()
-        )
-        self.status_label.setText(
-            f"UDP {self.receiver.rate:.1f} Hz | "
-            f"render {render_rate:.1f} FPS | frame age {age_ms:.1f} ms"
-        )
-        if self.current_renderer() == "matplotlib":
-            self.canvas.draw_idle()
+        render_rate = self.opengl_render_rate.rate()
+        self.udp_badge.setText(f"UDP {self.receiver.rate:.1f} Hz")
+        self.render_badge.setText(f"Render {render_rate:.1f} FPS")
+        self.age_badge.setText(f"Age {age_ms:.1f} ms")
 
     def shutdown(self):
         self.timer.stop()

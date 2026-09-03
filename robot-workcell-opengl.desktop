@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Robot Workcell OpenGL
+Comment=Launch the experimental Robot Workcell UI with NANSENSE OpenGL and RViz
+Exec=/home/mines/ros2_ws/src/ur7e_tools/run_workcell_ui_opengl.sh
+Path=/home/mines/ros2_ws/src/ur7e_tools
+Icon=applications-engineering
+Terminal=false
+Categories=Science;Robotics;
+StartupNotify=true
