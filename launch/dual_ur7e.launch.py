@@ -21,6 +21,7 @@ def generate_launch_description():
     robot1_ip = LaunchConfiguration("robot1_ip")
     robot2_ip = LaunchConfiguration("robot2_ip")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    use_wrist_camera = LaunchConfiguration("use_wrist_camera")
     robot1_x = LaunchConfiguration("robot1_x")
     robot1_y = LaunchConfiguration("robot1_y")
     robot1_z = LaunchConfiguration("robot1_z")
@@ -113,6 +114,7 @@ def generate_launch_description():
 
                     "tf_prefix": "robot1_",
                     "use_2fg7": "true",
+                    "use_wrist_camera": use_wrist_camera,
                     "base_x": robot1_x,
                     "base_y": robot1_y,
                     "base_z": robot1_z,
@@ -152,6 +154,7 @@ def generate_launch_description():
 
                     "tf_prefix": "robot2_",
                     "use_2fg7": "true",
+                    "use_wrist_camera": use_wrist_camera,
                     "base_x": robot2_x,
                     "base_y": robot2_y,
                     "base_z": robot2_z,
@@ -183,6 +186,7 @@ def generate_launch_description():
         DeclareLaunchArgument("robot1_ip", default_value="127.0.0.1"),
         DeclareLaunchArgument("robot2_ip", default_value="127.0.0.1"),
         DeclareLaunchArgument("use_fake_hardware", default_value="true"),
+        DeclareLaunchArgument("use_wrist_camera", default_value="true"),
         DeclareLaunchArgument("launch_rviz", default_value="true"),
         DeclareLaunchArgument("robot1_x", default_value="0.27"),
         DeclareLaunchArgument("robot1_y", default_value="0.275"),

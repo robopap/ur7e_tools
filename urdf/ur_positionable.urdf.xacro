@@ -5,6 +5,7 @@
    <!-- import main macro -->
    <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
    <xacro:include filename="$(find onrobot_2fg7_description)/urdf/onrobot_2fg7.xacro"/>
+   <xacro:include filename="$(find realsense2_description)/urdf/_d435.urdf.xacro"/>
 
    <!-- possible 'ur_type' values: ur3, ur5, ur10, ur3e, ur5e, ur7e, ur10e, ur12e, ur16e, ur8long, ur15, ur18, ur20, ur30 -->
    <!-- the default value should raise an error in case this was called without defining the type -->
@@ -49,6 +50,23 @@
    <xacro:arg name="base_pitch" default="0.0"/>
    <xacro:arg name="base_yaw" default="0.0"/>
    <xacro:arg name="use_2fg7" default="false"/>
+   <xacro:arg name="use_wrist_camera" default="false"/>
+
+   <!-- Camera bracket relative to tool0 -->
+   <xacro:arg name="camera_mount_x" default="0.0"/>
+   <xacro:arg name="camera_mount_y" default="0.0"/>
+   <xacro:arg name="camera_mount_z" default="0.0"/>
+   <xacro:arg name="camera_mount_roll" default="0.0"/>
+   <xacro:arg name="camera_mount_pitch" default="0.0"/>
+   <xacro:arg name="camera_mount_yaw" default="0.0"/>
+
+   <!-- D435 bottom screw frame relative to the bracket -->
+   <xacro:arg name="camera_x" default="0.0"/>
+   <xacro:arg name="camera_y" default="-0.045"/>
+   <xacro:arg name="camera_z" default="0.019"/>
+   <xacro:arg name="camera_roll" default="0.0"/>
+   <xacro:arg name="camera_pitch" default="-1.5708"/>
+   <xacro:arg name="camera_yaw" default="1.5708"/>
 
      <!-- Simulation parameters -->
    <xacro:arg name="use_fake_hardware" default="false" />
@@ -165,6 +183,44 @@
 
      </xacro:onrobot_2fg7_fingertip>
 
+  </xacro:if>
+
+  <xacro:if value="$(arg use_wrist_camera)">
+    <link name="$(arg tf_prefix)camera_mount_link">
+      <visual>
+        <geometry>
+          <mesh filename="package://ur7e_tools/meshes/camera_mount/support-UR-D435.stl"
+                scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="camera_mount_material">
+          <color rgba="0.15 0.15 0.15 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://ur7e_tools/meshes/camera_mount/support-UR-D435.stl"
+                scale="0.001 0.001 0.001"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="$(arg tf_prefix)tool0_to_camera_mount" type="fixed">
+      <parent link="$(arg tf_prefix)tool0"/>
+      <child link="$(arg tf_prefix)camera_mount_link"/>
+      <origin
+        xyz="$(arg camera_mount_x) $(arg camera_mount_y) $(arg camera_mount_z)"
+        rpy="$(arg camera_mount_roll) $(arg camera_mount_pitch) $(arg camera_mount_yaw)"/>
+    </joint>
+
+    <xacro:sensor_d435
+        parent="$(arg tf_prefix)camera_mount_link"
+        name="$(arg tf_prefix)camera"
+        use_nominal_extrinsics="true"
+        use_mesh="true">
+      <origin
+        xyz="$(arg camera_x) $(arg camera_y) $(arg camera_z)"
+        rpy="$(arg camera_roll) $(arg camera_pitch) $(arg camera_yaw)"/>
+    </xacro:sensor_d435>
   </xacro:if>
 
    <xacro:if value="$(arg sim_gazebo)">

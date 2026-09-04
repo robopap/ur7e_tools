@@ -75,6 +75,7 @@ def launch_setup(context, *args, **kwargs):
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     tf_prefix = LaunchConfiguration("tf_prefix")
     use_2fg7 = LaunchConfiguration("use_2fg7")
+    use_wrist_camera = LaunchConfiguration("use_wrist_camera")
     base_x = LaunchConfiguration("base_x")
     base_y = LaunchConfiguration("base_y")
     base_z = LaunchConfiguration("base_z")
@@ -246,6 +247,9 @@ def launch_setup(context, *args, **kwargs):
             " ",
             "use_2fg7:=",
             use_2fg7,
+            " ",
+            "use_wrist_camera:=",
+            use_wrist_camera,
         ]
     )
     robot_description = {
@@ -827,6 +831,12 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "use_2fg7",
+            default_value="false",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "use_wrist_camera",
             default_value="false",
         )
     )
