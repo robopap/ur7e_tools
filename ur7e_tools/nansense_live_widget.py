@@ -76,7 +76,13 @@ def parse_triplet(parts, start):
 
 def parse_packet(data):
     text = data.decode("utf-8", errors="ignore")
-    frame = {"receive_time": time.time(), "displacement_cm": None, "joints": {}}
+    receive_time_ns = time.time_ns()
+    frame = {
+        "receive_time": receive_time_ns / 1e9,
+        "receive_time_ns": receive_time_ns,
+        "displacement_cm": None,
+        "joints": {},
+    }
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -113,9 +119,10 @@ def parse_packet(data):
     return frame
 
 class LatestFrameReceiver:
-    def __init__(self, ip=UDP_IP, port=UDP_PORT):
+    def __init__(self, ip=UDP_IP, port=UDP_PORT, packet_callback=None):
         self.ip = ip
         self.port = port
+        self.packet_callback = packet_callback
         self.sock = None
         self.thread = None
         self.running = False
@@ -156,6 +163,9 @@ class LatestFrameReceiver:
 
             with self.lock:
                 self.latest_frame = frame
+
+            if self.packet_callback is not None:
+                self.packet_callback(frame)
 
             self.rate_count += 1
             now = time.monotonic()
@@ -279,9 +289,12 @@ class NansenseLiveWidget(QWidget):
         parent=None,
         frame_callback=None,
         calibration_callback=None,
+        packet_callback=None,
     ):
         super().__init__(parent)
-        self.receiver = LatestFrameReceiver()
+        self.receiver = LatestFrameReceiver(
+            packet_callback=packet_callback
+        )
         self.frame_callback = frame_callback
         self.calibration_callback = calibration_callback
         config_home = Path(

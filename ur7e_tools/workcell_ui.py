@@ -22,7 +22,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Point, WrenchStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
 from visualization_msgs.msg import Marker, MarkerArray
@@ -66,6 +66,7 @@ WRENCH_UI_REFRESH_MS = 50
 WRENCH_STALE_SEC = 0.5
 
 NANSENSE_MARKER_TOPIC = "/nansense/skeleton_markers"
+NANSENSE_RAW_TOPIC = "/nansense/raw_frame"
 NANSENSE_MARKER_FRAME = "world"
 NANSENSE_MARKER_LIFETIME_SEC = 0.2
 
@@ -448,6 +449,11 @@ class WrenchListenerNode(Node):
             NANSENSE_MARKER_TOPIC,
             1,
         )
+        self._nansense_raw_publisher = self.create_publisher(
+            String,
+            NANSENSE_RAW_TOPIC,
+            50,
+        )
 
         # Health probes run inside this ROS node's spin thread so the GUI never
         # blocks on controller-manager, graph, or TF calls.
@@ -531,6 +537,21 @@ class WrenchListenerNode(Node):
             1.0 / 30.0,
             self._publish_latest_nansense_markers,
         )
+
+    def publish_nansense_raw_frame(self, frame):
+        """Publish one complete parsed NANSENSE UDP frame for rosbag logging."""
+        if frame is None:
+            return
+
+        import json
+
+        msg = String()
+        msg.data = json.dumps(
+            frame,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        self._nansense_raw_publisher.publish(msg)
 
     def update_nansense_frame(self, frame):
         with self._nansense_lock:
@@ -1989,6 +2010,9 @@ class WorkcellUI(QMainWindow):
             frame_callback=self.wrench_listener.update_nansense_frame,
             calibration_callback=(
                 self.wrench_listener.update_nansense_calibration
+            ),
+            packet_callback=(
+                self.wrench_listener.publish_nansense_raw_frame
             ),
         )
         self.nansense_widget.setMinimumWidth(650)
