@@ -35,6 +35,7 @@ setup(
         'console_scripts': [
             'move_joints = ur7e_tools.move_ur7e_joints:main',
             'workcell_ui = ur7e_tools.workcell_ui:main',
+            'saved_pose = ur7e_tools.saved_pose:main',
             'home_pose = ur7e_tools.home_pose:main',
             'gripper_visualizer = ur7e_tools.gripper_visualizer:main',
             'ft_sensor = ur7e_tools.ft_sensor_node:main',

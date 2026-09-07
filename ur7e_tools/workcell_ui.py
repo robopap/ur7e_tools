@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -1221,20 +1222,27 @@ class WorkcellUI(QMainWindow):
         )
 
         # -----------------------------------------------------
-        # HOME motion process
+        # Setup motion process
+        #
+        # This single process serializes setup motions. For the
+        # Dual UR7e setup it runs the saved_pose backend, whose
+        # mandatory full-path workcell safety gate cannot be
+        # bypassed by the UI. The legacy UR5 HOME path remains
+        # available for the Single UR5 setup.
         # -----------------------------------------------------
 
         self.home_process = QProcess(self)
         self.home_process.setProcessChannelMode(QProcess.MergedChannels)
 
         self.home_process.readyReadStandardOutput.connect(
-            self.read_home_output
+            self.read_setup_motion_output
         )
         self.home_process.finished.connect(
-            self.home_motion_finished
+            self.setup_motion_finished
         )
 
-        self.active_home_target = None
+        self.active_setup_motion = None
+        self.setup_motion_output_buffer = ""
 
         # -----------------------------------------------------
         # 2FG7 gripper commands
@@ -1719,14 +1727,22 @@ class WorkcellUI(QMainWindow):
         robot1_actions = QHBoxLayout()
 
         self.robot1_home_button = QPushButton(
-            "MOVE TO HOME"
+            "MOVE ROBOT"
         )
         self.robot1_home_button.setEnabled(False)
-        self.robot1_home_button.clicked.connect(
-            lambda: self.move_to_home("robot1")
+        self.robot1_pose_menu = QMenu(
+            self.robot1_home_button
+        )
+        self.robot1_pose_menu.aboutToShow.connect(
+            lambda: self.refresh_robot_pose_menu("robot1")
+        )
+        self.robot1_home_button.setMenu(
+            self.robot1_pose_menu
         )
         self.robot1_home_button.setToolTip(
-            "Move Robot 1 to its saved HOME joint configuration."
+            "Choose a saved Robot 1 setup pose. "
+            "Every real move is checked against the table and Robot 2 "
+            "before any trajectory is sent."
         )
         robot1_actions.addWidget(
             self.robot1_home_button
@@ -1773,7 +1789,7 @@ class WorkcellUI(QMainWindow):
         )
 
         self.robot1_gripper_move_button = QPushButton(
-            "MOVE"
+            "MOVE GRIP"
         )
         self.robot1_gripper_move_button.setEnabled(False)
         self.robot1_gripper_move_button.clicked.connect(
@@ -1863,14 +1879,22 @@ class WorkcellUI(QMainWindow):
         robot2_actions = QHBoxLayout()
 
         self.robot2_home_button = QPushButton(
-            "MOVE TO HOME"
+            "MOVE ROBOT"
         )
         self.robot2_home_button.setEnabled(False)
-        self.robot2_home_button.clicked.connect(
-            lambda: self.move_to_home("robot2")
+        self.robot2_pose_menu = QMenu(
+            self.robot2_home_button
+        )
+        self.robot2_pose_menu.aboutToShow.connect(
+            lambda: self.refresh_robot_pose_menu("robot2")
+        )
+        self.robot2_home_button.setMenu(
+            self.robot2_pose_menu
         )
         self.robot2_home_button.setToolTip(
-            "Move Robot 2 to its saved HOME joint configuration."
+            "Choose a saved Robot 2 setup pose. "
+            "Every real move is checked against the table and Robot 1 "
+            "before any trajectory is sent."
         )
         robot2_actions.addWidget(
             self.robot2_home_button
@@ -1917,7 +1941,7 @@ class WorkcellUI(QMainWindow):
         )
 
         self.robot2_gripper_move_button = QPushButton(
-            "MOVE"
+            "MOVE GRIP"
         )
         self.robot2_gripper_move_button.setEnabled(False)
         self.robot2_gripper_move_button.clicked.connect(
@@ -4452,17 +4476,80 @@ class WorkcellUI(QMainWindow):
         self.start_guard_label.setVisible(True)
 
     # =========================================================
-    # HOME motion
+    # Setup / saved-pose motion
     # =========================================================
 
+    @staticmethod
+    def _pose_display_name(pose_name):
+        if pose_name == "home":
+            return "HOME"
+        return pose_name.replace("_", " ").replace("-", " ").title()
+
+    def discover_robot_saved_poses(self, robot):
+        """Return saved pose names for robot1/robot2 from config/."""
+
+        if robot not in ("robot1", "robot2"):
+            return []
+
+        config_dir = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+        )
+
+        poses = []
+
+        home_path = config_dir / f"home_{robot}.yaml"
+        if home_path.is_file():
+            poses.append("home")
+
+        prefix = f"pose_{robot}_"
+        for path in sorted(config_dir.glob(f"{prefix}*.yaml")):
+            pose_name = path.stem[len(prefix):]
+            if pose_name and pose_name not in poses:
+                poses.append(pose_name)
+
+        return poses
+
+    def refresh_robot_pose_menu(self, robot):
+        menu = (
+            self.robot1_pose_menu
+            if robot == "robot1"
+            else self.robot2_pose_menu
+        )
+
+        menu.clear()
+        poses = self.discover_robot_saved_poses(robot)
+
+        if not poses:
+            action = menu.addAction("No saved poses")
+            action.setEnabled(False)
+            return
+
+        for pose_name in poses:
+            action = menu.addAction(
+                self._pose_display_name(pose_name)
+            )
+            action.setToolTip(
+                f"Saved pose: {pose_name}"
+            )
+            action.triggered.connect(
+                lambda checked=False,
+                robot=robot,
+                pose_name=pose_name:
+                self.move_robot_to_pose(robot, pose_name)
+            )
+
     def update_home_buttons(self):
+        """Update UR5 HOME and Dual-UR7e MOVE ROBOT controls."""
 
         system_running = (
             self.status_label.text() == "RUNNING"
         )
 
-        home_idle = (
+        motion_idle = (
             self.home_process.state()
+            == QProcess.NotRunning
+            and self.gripper_process.state()
             == QProcess.NotRunning
         )
 
@@ -4473,7 +4560,7 @@ class WorkcellUI(QMainWindow):
 
         self.ur5_home_button.setEnabled(
             system_running
-            and home_idle
+            and motion_idle
             and single
         )
 
@@ -4495,19 +4582,27 @@ class WorkcellUI(QMainWindow):
 
         self.robot1_home_button.setEnabled(
             system_running
-            and home_idle
+            and motion_idle
             and not single
             and robot1_ready
         )
 
         self.robot2_home_button.setEnabled(
             system_running
-            and home_idle
+            and motion_idle
             and not single
             and robot2_ready
         )
 
     def move_to_home(self, target):
+        """Legacy UR5 HOME entry point; dual robots use saved_pose safely."""
+
+        if target in ("robot1", "robot2"):
+            self.move_robot_to_pose(target, "home")
+            return
+
+        if target != "ur5":
+            return
 
         if self.status_label.text() != "RUNNING":
             return
@@ -4518,49 +4613,15 @@ class WorkcellUI(QMainWindow):
         ):
             return
 
-        dual_real_target = (
-            target in ("robot1", "robot2")
-            and self.setup_combo.currentText() == "Dual UR7e"
-            and self.mode_combo.currentText() == "Real Robot(s)"
-        )
-
-        if (
-            dual_real_target
-            and not self.robot_ready[target]
-        ):
-            self.show_robot_not_ready_warning(target)
-            return
-
-        # Require explicit confirmation on real hardware.
-        if (
-            self.mode_combo.currentText()
-            == "Real Robot(s)"
-        ):
-
-            display_names = {
-                "ur5": "UR5",
-                "robot1": "Robot 1",
-                "robot2": "Robot 2",
-            }
-
+        if self.mode_combo.currentText() == "Real Robot(s)":
             answer = QMessageBox.question(
                 self,
-                "Move to HOME",
-                f"Move {display_names[target]} to its saved HOME position?",
+                "Move UR5 to HOME",
+                "Move UR5 to its saved HOME position?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
-
             if answer != QMessageBox.Yes:
-                return
-
-            # Re-check after the confirmation dialog. PLAY may have been
-            # stopped while the dialog was open.
-            if (
-                dual_real_target
-                and not self.robot_ready[target]
-            ):
-                self.show_robot_not_ready_warning(target)
                 return
 
         workspace_setup = os.path.expanduser(
@@ -4568,10 +4629,8 @@ class WorkcellUI(QMainWindow):
         )
 
         command = (
-            f"ros2 run ur7e_tools home_pose "
-            f"--target {target} "
-            f"--move "
-            f"--duration 5.0"
+            "ros2 run ur7e_tools home_pose "
+            "--target ur5 --move --duration 5.0"
         )
 
         full_command = (
@@ -4580,27 +4639,149 @@ class WorkcellUI(QMainWindow):
             f" && exec {command}"
         )
 
-        self.active_home_target = target
+        self.active_setup_motion = (
+            "ur5_home",
+            "ur5",
+            "home",
+        )
+        self.setup_motion_output_buffer = ""
 
         self.log_output.appendPlainText(
             f"\n$ {command}\n"
         )
 
-        # Prevent a second HOME command until this one finishes.
         self.ur5_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
 
         self.home_process.start(
             "/bin/bash",
-            [
-                "-lc",
-                full_command,
-            ],
+            ["-lc", full_command],
         )
 
-    def read_home_output(self):
+    def move_robot_to_pose(self, robot, pose_name):
+        """
+        Move robot1/robot2 to a named pose through saved_pose.py.
 
+        The UI confirmation is only a user confirmation. The mandatory
+        full-path collision/clearance gate remains inside saved_pose.py and
+        is run before any trajectory can be submitted.
+        """
+
+        if robot not in ("robot1", "robot2"):
+            return
+
+        if self.status_label.text() != "RUNNING":
+            return
+
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+
+        if (
+            self.home_process.state()
+            != QProcess.NotRunning
+            or self.gripper_process.state()
+            != QProcess.NotRunning
+        ):
+            return
+
+        available = self.discover_robot_saved_poses(robot)
+        if pose_name not in available:
+            QMessageBox.warning(
+                self,
+                "Saved pose unavailable",
+                f"The saved pose '{pose_name}' is not available for {robot}.",
+            )
+            return
+
+        dual_real = (
+            self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        if dual_real and not self.robot_ready[robot]:
+            self.show_robot_not_ready_warning(robot)
+            return
+
+        display_robot = (
+            "Robot 1" if robot == "robot1" else "Robot 2"
+        )
+        display_pose = self._pose_display_name(pose_name)
+
+        # Explicit UI confirmation on real hardware. --yes is passed to the
+        # backend only because this dialog has already handled confirmation;
+        # it never disables the backend safety gate.
+        if dual_real:
+            answer = QMessageBox.question(
+                self,
+                "Move robot to saved pose",
+                (
+                    f"Move {display_robot} to:\n\n"
+                    f"{display_pose}\n\n"
+                    "A full-path workcell safety check will run before "
+                    "any trajectory is sent."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+
+            if answer != QMessageBox.Yes:
+                return
+
+            # PLAY/readiness may change while the dialog is open.
+            if not self.robot_ready[robot]:
+                self.show_robot_not_ready_warning(robot)
+                return
+
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+        repo_root = Path(__file__).resolve().parents[1]
+
+        backend_command = (
+            "ros2 run ur7e_tools saved_pose "
+            f"--target {shlex.quote(robot)} "
+            "--move "
+            f"--pose {shlex.quote(pose_name)} "
+            "--duration 10.0 "
+            "--yes"
+        )
+
+        # Run from the source repository so newly added saved-pose/safety
+        # modules are resolved even before a later install-space refresh.
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && cd {shlex.quote(str(repo_root))}"
+            f" && exec {backend_command}"
+        )
+
+        self.active_setup_motion = (
+            "saved_pose",
+            robot,
+            pose_name,
+        )
+        self.setup_motion_output_buffer = ""
+
+        self.log_output.appendPlainText(
+            f"\n$ {backend_command}\n"
+        )
+
+        # Serialize setup motion: never allow a second robot move in parallel.
+        self.ur5_home_button.setEnabled(False)
+        self.robot1_home_button.setEnabled(False)
+        self.robot2_home_button.setEnabled(False)
+
+        self.robot1_gripper_move_button.setEnabled(False)
+        self.robot2_gripper_move_button.setEnabled(False)
+        self.robot1_gripper_slider.setEnabled(False)
+        self.robot2_gripper_slider.setEnabled(False)
+
+        self.home_process.start(
+            "/bin/bash",
+            ["-lc", full_command],
+        )
+
+    def read_setup_motion_output(self):
         text = bytes(
             self.home_process.readAllStandardOutput()
         ).decode(
@@ -4608,43 +4789,79 @@ class WorkcellUI(QMainWindow):
             errors="replace",
         )
 
-        if text:
+        if not text:
+            return
 
-            self.log_output.appendPlainText(
-                text.rstrip()
-            )
+        self.setup_motion_output_buffer += text
+        self.log_output.appendPlainText(
+            text.rstrip()
+        )
 
-            scrollbar = (
-                self.log_output.verticalScrollBar()
-            )
+        scrollbar = (
+            self.log_output.verticalScrollBar()
+        )
+        scrollbar.setValue(
+            scrollbar.maximum()
+        )
 
-            scrollbar.setValue(
-                scrollbar.maximum()
-            )
-
-    def home_motion_finished(
+    def setup_motion_finished(
         self,
         exit_code,
-        exit_status
+        exit_status,
     ):
+        motion = self.active_setup_motion
+        output = self.setup_motion_output_buffer
 
-        target = self.active_home_target
+        if motion is None:
+            self.update_home_buttons()
+            return
+
+        kind, target, pose_name = motion
+        display_pose = self._pose_display_name(pose_name)
 
         if exit_code == 0:
-
-            self.log_output.appendPlainText(
-                f"\n[HOME completed: {target}]"
-            )
-
+            if kind == "saved_pose":
+                self.log_output.appendPlainText(
+                    f"\n[POSE completed: {target} -> {display_pose}]"
+                )
+            else:
+                self.log_output.appendPlainText(
+                    "\n[HOME completed: ur5]"
+                )
         else:
+            blocked = "MOVE BLOCKED" in output
 
-            self.log_output.appendPlainText(
-                f"\n[HOME failed: {target} "
-                f"- exit code {exit_code}]"
-            )
+            if kind == "saved_pose" and blocked:
+                self.log_output.appendPlainText(
+                    f"\n[MOVE BLOCKED: {target} -> {display_pose}]"
+                )
+                QMessageBox.warning(
+                    self,
+                    "Move blocked",
+                    (
+                        f"{target} was NOT moved to {display_pose}.\n\n"
+                        "The saved-pose safety backend blocked the path.\n"
+                        "See ROS 2 output for the collision/clearance details."
+                    ),
+                )
+            else:
+                self.log_output.appendPlainText(
+                    f"\n[SETUP MOVE failed: {target} -> {display_pose} "
+                    f"- exit code {exit_code}]"
+                )
+                QMessageBox.warning(
+                    self,
+                    "Robot move failed",
+                    (
+                        f"The setup move for {target} did not complete.\n\n"
+                        "See ROS 2 output for details."
+                    ),
+                )
 
-        self.active_home_target = None
+        self.active_setup_motion = None
+        self.setup_motion_output_buffer = ""
         self.update_home_buttons()
+        self.update_gripper_buttons()
 
     # =========================================================
     # 2FG7 gripper control
@@ -4665,10 +4882,16 @@ class WorkcellUI(QMainWindow):
             == QProcess.NotRunning
         )
 
+        setup_motion_idle = (
+            self.home_process.state()
+            == QProcess.NotRunning
+        )
+
         base_enabled = (
             system_running
             and dual
             and command_idle
+            and setup_motion_idle
         )
 
         dual_real = (
@@ -4691,7 +4914,11 @@ class WorkcellUI(QMainWindow):
             )
         )
 
-        slider_enabled = dual and command_idle
+        slider_enabled = (
+            dual
+            and command_idle
+            and setup_motion_idle
+        )
         self.robot1_gripper_slider.setEnabled(slider_enabled)
         self.robot2_gripper_slider.setEnabled(slider_enabled)
 
@@ -4705,6 +4932,8 @@ class WorkcellUI(QMainWindow):
 
         if (
             self.gripper_process.state()
+            != QProcess.NotRunning
+            or self.home_process.state()
             != QProcess.NotRunning
         ):
             return
@@ -4776,6 +5005,7 @@ class WorkcellUI(QMainWindow):
                 full_command,
             ],
         )
+        self.update_home_buttons()
 
     def read_gripper_output(self):
 
@@ -4821,6 +5051,7 @@ class WorkcellUI(QMainWindow):
 
         self.active_gripper_command = None
         self.update_gripper_buttons()
+        self.update_home_buttons()
 
     # =========================================================
     # Configuration validation
