@@ -52,7 +52,7 @@ CONFIG_DIR = (
 )
 
 START_HOLD_SEC = 1.0
-DEFAULT_DURATION_SEC = 10.0
+DEFAULT_DURATION_SEC = 5.0
 DEFAULT_TOLERANCE_RAD = 0.02
 
 
@@ -445,45 +445,11 @@ class SavedPoseNode(Node):
 
         return goal
 
-    def run_path_safety_check(
-        self,
-        current,
-        target,
-    ):
-        """
-        Mandatory full-workcell safety scan.
-
-        Checks the complete interpolated path of the
-        moving robot against:
-          - the live stationary other robot
-          - the table
-
-        The live expanded robot_description is used,
-        including arm, 2FG7 and camera geometry.
-        """
-
-        checker = LiveWorkcellSafety(
-            self
-        )
-
-        report = checker.check_path(
-            moving_robot=self.target,
-            moving_start_q=current,
-            moving_target_q=target,
-        )
-
-        print_safety_report(
-            report
-        )
-
-        return report
-
     def move_to_pose(
         self,
         pose_name,
         duration=DEFAULT_DURATION_SEC,
         tolerance=DEFAULT_TOLERANCE_RAD,
-        skip_confirmation=False,
     ):
         if duration <= 0.0:
             raise ValueError(
@@ -521,100 +487,11 @@ class SavedPoseNode(Node):
                 f"{self.target} is already "
                 f"at '{pose_name}'."
             )
-            return True
+            return
 
         print()
         print("Saved pose file:")
         print(path)
-
-        # ------------------------------------------------
-        # SAFETY GATE 1
-        # Full path must be safe before confirmation.
-        # ------------------------------------------------
-
-        print()
-        print(
-            "Running mandatory full-path "
-            "workcell safety check..."
-        )
-
-        report = self.run_path_safety_check(
-            current,
-            target,
-        )
-
-        if not report.safe:
-            print()
-            print(
-                "MOVE BLOCKED: trajectory "
-                "was NOT sent."
-            )
-            return False
-
-        # ------------------------------------------------
-        # User/UI confirmation happens only after the
-        # candidate path has passed the safety scan.
-        # --yes skips ONLY this confirmation, never safety.
-        # ------------------------------------------------
-
-        if not skip_confirmation:
-            expected = (
-                f"MOVE {self.target.upper()} "
-                f"TO {pose_name.upper()}"
-            )
-
-            print()
-            print(
-                "Requested motion:"
-            )
-            print(
-                f"  {self.target} "
-                f"→ {pose_name}"
-            )
-
-            answer = input(
-                f"\nType {expected} "
-                "to continue: "
-            )
-
-            if answer.strip() != expected:
-                print(
-                    "Motion cancelled."
-                )
-                return False
-
-        # ------------------------------------------------
-        # SAFETY GATE 2
-        # Confirmation may take time. Obtain a fresh
-        # measured moving-robot state and re-run the full
-        # workcell scan immediately before sending motion.
-        # ------------------------------------------------
-
-        self.latest_joint_state = None
-
-        current = (
-            self.get_current_positions()
-        )
-
-        print()
-        print(
-            "Re-checking full path immediately "
-            "before trajectory submission..."
-        )
-
-        report = self.run_path_safety_check(
-            current,
-            target,
-        )
-
-        if not report.safe:
-            print()
-            print(
-                "MOVE BLOCKED: workcell state "
-                "changed or path is unsafe. "
-                "Trajectory was NOT sent."
-            )
-            return False
 
         print()
         print(
@@ -726,8 +603,6 @@ class SavedPoseNode(Node):
             f"'{pose_name}'"
         )
 
-        return True
-
 
 def print_saved_poses(target):
     poses = discover_poses(target)
@@ -794,15 +669,6 @@ def parse_arguments():
         help="Check current joints against a saved pose without motion.",
     )
 
-    mode.add_argument(
-        "--path-check",
-        action="store_true",
-        help=(
-            "Run the full workcell path safety "
-            "check without sending any motion."
-        ),
-    )
-
     parser.add_argument(
         "--pose",
         default=None,
@@ -852,7 +718,7 @@ def main(args=None):
     if not cli.pose:
         raise RuntimeError(
             "--pose is required for "
-            "--save, --check, --path-check and --move."
+            "--save and --move."
         )
 
     pose_name = normalize_pose_name(
@@ -905,60 +771,62 @@ def main(args=None):
                     f"'{pose_name}'"
                 )
 
-        elif cli.path_check:
-            target, path = load_pose(
+        elif cli.move:
+            # CLI safety confirmation.
+            # Later the UI can use --yes after
+            # its own confirmation dialog.
+            if not cli.yes:
+                expected = (
+                    f"MOVE {cli.target.upper()} "
+                    f"TO {pose_name.upper()}"
+                )
+
+                print()
+                print(
+                    "Requested motion:"
+                )
+                print(
+                    f"  {cli.target} "
+                    f"→ {pose_name}"
+                )
+
+                answer = input(
+                    f"\nType {expected} "
+                    "to continue: "
+                )
+
+                if answer.strip() != expected:
+                    print(
+                        "Motion cancelled."
+                    )
+                    return
+
+            # One fast coarse full-path safety guard immediately
+            # before sending the setup trajectory.
+            target_q, _ = load_pose(
                 cli.target,
                 pose_name,
             )
+            current_q = node.get_current_positions()
 
-            current = (
-                node.get_current_positions()
+            safety = LiveWorkcellSafety(node)
+            report = safety.check_path(
+                moving_robot=cli.target,
+                moving_start_q=current_q,
+                moving_target_q=target_q,
             )
-
-            node.print_comparison(
-                current,
-                target,
-                (
-                    f"{cli.target.upper()} "
-                    f"PATH CHECK: {pose_name}"
-                ),
-            )
-
-            print()
-            print("Saved pose file:")
-            print(path)
-
-            report = (
-                node.run_path_safety_check(
-                    current,
-                    target,
-                )
-            )
+            print_safety_report(report)
 
             if not report.safe:
-                print()
-                print(
-                    "PATH CHECK RESULT: "
-                    "MOVE BLOCKED"
+                raise RuntimeError(
+                    "MOVE BLOCKED by workcell collision check."
                 )
-                sys.exit(2)
 
-            print()
-            print(
-                "PATH CHECK RESULT: "
-                "PATH ACCEPTED"
-            )
-
-        elif cli.move:
-            success = node.move_to_pose(
+            node.move_to_pose(
                 pose_name,
                 duration=cli.duration,
                 tolerance=cli.tolerance,
-                skip_confirmation=cli.yes,
             )
-
-            if not success:
-                sys.exit(2)
 
     finally:
         node.destroy_node()

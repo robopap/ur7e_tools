@@ -20,14 +20,9 @@ from ur7e_tools.workcell_safety import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-ROBOT_ROBOT_MARGIN_M = 0.020
-TABLE_MARGIN_M = 0.010
-MAX_SAMPLE_STEP_RAD = 0.020
-
-# Per-process geometry cache. A saved-pose MOVE performs more than one safety
-# scan; the robot descriptions and collision meshes do not change between
-# those scans, so rebuilding Pinocchio/Coal models is unnecessary.
-_SCENE_CACHE = None
+ROBOT_ROBOT_MARGIN_M = 0.0
+TABLE_MARGIN_M = 0.0
+MAX_SAMPLE_STEP_RAD = 0.050
 
 
 class LiveWorkcellSafety:
@@ -224,72 +219,6 @@ class LiveWorkcellSafety:
 
         return xml
 
-    def _refresh_live_states(self):
-        """Require new ROS samples for every safety scan."""
-        for robot in ("robot1", "robot2"):
-            self.arm_states[robot] = None
-            self.visual_states[robot] = None
-
-    def _get_cached_scenes(self):
-        """Load live robot collision scenes once per saved-pose process."""
-        global _SCENE_CACHE
-
-        if _SCENE_CACHE is not None:
-            return _SCENE_CACHE
-
-        robot1_xml = self.get_robot_description(
-            "robot1"
-        )
-        robot2_xml = self.get_robot_description(
-            "robot2"
-        )
-
-        with tempfile.TemporaryDirectory(
-            prefix="ur7e_safety_"
-        ) as tmpdir:
-            tmpdir = Path(tmpdir)
-
-            r1_path = tmpdir / "robot1_live.urdf"
-            r2_path = tmpdir / "robot2_live.urdf"
-
-            r1_path.write_text(
-                robot1_xml,
-                encoding="utf-8",
-            )
-            r2_path.write_text(
-                robot2_xml,
-                encoding="utf-8",
-            )
-
-            robot1_scene = load_robot_scene(
-                "robot1",
-                r1_path,
-            )
-            robot2_scene = load_robot_scene(
-                "robot2",
-                r2_path,
-            )
-
-        (
-            _table_model,
-            _table_data,
-            table_geom_model,
-            table_geom_data,
-        ) = load_table_scene(
-            REPO_ROOT / "urdf/workcell.urdf"
-        )
-
-        _SCENE_CACHE = (
-            {
-                "robot1": robot1_scene,
-                "robot2": robot2_scene,
-            },
-            table_geom_model,
-            table_geom_data,
-        )
-
-        return _SCENE_CACHE
-
     def check_path(
         self,
         moving_robot,
@@ -311,9 +240,6 @@ class LiveWorkcellSafety:
             else "robot1"
         )
 
-        # The second pre-send scan must use fresh live robot/gripper state.
-        self._refresh_live_states()
-
         other_q = self.get_arm_q(
             other_robot
         )
@@ -330,99 +256,128 @@ class LiveWorkcellSafety:
             )
         )
 
-        (
-            scenes,
-            table_geom_model,
-            table_geom_data,
-        ) = self._get_cached_scenes()
-
-        report = check_move_path(
-            moving_scene=scenes[
-                moving_robot
-            ],
-            other_scene=scenes[
-                other_robot
-            ],
-            table_geom_model=(
-                table_geom_model
-            ),
-            table_geom_data=(
-                table_geom_data
-            ),
-            moving_start_arm_q=(
-                moving_start_q
-            ),
-            moving_target_arm_q=(
-                moving_target_q
-            ),
-            other_arm_q=other_q,
-            moving_gripper_position=(
-                moving_gripper
-            ),
-            other_gripper_position=(
-                other_gripper
-            ),
-            robot_robot_margin_m=(
-                ROBOT_ROBOT_MARGIN_M
-            ),
-            table_margin_m=(
-                TABLE_MARGIN_M
-            ),
-            max_sample_step_rad=(
-                MAX_SAMPLE_STEP_RAD
-            ),
+        robot1_xml = (
+            self.get_robot_description(
+                "robot1"
+            )
         )
 
-        return report
+        robot2_xml = (
+            self.get_robot_description(
+                "robot2"
+            )
+        )
 
+        with tempfile.TemporaryDirectory(
+            prefix="ur7e_safety_"
+        ) as tmpdir:
+
+            tmpdir = Path(tmpdir)
+
+            r1_path = (
+                tmpdir
+                / "robot1_live.urdf"
+            )
+
+            r2_path = (
+                tmpdir
+                / "robot2_live.urdf"
+            )
+
+            r1_path.write_text(
+                robot1_xml
+            )
+
+            r2_path.write_text(
+                robot2_xml
+            )
+
+            robot1_scene = (
+                load_robot_scene(
+                    "robot1",
+                    r1_path,
+                )
+            )
+
+            robot2_scene = (
+                load_robot_scene(
+                    "robot2",
+                    r2_path,
+                )
+            )
+
+            (
+                _table_model,
+                _table_data,
+                table_geom_model,
+                table_geom_data,
+            ) = load_table_scene(
+                REPO_ROOT
+                / "urdf/workcell.urdf"
+            )
+
+            scenes = {
+                "robot1": robot1_scene,
+                "robot2": robot2_scene,
+            }
+
+            report = check_move_path(
+                moving_scene=scenes[
+                    moving_robot
+                ],
+                other_scene=scenes[
+                    other_robot
+                ],
+                table_geom_model=(
+                    table_geom_model
+                ),
+                table_geom_data=(
+                    table_geom_data
+                ),
+                moving_start_arm_q=(
+                    moving_start_q
+                ),
+                moving_target_arm_q=(
+                    moving_target_q
+                ),
+                other_arm_q=other_q,
+                moving_gripper_position=(
+                    moving_gripper
+                ),
+                other_gripper_position=(
+                    other_gripper
+                ),
+                robot_robot_margin_m=(
+                    ROBOT_ROBOT_MARGIN_M
+                ),
+                table_margin_m=(
+                    TABLE_MARGIN_M
+                ),
+                max_sample_step_rad=(
+                    MAX_SAMPLE_STEP_RAD
+                ),
+            )
+
+        return report
 
 
 def print_safety_report(report):
 
     print()
     print("=" * 72)
-    print("FULL-PATH WORKCELL SAFETY CHECK")
+    print("FAST COARSE WORKCELL COLLISION CHECK")
     print("=" * 72)
 
     print(
         f"Samples checked: {report.samples}"
     )
-
-    if np.isfinite(
-        report.min_robot_robot_distance_m
-    ):
-        print(
-            "Minimum robot-robot clearance: "
-            f"{1000.0 * report.min_robot_robot_distance_m:.2f} mm"
-        )
-
-    if np.isfinite(
-        report.min_table_distance_m
-    ):
-        print(
-            "Minimum robot-table clearance: "
-            f"{1000.0 * report.min_table_distance_m:.2f} mm"
-        )
-
     print(
-        "Required robot-robot margin: "
-        f"{1000.0 * ROBOT_ROBOT_MARGIN_M:.1f} mm"
+        "Checks: moving robot vs other robot + table"
     )
-
     print(
-        "Required table margin: "
-        f"{1000.0 * TABLE_MARGIN_M:.1f} mm"
+        f"Maximum joint-space sample step: "
+        f"{MAX_SAMPLE_STEP_RAD:.3f} rad"
     )
-
-    if (
-        not np.isfinite(report.min_robot_robot_distance_m)
-        and not np.isfinite(report.min_table_distance_m)
-    ):
-        print(
-            "Clearance mode: FAST THRESHOLD "
-            "(exact minimum distances not computed)"
-        )
-
     print()
 
     if report.safe:

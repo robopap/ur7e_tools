@@ -3,6 +3,7 @@
 import csv
 import ipaddress
 import glob
+import json
 import math
 import os
 import shlex
@@ -1261,6 +1262,35 @@ class WorkcellUI(QMainWindow):
         self.active_gripper_command = None
 
         # -----------------------------------------------------
+        # Experiment process
+        # -----------------------------------------------------
+
+        self.experiment_process = QProcess(self)
+        self.experiment_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.experiment_process.readyReadStandardOutput.connect(
+            self.read_experiment_output
+        )
+        self.experiment_process.finished.connect(
+            self.experiment_finished
+        )
+        self.active_experiment = None
+
+        # -----------------------------------------------------
+        # Experiment analyzer process
+        # -----------------------------------------------------
+
+        self.analysis_process = QProcess(self)
+        self.analysis_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.analysis_process.readyReadStandardOutput.connect(
+            self.read_analysis_output
+        )
+        self.analysis_process.finished.connect(
+            self.analysis_finished
+        )
+        self.analysis_output_buffer = ""
+        self.analysis_report_path = None
+
+        # -----------------------------------------------------
         # Per-robot readiness state for the current UI-owned launch
         # -----------------------------------------------------
 
@@ -1969,6 +1999,165 @@ class WorkcellUI(QMainWindow):
 
         main_layout.addWidget(
             self.dual_group
+        )
+
+        # =====================================================
+        # EXPERIMENT
+        # =====================================================
+
+        self.experiment_group = QGroupBox("Experiment")
+        experiment_layout = QVBoxLayout(self.experiment_group)
+        experiment_layout.setSpacing(8)
+
+        # -----------------------------------------------------
+        # Experiment execution row
+        # -----------------------------------------------------
+
+        experiment_controls_layout = QHBoxLayout()
+        experiment_controls_layout.setSpacing(8)
+
+        experiment_controls_layout.addWidget(QLabel("Task:"))
+        self.experiment_task_combo = QComboBox()
+        self.experiment_task_combo.addItems([
+            "Compound",
+            "Polishing",
+        ])
+        experiment_controls_layout.addWidget(
+            self.experiment_task_combo
+        )
+
+        experiment_controls_layout.addWidget(QLabel("Hand:"))
+        self.experiment_hand_combo = QComboBox()
+        self.experiment_hand_combo.addItems([
+            "Right",
+            "Left",
+        ])
+        experiment_controls_layout.addWidget(
+            self.experiment_hand_combo
+        )
+
+        experiment_controls_layout.addWidget(QLabel("Control:"))
+        self.experiment_control_combo = QComboBox()
+        self.experiment_control_combo.addItems([
+            "Open-loop",
+            "Reactive",
+            "Proactive",
+        ])
+        experiment_controls_layout.addWidget(
+            self.experiment_control_combo
+        )
+
+        experiment_controls_layout.addWidget(QLabel("Motion:"))
+        self.experiment_motion_combo = QComboBox()
+        self.experiment_motion_combo.addItems([
+            "Task Space",
+            "Joint Space",
+        ])
+        experiment_controls_layout.addWidget(
+            self.experiment_motion_combo
+        )
+
+        self.run_experiment_button = QPushButton(
+            "RUN EXPERIMENT"
+        )
+        self.run_experiment_button.setObjectName("startButton")
+        self.run_experiment_button.setEnabled(False)
+        self.run_experiment_button.clicked.connect(
+            self.run_selected_experiment
+        )
+        experiment_controls_layout.addWidget(
+            self.run_experiment_button
+        )
+
+        self.experiment_status_label = QLabel("IDLE")
+        self.experiment_status_label.setObjectName(
+            "connectionUnknown"
+        )
+        self.experiment_status_label.setMinimumWidth(82)
+        experiment_controls_layout.addWidget(
+            self.experiment_status_label
+        )
+
+        experiment_controls_layout.addStretch()
+        experiment_layout.addLayout(
+            experiment_controls_layout
+        )
+
+        # -----------------------------------------------------
+        # Analysis row
+        # -----------------------------------------------------
+
+        analysis_layout = QHBoxLayout()
+        analysis_layout.setSpacing(8)
+
+        analysis_layout.addWidget(QLabel("Analysis trial:"))
+
+        self.analysis_trial_combo = QComboBox()
+        self.analysis_trial_combo.setObjectName(
+            "analysisTrialCombo"
+        )
+        self.analysis_trial_combo.setMinimumContentsLength(38)
+        self.analysis_trial_combo.setToolTip(
+            "Choose a completed experiment trial to analyze."
+        )
+        analysis_layout.addWidget(
+            self.analysis_trial_combo,
+            1,
+        )
+
+        self.refresh_analysis_button = QPushButton("REFRESH")
+        self.refresh_analysis_button.setToolTip(
+            "Reload the list of completed experiment trials."
+        )
+        self.refresh_analysis_button.clicked.connect(
+            lambda: self.refresh_analysis_trials(
+                preserve_selection=True
+            )
+        )
+        analysis_layout.addWidget(
+            self.refresh_analysis_button
+        )
+
+        self.analyze_trial_button = QPushButton("ANALYZE")
+        self.analyze_trial_button.setEnabled(False)
+        self.analyze_trial_button.clicked.connect(
+            self.analyze_selected_trial
+        )
+        analysis_layout.addWidget(
+            self.analyze_trial_button
+        )
+
+        self.analysis_status_label = QLabel("IDLE")
+        self.analysis_status_label.setObjectName(
+            "connectionUnknown"
+        )
+        self.analysis_status_label.setMinimumWidth(82)
+        analysis_layout.addWidget(
+            self.analysis_status_label
+        )
+
+        experiment_layout.addLayout(analysis_layout)
+
+        for combo in (
+            self.experiment_task_combo,
+            self.experiment_hand_combo,
+            self.experiment_control_combo,
+            self.experiment_motion_combo,
+        ):
+            combo.currentIndexChanged.connect(
+                self.update_experiment_controls
+            )
+
+        self.analysis_trial_combo.currentIndexChanged.connect(
+            self.update_experiment_controls
+        )
+
+        main_layout.addWidget(self.experiment_group)
+
+        # Populate the selector once at UI startup.
+        # Completed trials are listed newest first.
+        self.refresh_analysis_trials(
+            preserve_selection=False
         )
 
         self.robot1_ip.textChanged.connect(
@@ -3571,6 +3760,10 @@ class WorkcellUI(QMainWindow):
             not single
         )
 
+        if hasattr(self, "experiment_group"):
+            self.experiment_group.setVisible(not single)
+            self.update_experiment_controls()
+
         if hasattr(self, "robots_ready_label"):
             self.robots_ready_label.setVisible(not single)
 
@@ -4551,6 +4744,8 @@ class WorkcellUI(QMainWindow):
             == QProcess.NotRunning
             and self.gripper_process.state()
             == QProcess.NotRunning
+            and self.experiment_process.state()
+            == QProcess.NotRunning
         )
 
         single = (
@@ -4682,6 +4877,8 @@ class WorkcellUI(QMainWindow):
             != QProcess.NotRunning
             or self.gripper_process.state()
             != QProcess.NotRunning
+            or self.experiment_process.state()
+            != QProcess.NotRunning
         ):
             return
 
@@ -4742,7 +4939,7 @@ class WorkcellUI(QMainWindow):
             f"--target {shlex.quote(robot)} "
             "--move "
             f"--pose {shlex.quote(pose_name)} "
-            "--duration 10.0 "
+            "--duration 5.0 "
             "--yes"
         )
 
@@ -4862,6 +5059,711 @@ class WorkcellUI(QMainWindow):
         self.setup_motion_output_buffer = ""
         self.update_home_buttons()
         self.update_gripper_buttons()
+        self.update_experiment_controls()
+
+    # =========================================================
+    # Experiment execution
+    # =========================================================
+
+    def _selected_experiment(self):
+        return (
+            self.experiment_task_combo.currentText(),
+            self.experiment_hand_combo.currentText(),
+            self.experiment_control_combo.currentText(),
+            self.experiment_motion_combo.currentText(),
+        )
+
+    def update_experiment_controls(self):
+        if not hasattr(self, "run_experiment_button"):
+            return
+
+        dual = (
+            self.setup_combo.currentText() == "Dual UR7e"
+        )
+        system_running = (
+            self.status_label.text() == "RUNNING"
+        )
+        experiment_idle = (
+            self.experiment_process.state()
+            == QProcess.NotRunning
+        )
+        analysis_idle = (
+            self.analysis_process.state()
+            == QProcess.NotRunning
+        )
+        setup_idle = (
+            self.home_process.state()
+            == QProcess.NotRunning
+            and self.gripper_process.state()
+            == QProcess.NotRunning
+        )
+
+        real_mode = (
+            self.mode_combo.currentText() == "Real Robot(s)"
+        )
+        robots_ready = (
+            self.robot_ready["robot1"]
+            and self.robot_ready["robot2"]
+        )
+
+        enabled = (
+            dual
+            and system_running
+            and experiment_idle
+            and analysis_idle
+            and setup_idle
+            and (not real_mode or robots_ready)
+        )
+        self.run_experiment_button.setEnabled(enabled)
+
+        analysis_has_trial = (
+            hasattr(self, "analysis_trial_combo")
+            and self.analysis_trial_combo.currentData()
+            is not None
+        )
+
+        analysis_controls_enabled = (
+            dual
+            and experiment_idle
+            and analysis_idle
+        )
+
+        if hasattr(self, "analysis_trial_combo"):
+            self.analysis_trial_combo.setEnabled(
+                analysis_controls_enabled
+            )
+
+        if hasattr(self, "refresh_analysis_button"):
+            self.refresh_analysis_button.setEnabled(
+                analysis_controls_enabled
+            )
+
+        self.analyze_trial_button.setEnabled(
+            analysis_controls_enabled
+            and analysis_has_trial
+        )
+
+        if not experiment_idle:
+            self.experiment_status_label.setText("RUNNING")
+            self.experiment_status_label.setObjectName(
+                "connectionTesting"
+            )
+        elif not system_running:
+            self.experiment_status_label.setText("IDLE")
+            self.experiment_status_label.setObjectName(
+                "connectionUnknown"
+            )
+        else:
+            selection = self._selected_experiment()
+            implemented = selection == (
+                "Compound",
+                "Right",
+                "Open-loop",
+                "Task Space",
+            )
+            self.experiment_status_label.setText(
+                "READY" if implemented else "NOT READY"
+            )
+            self.experiment_status_label.setObjectName(
+                "connectionReachable"
+                if implemented
+                else "connectionUnknown"
+            )
+
+        self.experiment_status_label.style().unpolish(
+            self.experiment_status_label
+        )
+        self.experiment_status_label.style().polish(
+            self.experiment_status_label
+        )
+
+    def run_selected_experiment(self):
+        if self.status_label.text() != "RUNNING":
+            return
+
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+
+        if (
+            self.experiment_process.state()
+            != QProcess.NotRunning
+            or self.analysis_process.state()
+            != QProcess.NotRunning
+            or self.home_process.state()
+            != QProcess.NotRunning
+            or self.gripper_process.state()
+            != QProcess.NotRunning
+        ):
+            return
+
+        selection = self._selected_experiment()
+        implemented = (
+            "Compound",
+            "Right",
+            "Open-loop",
+            "Task Space",
+        )
+
+        if selection != implemented:
+            QMessageBox.information(
+                self,
+                "Experiment not implemented",
+                (
+                    "This experiment combination is not implemented yet:\n\n"
+                    f"Task: {selection[0]}\n"
+                    f"Hand: {selection[1]}\n"
+                    f"Control: {selection[2]}\n"
+                    f"Motion: {selection[3]}\n\n"
+                    "No robot command was sent."
+                ),
+            )
+            return
+
+        real_mode = (
+            self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        if real_mode:
+            if not (
+                self.robot_ready["robot1"]
+                and self.robot_ready["robot2"]
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Robots not ready",
+                    "Both robots must be READY before an experiment.",
+                )
+                return
+
+            answer = QMessageBox.question(
+                self,
+                "Run experiment",
+                (
+                    "Run the following REAL experiment?\n\n"
+                    "Compound / Right / Open-loop / Task Space\n\n"
+                    "The experiment backend will start data acquisition "
+                    "and then command Robot 1."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        project_root = Path(
+            os.path.expanduser("~/phd_polishing_experiments")
+        )
+        backend = (
+            project_root
+            / "experiment_backend"
+            / "compound_right_task_space.py"
+        )
+
+        if not backend.is_file():
+            QMessageBox.critical(
+                self,
+                "Experiment backend missing",
+                f"Backend not found:\n{backend}",
+            )
+            return
+
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+
+        backend_module = (
+            "experiment_backend.compound_right_task_space"
+        )
+
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && cd {shlex.quote(str(project_root))}"
+            " && exec setsid /usr/bin/python3 -u -m "
+            f"{shlex.quote(backend_module)}"
+        )
+
+        self.active_experiment = selection
+
+        self.log_output.appendPlainText(
+            "\n============================================================\n"
+            "RUN EXPERIMENT\n"
+            "============================================================\n"
+            f"Mode: {self.mode_combo.currentText()}\n"
+            f"Task: {selection[0]}\n"
+            f"Hand: {selection[1]}\n"
+            f"Control: {selection[2]}\n"
+            f"Motion: {selection[3]}\n"
+            f"Backend: {backend}\n"
+        )
+
+        self.run_experiment_button.setEnabled(False)
+        self.robot1_home_button.setEnabled(False)
+        self.robot2_home_button.setEnabled(False)
+        self.robot1_gripper_move_button.setEnabled(False)
+        self.robot2_gripper_move_button.setEnabled(False)
+        self.robot1_gripper_slider.setEnabled(False)
+        self.robot2_gripper_slider.setEnabled(False)
+
+        self.experiment_status_label.setText("RUNNING")
+        self.experiment_status_label.setObjectName(
+            "connectionTesting"
+        )
+
+        self.experiment_process.start(
+            "/bin/bash",
+            ["-lc", full_command],
+        )
+
+    def read_experiment_output(self):
+        text = bytes(
+            self.experiment_process.readAllStandardOutput()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if text:
+            self.log_output.appendPlainText(
+                text.rstrip()
+            )
+            scrollbar = self.log_output.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def experiment_finished(
+        self,
+        exit_code,
+        exit_status,
+    ):
+        if exit_code == 0:
+            self.log_output.appendPlainText(
+                "\n[EXPERIMENT COMPLETE]"
+            )
+            self.experiment_status_label.setText("COMPLETE")
+            self.experiment_status_label.setObjectName(
+                "connectionReachable"
+            )
+        else:
+            self.log_output.appendPlainText(
+                f"\n[EXPERIMENT FAILED - exit code {exit_code}]"
+            )
+            self.experiment_status_label.setText("FAILED")
+            self.experiment_status_label.setObjectName(
+                "connectionOffline"
+            )
+
+        self.active_experiment = None
+        self.update_home_buttons()
+        self.update_gripper_buttons()
+
+        # A just-finished run may have created a new completed trial.
+        self.refresh_analysis_trials(
+            preserve_selection=False
+        )
+        self.update_experiment_controls()
+
+    def _analysis_trial_label(
+        self,
+        trial_dir,
+        metadata,
+    ):
+        trial_id = metadata.get(
+            "trial_id",
+            trial_dir.name,
+        )
+
+        timestamp_text = trial_id
+        parts = trial_id.split("_")
+
+        if len(parts) >= 3:
+            try:
+                stamp = datetime.strptime(
+                    f"{parts[1]}_{parts[2]}",
+                    "%Y%m%d_%H%M%S",
+                )
+                timestamp_text = stamp.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                pass
+
+        task = str(
+            metadata.get("task", "unknown")
+        ).replace("_", " ").title()
+
+        hand = str(
+            metadata.get(
+                "substituted_human_hand",
+                "unknown",
+            )
+        ).replace("_", " ").title()
+
+        control = str(
+            metadata.get("control_mode", "unknown")
+        ).replace("_", " ").title()
+
+        motion = str(
+            metadata.get("motion_method", "unknown")
+        ).replace("_", " ").title()
+
+        return (
+            f"{timestamp_text} | "
+            f"{task} | {hand} | {control} | {motion}"
+        )
+
+    def refresh_analysis_trials(
+        self,
+        preserve_selection=True,
+    ):
+        if not hasattr(self, "analysis_trial_combo"):
+            return
+
+        previous_path = None
+
+        if preserve_selection:
+            previous_path = (
+                self.analysis_trial_combo.currentData()
+            )
+
+        project_root = Path(
+            os.path.expanduser(
+                "~/phd_polishing_experiments"
+            )
+        )
+        experiments_root = (
+            project_root
+            / "results"
+            / "experiments"
+        )
+
+        completed_trials = []
+
+        if experiments_root.is_dir():
+            for trial_dir in experiments_root.iterdir():
+                if not trial_dir.is_dir():
+                    continue
+
+                metadata_path = (
+                    trial_dir
+                    / "metadata.json"
+                )
+
+                if not metadata_path.is_file():
+                    continue
+
+                try:
+                    with metadata_path.open(
+                        "r",
+                        encoding="utf-8",
+                    ) as f:
+                        metadata = json.load(f)
+                except Exception:
+                    continue
+
+                timebase = metadata.get(
+                    "timebase",
+                    {},
+                )
+
+                completed = (
+                    timebase.get(
+                        "trial_end_ros_time_ns"
+                    )
+                    is not None
+                    or metadata.get(
+                        "experiment_end_time_utc"
+                    )
+                    is not None
+                )
+
+                if not completed:
+                    continue
+
+                completed_trials.append(
+                    (
+                        trial_dir,
+                        metadata,
+                    )
+                )
+
+        completed_trials.sort(
+            key=lambda item: item[0].name,
+            reverse=True,
+        )
+
+        self.analysis_trial_combo.blockSignals(True)
+        self.analysis_trial_combo.clear()
+
+        selected_index = 0
+
+        if completed_trials:
+            for index, (
+                trial_dir,
+                metadata,
+            ) in enumerate(completed_trials):
+
+                label = self._analysis_trial_label(
+                    trial_dir,
+                    metadata,
+                )
+
+                self.analysis_trial_combo.addItem(
+                    label,
+                    str(trial_dir),
+                )
+
+                self.analysis_trial_combo.setItemData(
+                    index,
+                    (
+                        f"{trial_dir.name}\n"
+                        f"{trial_dir}"
+                    ),
+                    Qt.ToolTipRole,
+                )
+
+                if (
+                    previous_path is not None
+                    and str(previous_path)
+                    == str(trial_dir)
+                ):
+                    selected_index = index
+
+            self.analysis_trial_combo.setCurrentIndex(
+                selected_index
+            )
+
+        else:
+            self.analysis_trial_combo.addItem(
+                "No completed trials found",
+                None,
+            )
+            self.analysis_trial_combo.setCurrentIndex(0)
+
+        self.analysis_trial_combo.blockSignals(False)
+
+        if hasattr(self, "run_experiment_button"):
+            self.update_experiment_controls()
+
+    def analyze_selected_trial(self):
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+
+        if (
+            self.analysis_process.state()
+            != QProcess.NotRunning
+            or self.experiment_process.state()
+            != QProcess.NotRunning
+        ):
+            return
+
+        project_root = Path(
+            os.path.expanduser("~/phd_polishing_experiments")
+        )
+        analyzer = (
+            project_root
+            / "experiment_analysis"
+            / "analyze_trial.py"
+        )
+
+        if not analyzer.is_file():
+            QMessageBox.critical(
+                self,
+                "Experiment analyzer missing",
+                f"Analyzer not found:\n{analyzer}",
+            )
+            return
+
+        selected_trial = (
+            self.analysis_trial_combo.currentData()
+        )
+
+        if selected_trial is None:
+            QMessageBox.information(
+                self,
+                "No completed trial",
+                "There is no completed experiment trial to analyze.",
+            )
+            return
+
+        trial_dir = Path(
+            str(selected_trial)
+        ).expanduser().resolve()
+
+        if not (
+            trial_dir.is_dir()
+            and (trial_dir / "metadata.json").is_file()
+            and (trial_dir / "rosbag").is_dir()
+        ):
+            QMessageBox.critical(
+                self,
+                "Invalid experiment trial",
+                (
+                    "The selected trial is incomplete or missing:\n"
+                    f"{trial_dir}"
+                ),
+            )
+            self.refresh_analysis_trials(
+                preserve_selection=False
+            )
+            return
+
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && cd {shlex.quote(str(project_root))}"
+            " && exec /usr/bin/python3 -u -m "
+            "experiment_analysis.analyze_trial "
+            f"{shlex.quote(str(trial_dir))}"
+        )
+
+        self.analysis_output_buffer = ""
+        self.analysis_report_path = None
+
+        self.log_output.appendPlainText(
+            "\n============================================================\n"
+            "ANALYZE SELECTED TRIAL\n"
+            "============================================================\n"
+            f"Trial:    {trial_dir.name}\n"
+            f"Path:     {trial_dir}\n"
+            f"Analyzer: {analyzer}\n"
+        )
+
+        self.analysis_status_label.setText("RUNNING")
+        self.analysis_status_label.setObjectName(
+            "connectionTesting"
+        )
+        self.analysis_status_label.style().unpolish(
+            self.analysis_status_label
+        )
+        self.analysis_status_label.style().polish(
+            self.analysis_status_label
+        )
+
+        self.run_experiment_button.setEnabled(False)
+        self.analyze_trial_button.setEnabled(False)
+        self.analysis_trial_combo.setEnabled(False)
+        self.refresh_analysis_button.setEnabled(False)
+
+        self.analysis_process.start(
+            "/bin/bash",
+            ["-lc", full_command],
+        )
+
+    def read_analysis_output(self):
+        text = bytes(
+            self.analysis_process.readAllStandardOutput()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if not text:
+            return
+
+        self.analysis_output_buffer += text
+        self.log_output.appendPlainText(
+            text.rstrip()
+        )
+
+        for line in text.splitlines():
+            if line.startswith("ANALYSIS_REPORT="):
+                report_text = line.split("=", 1)[1].strip()
+                if report_text:
+                    self.analysis_report_path = Path(
+                        report_text
+                    ).expanduser()
+
+        scrollbar = self.log_output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def analysis_finished(
+        self,
+        exit_code,
+        exit_status,
+    ):
+        # Catch a marker split across two QProcess reads.
+        if self.analysis_report_path is None:
+            for line in self.analysis_output_buffer.splitlines():
+                if line.startswith("ANALYSIS_REPORT="):
+                    report_text = line.split("=", 1)[1].strip()
+                    if report_text:
+                        self.analysis_report_path = Path(
+                            report_text
+                        ).expanduser()
+                    break
+
+        if exit_code == 0:
+            self.log_output.appendPlainText(
+                "\n[ANALYSIS COMPLETE]"
+            )
+            self.analysis_status_label.setText("COMPLETE")
+            self.analysis_status_label.setObjectName(
+                "connectionReachable"
+            )
+
+            report = self.analysis_report_path
+            if report is not None and report.is_file():
+                self.log_output.appendPlainText(
+                    f"[OPENING REPORT] {report}"
+                )
+                QProcess.startDetached(
+                    "xdg-open",
+                    [str(report)],
+                )
+            else:
+                self.log_output.appendPlainText(
+                    "[ANALYSIS COMPLETE, but report path was not found]"
+                )
+        else:
+            self.log_output.appendPlainText(
+                f"\n[ANALYSIS FAILED - exit code {exit_code}]"
+            )
+            self.analysis_status_label.setText("FAILED")
+            self.analysis_status_label.setObjectName(
+                "connectionOffline"
+            )
+
+        self.analysis_status_label.style().unpolish(
+            self.analysis_status_label
+        )
+        self.analysis_status_label.style().polish(
+            self.analysis_status_label
+        )
+
+        self.update_experiment_controls()
+
+    def stop_analysis(self):
+        if (
+            self.analysis_process.state()
+            == QProcess.NotRunning
+        ):
+            return
+
+        self.analysis_process.terminate()
+
+        if not self.analysis_process.waitForFinished(1500):
+            self.analysis_process.kill()
+            self.analysis_process.waitForFinished(1000)
+
+    def stop_experiment(self):
+        if (
+            self.experiment_process.state()
+            == QProcess.NotRunning
+        ):
+            return
+
+        pid = int(self.experiment_process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        else:
+            self.experiment_process.terminate()
 
     # =========================================================
     # 2FG7 gripper control
@@ -4887,11 +5789,17 @@ class WorkcellUI(QMainWindow):
             == QProcess.NotRunning
         )
 
+        experiment_idle = (
+            self.experiment_process.state()
+            == QProcess.NotRunning
+        )
+
         base_enabled = (
             system_running
             and dual
             and command_idle
             and setup_motion_idle
+            and experiment_idle
         )
 
         dual_real = (
@@ -4918,6 +5826,7 @@ class WorkcellUI(QMainWindow):
             dual
             and command_idle
             and setup_motion_idle
+            and experiment_idle
         )
         self.robot1_gripper_slider.setEnabled(slider_enabled)
         self.robot2_gripper_slider.setEnabled(slider_enabled)
@@ -4934,6 +5843,8 @@ class WorkcellUI(QMainWindow):
             self.gripper_process.state()
             != QProcess.NotRunning
             or self.home_process.state()
+            != QProcess.NotRunning
+            or self.experiment_process.state()
             != QProcess.NotRunning
         ):
             return
@@ -5052,6 +5963,7 @@ class WorkcellUI(QMainWindow):
         self.active_gripper_command = None
         self.update_gripper_buttons()
         self.update_home_buttons()
+        self.update_experiment_controls()
 
     # =========================================================
     # Configuration validation
@@ -5282,6 +6194,12 @@ class WorkcellUI(QMainWindow):
     # =========================================================
 
     def stop_system(self):
+
+        if (
+            self.experiment_process.state()
+            != QProcess.NotRunning
+        ):
+            self.stop_experiment()
 
         if (
             self.ros_process.state()
@@ -5619,6 +6537,9 @@ class WorkcellUI(QMainWindow):
             self.status_label
         )
 
+        if hasattr(self, "run_experiment_button"):
+            self.update_experiment_controls()
+
     # =========================================================
     # Closing
     # =========================================================
@@ -5644,6 +6565,19 @@ class WorkcellUI(QMainWindow):
             self.ros_process.waitForFinished(
                 3000
             )
+
+        if (
+            self.experiment_process.state()
+            != QProcess.NotRunning
+        ):
+            self.stop_experiment()
+            self.experiment_process.waitForFinished(2000)
+
+        if (
+            self.analysis_process.state()
+            != QProcess.NotRunning
+        ):
+            self.stop_analysis()
 
         if (
             self.home_process.state()
@@ -5879,6 +6813,29 @@ class WorkcellUI(QMainWindow):
                 selection-color: #ffffff;
                 outline: 0px;
                 padding: 4px;
+            }
+
+            QMenu {
+                background: #252628;
+                color: #ffffff;
+                border: 1px solid #6f7479;
+                padding: 4px;
+            }
+
+            QMenu::item {
+                background: transparent;
+                color: #ffffff;
+                padding: 7px 28px 7px 12px;
+                min-width: 220px;
+            }
+
+            QMenu::item:selected {
+                background: #4a4d51;
+                color: #ffffff;
+            }
+
+            QMenu::item:disabled {
+                color: #9aa0a6;
             }
 
             QPushButton {

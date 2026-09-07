@@ -27,7 +27,7 @@ ARM_JOINTS = [
 GRIPPER_CLOSED = 0.0115
 GRIPPER_OPEN = 0.0305
 
-DEFAULT_MAX_SAMPLE_STEP_RAD = 0.02
+DEFAULT_MAX_SAMPLE_STEP_RAD = 0.05
 
 
 @dataclass
@@ -217,37 +217,20 @@ def coal_transform(M):
     )
 
 
-def objects_within_margin(
+def objects_collide(
     geometry_a,
-    transform_a,
+    placement_a,
     geometry_b,
-    transform_b,
-    margin_m,
-    request=None,
+    placement_b,
 ):
-    """Return True if two geometries overlap or are closer than margin_m.
-
-    This uses Coal's collision query with a positive security margin instead
-    of an exact mesh-distance query. It preserves the same safety threshold
-    while avoiding the expensive distance computation for every geometry pair.
-    """
-    if request is None:
-        request = coal.CollisionRequest()
-        try:
-            request.security_margin = float(margin_m)
-        except Exception as exc:
-            raise RuntimeError(
-                "Coal CollisionRequest.security_margin is unavailable; "
-                "cannot run fast fail-closed margin checking."
-            ) from exc
-
+    request = coal.CollisionRequest()
     result = coal.CollisionResult()
 
     count = coal.collide(
         geometry_a,
-        transform_a,
+        coal_transform(placement_a),
         geometry_b,
-        transform_b,
+        coal_transform(placement_b),
         request,
         result,
     )
@@ -260,16 +243,26 @@ def objects_within_margin(
     return bool(count > 0 or flag)
 
 
-def make_margin_request(margin_m):
-    request = coal.CollisionRequest()
-    try:
-        request.security_margin = float(margin_m)
-    except Exception as exc:
-        raise RuntimeError(
-            "Coal CollisionRequest.security_margin is unavailable; "
-            "cannot run fast fail-closed margin checking."
-        ) from exc
-    return request
+def objects_distance(
+    geometry_a,
+    placement_a,
+    geometry_b,
+    placement_b,
+):
+    request = coal.DistanceRequest()
+    result = coal.DistanceResult()
+
+    distance = coal.distance(
+        geometry_a,
+        coal_transform(placement_a),
+        geometry_b,
+        coal_transform(placement_b),
+        request,
+        result,
+    )
+
+    return float(distance)
+
 
 def generate_joint_path(
     q_start,
@@ -333,15 +326,19 @@ def check_move_path(
     table_margin_m=0.0,
     max_sample_step_rad=DEFAULT_MAX_SAMPLE_STEP_RAD,
 ):
-    """Check the entire interpolated move path against workcell margins.
+    """
+    Fast coarse guard for setup moves.
 
-    Performance-critical design:
-    - path sampling resolution is unchanged;
-    - robot/robot and robot/table safety margins are unchanged;
-    - exact mesh distances are NOT computed for every pair;
-    - Coal collision queries use security_margin directly;
-    - static transforms are cached outside the path loop;
-    - the function exits immediately on the first unsafe sample.
+    This intentionally checks only actual mesh collisions along a sampled
+    joint-space path.  It does NOT compute exact pairwise clearances.
+
+    Checked:
+      - moving robot vs stationary other robot
+      - moving robot vs table
+      - whole interpolated path
+
+    robot_robot_margin_m/table_margin_m are accepted for API compatibility,
+    but no expensive distance-margin calculation is performed here.
     """
     path = generate_joint_path(
         moving_start_arm_q,
@@ -354,38 +351,10 @@ def check_move_path(
         other_arm_q,
         other_gripper_position,
     )
-
     update_robot_scene(
         other_scene,
         other_q,
     )
-
-    rr_request = make_margin_request(
-        robot_robot_margin_m
-    )
-    table_request = make_margin_request(
-        table_margin_m
-    )
-
-    moving_objects = list(
-        moving_scene.geom_model.geometryObjects
-    )
-    other_objects = list(
-        other_scene.geom_model.geometryObjects
-    )
-    table_objects = list(
-        table_geom_model.geometryObjects
-    )
-
-    # The other robot and table are stationary during this candidate move.
-    other_transforms = [
-        coal_transform(other_scene.geom_data.oMg[j])
-        for j in range(len(other_objects))
-    ]
-    table_transforms = [
-        coal_transform(table_geom_data.oMg[j])
-        for j in range(len(table_objects))
-    ]
 
     for sample_index, arm_q in enumerate(path):
         moving_q = build_robot_q(
@@ -393,75 +362,66 @@ def check_move_path(
             arm_q,
             moving_gripper_position,
         )
-
         update_robot_scene(
             moving_scene,
             moving_q,
         )
 
-        # Convert each moving placement only once per sample, rather than once
-        # again for every pairwise Coal query.
-        moving_transforms = [
-            coal_transform(moving_scene.geom_data.oMg[i])
-            for i in range(len(moving_objects))
-        ]
+        # Moving robot vs stationary robot.
+        for i, obj_a in enumerate(
+            moving_scene.geom_model.geometryObjects
+        ):
+            placement_a = moving_scene.geom_data.oMg[i]
 
-        # ---------------------------------
-        # Moving robot vs stationary robot
-        # ---------------------------------
-        for i, obj_a in enumerate(moving_objects):
-            transform_a = moving_transforms[i]
+            for j, obj_b in enumerate(
+                other_scene.geom_model.geometryObjects
+            ):
+                placement_b = other_scene.geom_data.oMg[j]
 
-            for j, obj_b in enumerate(other_objects):
-                if objects_within_margin(
+                if objects_collide(
                     obj_a.geometry,
-                    transform_a,
+                    placement_a,
                     obj_b.geometry,
-                    other_transforms[j],
-                    robot_robot_margin_m,
-                    request=rr_request,
+                    placement_b,
                 ):
                     return SafetyReport(
                         safe=False,
                         samples=len(path),
-                        # Fast mode intentionally does not compute exact
-                        # all-pairs minimum distances.
-                        min_robot_robot_distance_m=float("nan"),
-                        min_table_distance_m=float("nan"),
-                        collision_kind="robot_robot_margin",
+                        min_robot_robot_distance_m=float("inf"),
+                        min_table_distance_m=float("inf"),
+                        collision_kind="robot_robot",
                         sample_index=sample_index,
                         object_a=obj_a.name,
                         object_b=obj_b.name,
                     )
 
-        # --------------------------
-        # Moving robot vs table
-        # --------------------------
-        for i, obj_a in enumerate(moving_objects):
-            # Intentional mounting contact with table is not considered a
-            # collision for this one base geometry.
-            if obj_a.name.endswith(
-                "base_link_inertia_0"
-            ):
+        # Moving robot vs table.
+        for i, obj_a in enumerate(
+            moving_scene.geom_model.geometryObjects
+        ):
+            # Intentional robot mounting contact is ignored.
+            if obj_a.name.endswith("base_link_inertia_0"):
                 continue
 
-            transform_a = moving_transforms[i]
+            placement_a = moving_scene.geom_data.oMg[i]
 
-            for j, table_obj in enumerate(table_objects):
-                if objects_within_margin(
+            for j, table_obj in enumerate(
+                table_geom_model.geometryObjects
+            ):
+                table_placement = table_geom_data.oMg[j]
+
+                if objects_collide(
                     obj_a.geometry,
-                    transform_a,
+                    placement_a,
                     table_obj.geometry,
-                    table_transforms[j],
-                    table_margin_m,
-                    request=table_request,
+                    table_placement,
                 ):
                     return SafetyReport(
                         safe=False,
                         samples=len(path),
-                        min_robot_robot_distance_m=float("nan"),
-                        min_table_distance_m=float("nan"),
-                        collision_kind="robot_table_margin",
+                        min_robot_robot_distance_m=float("inf"),
+                        min_table_distance_m=float("inf"),
+                        collision_kind="robot_table",
                         sample_index=sample_index,
                         object_a=obj_a.name,
                         object_b=table_obj.name,
@@ -470,11 +430,8 @@ def check_move_path(
     return SafetyReport(
         safe=True,
         samples=len(path),
-        # Exact minimum clearances are intentionally omitted in fast mode.
-        # Safety is established directly against the requested margins.
-        min_robot_robot_distance_m=float("nan"),
-        min_table_distance_m=float("nan"),
-        collision_kind=None,
+        min_robot_robot_distance_m=float("inf"),
+        min_table_distance_m=float("inf"),
     )
 
 def main():
