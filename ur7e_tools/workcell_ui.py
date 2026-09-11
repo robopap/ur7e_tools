@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractScrollArea,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -2055,6 +2056,22 @@ class WorkcellUI(QMainWindow):
         ])
         experiment_controls_layout.addWidget(
             self.experiment_motion_combo
+        )
+
+        experiment_controls_layout.addWidget(QLabel("Speed:"))
+        self.experiment_speed_spin = QDoubleSpinBox()
+        self.experiment_speed_spin.setRange(0.05, 1.00)
+        self.experiment_speed_spin.setSingleStep(0.05)
+        self.experiment_speed_spin.setDecimals(2)
+        self.experiment_speed_spin.setValue(0.20)
+        self.experiment_speed_spin.setSuffix(" ×")
+        self.experiment_speed_spin.setFixedWidth(90)
+        self.experiment_speed_spin.setToolTip(
+            "Experiment trajectory speed scale. "
+            "1.00 = expert timing; 0.20 = five times slower."
+        )
+        experiment_controls_layout.addWidget(
+            self.experiment_speed_spin
         )
 
         self.run_experiment_button = QPushButton(
@@ -5197,6 +5214,10 @@ class WorkcellUI(QMainWindow):
             return
 
         selection = self._selected_experiment()
+        speed_scale = float(
+            self.experiment_speed_spin.value()
+        )
+
         implemented = (
             "Compound",
             "Right",
@@ -5240,7 +5261,8 @@ class WorkcellUI(QMainWindow):
                 "Run experiment",
                 (
                     "Run the following REAL experiment?\n\n"
-                    "Compound / Right / Open-loop / Task Space\n\n"
+                    "Compound / Right / Open-loop / Task Space\n"
+                    f"Speed scale: {speed_scale:.2f} ×\n\n"
                     "The experiment backend will start data acquisition "
                     "and then command Robot 1."
                 ),
@@ -5281,6 +5303,7 @@ class WorkcellUI(QMainWindow):
             f" && cd {shlex.quote(str(project_root))}"
             " && exec setsid /usr/bin/python3 -u -m "
             f"{shlex.quote(backend_module)}"
+            f" --speed-scale {speed_scale:.2f}"
         )
 
         self.active_experiment = selection
@@ -5294,6 +5317,7 @@ class WorkcellUI(QMainWindow):
             f"Hand: {selection[1]}\n"
             f"Control: {selection[2]}\n"
             f"Motion: {selection[3]}\n"
+            f"Speed scale: {speed_scale:.2f} ×\n"
             f"Backend: {backend}\n"
         )
 
@@ -6783,7 +6807,8 @@ class WorkcellUI(QMainWindow):
                 padding: 5px;
             }
 
-            QComboBox {
+            QComboBox,
+            QDoubleSpinBox {
                 background: #303134;
                 color: #ffffff;
                 border: 1px solid #7a7f85;
@@ -6793,7 +6818,8 @@ class WorkcellUI(QMainWindow):
                 font-weight: 600;
             }
 
-            QComboBox:hover {
+            QComboBox:hover,
+            QDoubleSpinBox:hover {
                 border: 1px solid #aeb4ba;
                 background: #35373a;
             }
