@@ -7016,6 +7016,8 @@ def main(args=None):
         sys.argv
     )
 
+    app.setDesktopFileName("Robot Control")
+
     window = WorkcellUI(
         startup_preflight_report=startup_preflight_report
     )
