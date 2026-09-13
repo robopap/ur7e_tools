@@ -5172,12 +5172,22 @@ class WorkcellUI(QMainWindow):
             )
         else:
             selection = self._selected_experiment()
-            implemented = selection == (
-                "Compound",
-                "Right",
-                "Open-loop",
-                "Task Space",
-            )
+
+            implemented = selection in {
+                (
+                    "Compound",
+                    "Right",
+                    "Open-loop",
+                    "Task Space",
+                ),
+                (
+                    "Polishing",
+                    "Right",
+                    "Open-loop",
+                    "Task Space",
+                ),
+            }
+
             self.experiment_status_label.setText(
                 "READY" if implemented else "NOT READY"
             )
@@ -5218,14 +5228,24 @@ class WorkcellUI(QMainWindow):
             self.experiment_speed_spin.value()
         )
 
-        implemented = (
+        compound_selection = (
             "Compound",
             "Right",
             "Open-loop",
             "Task Space",
         )
 
-        if selection != implemented:
+        polishing_selection = (
+            "Polishing",
+            "Right",
+            "Open-loop",
+            "Task Space",
+        )
+
+        if selection not in {
+            compound_selection,
+            polishing_selection,
+        }:
             QMessageBox.information(
                 self,
                 "Experiment not implemented",
@@ -5239,6 +5259,50 @@ class WorkcellUI(QMainWindow):
                 ),
             )
             return
+
+        polishing_setup = None
+
+        if selection == polishing_selection:
+            setup_box = QMessageBox(self)
+            setup_box.setIcon(
+                QMessageBox.Icon.Question
+            )
+            setup_box.setWindowTitle(
+                "Polishing Right setup"
+            )
+            setup_box.setText(
+                "Select the Polishing Right setup."
+            )
+            setup_box.setInformativeText(
+                "Direct and Bracket use the same D3 human "
+                "reference but different calibrated task-start q0."
+            )
+
+            direct_button = setup_box.addButton(
+                "Direct",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            bracket_button = setup_box.addButton(
+                "Bracket",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_button = setup_box.addButton(
+                QMessageBox.StandardButton.Cancel
+            )
+            setup_box.setDefaultButton(
+                cancel_button
+            )
+
+            setup_box.exec()
+
+            clicked = setup_box.clickedButton()
+
+            if clicked is direct_button:
+                polishing_setup = "direct"
+            elif clicked is bracket_button:
+                polishing_setup = "bracket"
+            else:
+                return
 
         real_mode = (
             self.mode_combo.currentText() == "Real Robot(s)"
@@ -5256,30 +5320,67 @@ class WorkcellUI(QMainWindow):
                 )
                 return
 
+            experiment_text = (
+                f"{selection[0]} / {selection[1]} / "
+                f"{selection[2]} / {selection[3]}"
+            )
+
+            setup_text = ""
+            if polishing_setup is not None:
+                setup_text = (
+                    f"Setup: {polishing_setup.title()}\n"
+                )
+
             answer = QMessageBox.question(
                 self,
                 "Run experiment",
                 (
                     "Run the following REAL experiment?\n\n"
-                    "Compound / Right / Open-loop / Task Space\n"
+                    f"{experiment_text}\n"
+                    f"{setup_text}"
                     f"Speed scale: {speed_scale:.2f} ×\n\n"
-                    "The experiment backend will start data acquisition "
+                    "The experiment backend will first verify "
+                    "that Robot 1 is already at the selected "
+                    "trajectory q0, start data acquisition, "
                     "and then command Robot 1."
                 ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
+
             if answer != QMessageBox.Yes:
                 return
 
         project_root = Path(
-            os.path.expanduser("~/phd_polishing_experiments")
+            os.path.expanduser(
+                "~/phd_polishing_experiments"
+            )
         )
-        backend = (
-            project_root
-            / "experiment_backend"
-            / "compound_right_task_space.py"
-        )
+
+        if selection == compound_selection:
+            backend = (
+                project_root
+                / "experiment_backend"
+                / "compound_right_task_space.py"
+            )
+            backend_module = (
+                "experiment_backend.compound_right_task_space"
+            )
+            backend_extra_args = ""
+
+        else:
+            backend = (
+                project_root
+                / "experiment_backend"
+                / "polishing_right_task_space.py"
+            )
+            backend_module = (
+                "experiment_backend.polishing_right_task_space"
+            )
+            backend_extra_args = (
+                " --setup "
+                + shlex.quote(polishing_setup)
+            )
 
         if not backend.is_file():
             QMessageBox.critical(
@@ -5293,20 +5394,23 @@ class WorkcellUI(QMainWindow):
             "~/ros2_ws/install/setup.bash"
         )
 
-        backend_module = (
-            "experiment_backend.compound_right_task_space"
-        )
-
         full_command = (
             "source /opt/ros/humble/setup.bash"
             f" && source {shlex.quote(workspace_setup)}"
             f" && cd {shlex.quote(str(project_root))}"
             " && exec setsid /usr/bin/python3 -u -m "
             f"{shlex.quote(backend_module)}"
+            f"{backend_extra_args}"
             f" --speed-scale {speed_scale:.2f}"
         )
 
         self.active_experiment = selection
+
+        setup_log = ""
+        if polishing_setup is not None:
+            setup_log = (
+                f"Setup: {polishing_setup.title()}\n"
+            )
 
         self.log_output.appendPlainText(
             "\n============================================================\n"
@@ -5317,6 +5421,7 @@ class WorkcellUI(QMainWindow):
             f"Hand: {selection[1]}\n"
             f"Control: {selection[2]}\n"
             f"Motion: {selection[3]}\n"
+            f"{setup_log}"
             f"Speed scale: {speed_scale:.2f} ×\n"
             f"Backend: {backend}\n"
         )
