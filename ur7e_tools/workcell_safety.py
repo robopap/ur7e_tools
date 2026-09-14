@@ -86,7 +86,7 @@ def load_robot_scene(robot_name, urdf_path):
         model,
         str(urdf_path),
         pin.GeometryType.COLLISION,
-        PACKAGE_DIRS,
+        package_dirs=PACKAGE_DIRS,
     )
 
     return RobotScene(
@@ -112,7 +112,7 @@ def load_table_scene(workcell_urdf):
         model,
         str(workcell_urdf),
         pin.GeometryType.VISUAL,
-        PACKAGE_DIRS,
+        package_dirs=PACKAGE_DIRS,
     )
 
     data = model.createData()

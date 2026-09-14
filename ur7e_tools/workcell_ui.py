@@ -1290,6 +1290,7 @@ class WorkcellUI(QMainWindow):
         )
         self.analysis_output_buffer = ""
         self.analysis_report_path = None
+        self.analysis_report_paths = []
 
         # -----------------------------------------------------
         # Per-robot readiness state for the current UI-owned launch
@@ -2022,6 +2023,7 @@ class WorkcellUI(QMainWindow):
         self.experiment_task_combo.addItems([
             "Compound",
             "Polishing",
+            "Full Protocol",
         ])
         experiment_controls_layout.addWidget(
             self.experiment_task_combo
@@ -5173,6 +5175,19 @@ class WorkcellUI(QMainWindow):
         else:
             selection = self._selected_experiment()
 
+            # Full Protocol uses independently validated Compound/Polishing
+            # speeds from right_hand_mvp.json, so the single-speed UI control
+            # must not imply that it overrides the protocol.
+            if hasattr(self, "experiment_speed_spin"):
+                self.experiment_speed_spin.setEnabled(
+                    selection != (
+                        "Full Protocol",
+                        "Right",
+                        "Open-loop",
+                        "Task Space",
+                    )
+                )
+
             implemented = selection in {
                 (
                     "Compound",
@@ -5182,6 +5197,12 @@ class WorkcellUI(QMainWindow):
                 ),
                 (
                     "Polishing",
+                    "Right",
+                    "Open-loop",
+                    "Task Space",
+                ),
+                (
+                    "Full Protocol",
                     "Right",
                     "Open-loop",
                     "Task Space",
@@ -5242,9 +5263,17 @@ class WorkcellUI(QMainWindow):
             "Task Space",
         )
 
+        full_protocol_selection = (
+            "Full Protocol",
+            "Right",
+            "Open-loop",
+            "Task Space",
+        )
+
         if selection not in {
             compound_selection,
             polishing_selection,
+            full_protocol_selection,
         }:
             QMessageBox.information(
                 self,
@@ -5338,11 +5367,24 @@ class WorkcellUI(QMainWindow):
                     "Run the following REAL experiment?\n\n"
                     f"{experiment_text}\n"
                     f"{setup_text}"
-                    f"Speed scale: {speed_scale:.2f} ×\n\n"
-                    "The experiment backend will first verify "
-                    "that Robot 1 is already at the selected "
-                    "trajectory q0, start data acquisition, "
-                    "and then command Robot 1."
+                    + (
+                        "Full Protocol uses its validated per-task speeds "
+                        "from config (Compound / Polishing).\n\n"
+                        if selection == full_protocol_selection
+                        else f"Speed scale: {speed_scale:.2f} ×\n\n"
+                    )
+                    + (
+                        "The Full Protocol backend controls Robot 2 string "
+                        "setup, Compound, Polishing, data acquisition, and "
+                        "warm restart trials."
+                        if selection == full_protocol_selection
+                        else (
+                            "The experiment backend will first verify "
+                            "that Robot 1 is already at the selected "
+                            "trajectory q0, start data acquisition, "
+                            "and then command Robot 1."
+                        )
+                    )
                 ),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -5367,8 +5409,9 @@ class WorkcellUI(QMainWindow):
                 "experiment_backend.compound_right_task_space"
             )
             backend_extra_args = ""
+            backend_speed_arg = f" --speed-scale {speed_scale:.2f}"
 
-        else:
+        elif selection == polishing_selection:
             backend = (
                 project_root
                 / "experiment_backend"
@@ -5381,6 +5424,22 @@ class WorkcellUI(QMainWindow):
                 " --setup "
                 + shlex.quote(polishing_setup)
             )
+            backend_speed_arg = f" --speed-scale {speed_scale:.2f}"
+
+        else:
+            backend = (
+                project_root
+                / "experiment_backend"
+                / "right_hand_mvp.py"
+            )
+            backend_module = "experiment_backend.right_hand_mvp"
+            protocol_mode = "real" if real_mode else "simulation"
+            backend_extra_args = (
+                " --mode " + shlex.quote(protocol_mode)
+            )
+            # Full Protocol keeps the validated independent speeds from
+            # config/right_hand_mvp.json (Compound and Polishing).
+            backend_speed_arg = ""
 
         if not backend.is_file():
             QMessageBox.critical(
@@ -5401,7 +5460,7 @@ class WorkcellUI(QMainWindow):
             " && exec setsid /usr/bin/python3 -u -m "
             f"{shlex.quote(backend_module)}"
             f"{backend_extra_args}"
-            f" --speed-scale {speed_scale:.2f}"
+            f"{backend_speed_arg}"
         )
 
         self.active_experiment = selection
@@ -5411,6 +5470,12 @@ class WorkcellUI(QMainWindow):
             setup_log = (
                 f"Setup: {polishing_setup.title()}\n"
             )
+
+        speed_log = (
+            "Config speeds: Compound / Polishing (right_hand_mvp.json)\n"
+            if selection == full_protocol_selection
+            else f"Speed scale: {speed_scale:.2f} ×\n"
+        )
 
         self.log_output.appendPlainText(
             "\n============================================================\n"
@@ -5422,7 +5487,7 @@ class WorkcellUI(QMainWindow):
             f"Control: {selection[2]}\n"
             f"Motion: {selection[3]}\n"
             f"{setup_log}"
-            f"Speed scale: {speed_scale:.2f} ×\n"
+            f"{speed_log}"
             f"Backend: {backend}\n"
         )
 
@@ -5516,23 +5581,32 @@ class WorkcellUI(QMainWindow):
             except ValueError:
                 pass
 
-        task = str(
-            metadata.get("task", "unknown")
-        ).replace("_", " ").title()
+        if metadata.get("mvp") == "right_hand_compound_then_polishing" or metadata.get("trial_kind") == "full_protocol":
+            task = "Full Protocol"
+        else:
+            task = str(
+                metadata.get("task", "unknown")
+            ).replace("_", " ").title()
 
         hand = str(
             metadata.get(
                 "substituted_human_hand",
-                "unknown",
+                "right" if task == "Full Protocol" else "unknown",
             )
         ).replace("_", " ").title()
 
         control = str(
-            metadata.get("control_mode", "unknown")
+            metadata.get(
+                "control_mode",
+                "open_loop" if task == "Full Protocol" else "unknown",
+            )
         ).replace("_", " ").title()
 
         motion = str(
-            metadata.get("motion_method", "unknown")
+            metadata.get(
+                "motion_method",
+                "task_space" if task == "Full Protocol" else "unknown",
+            )
         ).replace("_", " ").title()
 
         return (
@@ -5559,24 +5633,22 @@ class WorkcellUI(QMainWindow):
                 "~/phd_polishing_experiments"
             )
         )
-        experiments_root = (
-            project_root
-            / "results"
-            / "experiments"
-        )
+        trial_roots = [
+            project_root / "results" / "experiments",
+            project_root / "results" / "mvp_right",
+        ]
 
         completed_trials = []
 
-        if experiments_root.is_dir():
+        for experiments_root in trial_roots:
+            if not experiments_root.is_dir():
+                continue
+
             for trial_dir in experiments_root.iterdir():
                 if not trial_dir.is_dir():
                     continue
 
-                metadata_path = (
-                    trial_dir
-                    / "metadata.json"
-                )
-
+                metadata_path = trial_dir / "metadata.json"
                 if not metadata_path.is_file():
                     continue
 
@@ -5589,31 +5661,22 @@ class WorkcellUI(QMainWindow):
                 except Exception:
                     continue
 
-                timebase = metadata.get(
-                    "timebase",
-                    {},
-                )
-
+                timebase = metadata.get("timebase", {})
                 completed = (
-                    timebase.get(
-                        "trial_end_ros_time_ns"
-                    )
-                    is not None
-                    or metadata.get(
-                        "experiment_end_time_utc"
-                    )
-                    is not None
+                    timebase.get("trial_end_ros_time_ns") is not None
+                    or metadata.get("experiment_end_time_utc") is not None
+                    or metadata.get("completed_utc") is not None
+                    or bool(metadata.get("trial_complete", False))
                 )
 
                 if not completed:
                     continue
 
-                completed_trials.append(
-                    (
-                        trial_dir,
-                        metadata,
-                    )
-                )
+                # A full-protocol registered trial must contain its own bag.
+                if not (trial_dir / "rosbag").is_dir():
+                    continue
+
+                completed_trials.append((trial_dir, metadata))
 
         completed_trials.sort(
             key=lambda item: item[0].name,
@@ -5751,6 +5814,7 @@ class WorkcellUI(QMainWindow):
 
         self.analysis_output_buffer = ""
         self.analysis_report_path = None
+        self.analysis_report_paths = []
 
         self.log_output.appendPlainText(
             "\n============================================================\n"
@@ -5802,9 +5866,11 @@ class WorkcellUI(QMainWindow):
             if line.startswith("ANALYSIS_REPORT="):
                 report_text = line.split("=", 1)[1].strip()
                 if report_text:
-                    self.analysis_report_path = Path(
-                        report_text
-                    ).expanduser()
+                    report_path = Path(report_text).expanduser()
+                    if report_path not in self.analysis_report_paths:
+                        self.analysis_report_paths.append(report_path)
+                    if self.analysis_report_path is None:
+                        self.analysis_report_path = report_path
 
         scrollbar = self.log_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -5814,16 +5880,18 @@ class WorkcellUI(QMainWindow):
         exit_code,
         exit_status,
     ):
-        # Catch a marker split across two QProcess reads.
-        if self.analysis_report_path is None:
-            for line in self.analysis_output_buffer.splitlines():
-                if line.startswith("ANALYSIS_REPORT="):
-                    report_text = line.split("=", 1)[1].strip()
-                    if report_text:
-                        self.analysis_report_path = Path(
-                            report_text
-                        ).expanduser()
-                    break
+        # Catch markers split across QProcess reads. Full Protocol may
+        # intentionally emit two report paths (Compound and Polishing).
+        for line in self.analysis_output_buffer.splitlines():
+            if line.startswith("ANALYSIS_REPORT="):
+                report_text = line.split("=", 1)[1].strip()
+                if report_text:
+                    report_path = Path(report_text).expanduser()
+                    if report_path not in self.analysis_report_paths:
+                        self.analysis_report_paths.append(report_path)
+
+        if self.analysis_report_paths and self.analysis_report_path is None:
+            self.analysis_report_path = self.analysis_report_paths[0]
 
         if exit_code == 0:
             self.log_output.appendPlainText(
@@ -5834,15 +5902,25 @@ class WorkcellUI(QMainWindow):
                 "connectionReachable"
             )
 
-            report = self.analysis_report_path
-            if report is not None and report.is_file():
-                self.log_output.appendPlainText(
-                    f"[OPENING REPORT] {report}"
-                )
-                QProcess.startDetached(
-                    "xdg-open",
-                    [str(report)],
-                )
+            valid_reports = [
+                path
+                for path in self.analysis_report_paths
+                if path.is_file()
+            ]
+
+            if not valid_reports and self.analysis_report_path is not None:
+                if self.analysis_report_path.is_file():
+                    valid_reports = [self.analysis_report_path]
+
+            if valid_reports:
+                for report in valid_reports:
+                    self.log_output.appendPlainText(
+                        f"[OPENING REPORT] {report}"
+                    )
+                    QProcess.startDetached(
+                        "xdg-open",
+                        [str(report)],
+                    )
             else:
                 self.log_output.appendPlainText(
                     "[ANALYSIS COMPLETE, but report path was not found]"

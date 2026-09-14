@@ -1,0 +1,14 @@
+joint_names:
+- shoulder_pan_joint
+- shoulder_lift_joint
+- elbow_joint
+- wrist_1_joint
+- wrist_2_joint
+- wrist_3_joint
+positions:
+- 0.11597084999084473
+- -1.9099027119078578
+- -1.9202406406402588
+- -2.420711179772848
+- 3.25748610496521
+- -1.537837330495016
