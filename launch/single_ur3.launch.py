@@ -75,7 +75,21 @@ def generate_launch_description():
     ur_launch = os.path.join(
         own_share,
         "launch",
-        "ur_control_namespaced.launch.py",
+        "ur_control_single_ur3.launch.py",
+    )
+
+    # ------------------------------------------------------------------
+    # Robotiq 2F-140 RViz visualizer — simulation only
+    # ------------------------------------------------------------------
+    robotiq_visualizer = Node(
+        package="ur7e_tools",
+        executable="robotiq_gripper_visualizer",
+        name="robotiq_gripper_visualizer",
+        output="screen",
+        condition=IfCondition(use_fake_hardware),
+        parameters=[
+            {"gripper_joint_name": "gripper_finger_joint"}
+        ],
     )
 
     robot = IncludeLaunchDescription(
@@ -128,6 +142,7 @@ def generate_launch_description():
         ),
 
         workcell_state_publisher,
+        robotiq_visualizer,
         rviz_node,
         robot,
         

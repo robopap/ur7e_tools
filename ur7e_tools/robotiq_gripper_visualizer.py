@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 from sensor_msgs.msg import JointState
@@ -8,18 +9,25 @@ from std_msgs.msg import Float64
 from std_srvs.srv import Trigger
 
 
-CLOSED_POSITION = 0.0115
-OPEN_POSITION = 0.0305
+# Robotiq 2F-140 main joint:
+#   0.0 rad   ~= fully open
+#   0.695 rad ~= fully closed
+#
+# UI convention kept identical to the existing 2FG7 controls:
+#   normalized 0.0 = CLOSED
+#   normalized 1.0 = OPEN
+OPEN_POSITION = 0.0
+CLOSED_POSITION = 0.695
 
 
-class GripperVisualizer(Node):
+class RobotiqGripperVisualizer(Node):
 
     def __init__(self):
-        super().__init__("gripper_visualizer")
+        super().__init__("robotiq_gripper_visualizer")
 
         self.declare_parameter(
             "gripper_joint_name",
-            "gripper_gripper_joint",
+            "gripper_finger_joint",
         )
 
         self.gripper_joint_name = (
@@ -28,9 +36,11 @@ class GripperVisualizer(Node):
             .string_value
         )
 
+        # Start visually open.
         self.normalized_position = 1.0
         self.latest_robot_state = None
 
+        # Raw UR joint states from joint_state_broadcaster.
         self.subscription = self.create_subscription(
             JointState,
             "joint_states",
@@ -38,6 +48,8 @@ class GripperVisualizer(Node):
             10,
         )
 
+        # Combined UR + Robotiq joint-state stream consumed by
+        # robot_state_publisher in Single UR3 / Single UR7e.
         self.publisher = self.create_publisher(
             JointState,
             "visual_joint_states",
@@ -46,29 +58,29 @@ class GripperVisualizer(Node):
 
         self.position_subscription = self.create_subscription(
             Float64,
-            "gripper_visual/position",
+            "robotiq_visual/position",
             self.position_callback,
             10,
         )
 
-        # Keep OPEN/CLOSE services for compatibility with older UI versions.
         self.create_service(
             Trigger,
-            "gripper_visual/open",
+            "robotiq_visual/open",
             self.open_callback,
         )
 
         self.create_service(
             Trigger,
-            "gripper_visual/close",
+            "robotiq_visual/close",
             self.close_callback,
         )
 
         self.get_logger().info(
-            f"2FG7 visualizer ready: {self.gripper_joint_name}"
+            f"Robotiq 2F-140 visualizer ready: {self.gripper_joint_name}"
         )
 
     def normalized_to_joint_position(self):
+        # normalized 0 -> closed, normalized 1 -> open
         return (
             CLOSED_POSITION
             + self.normalized_position
@@ -95,6 +107,8 @@ class GripperVisualizer(Node):
         original_names = list(original.name)
 
         msg = JointState()
+
+        # Important: publish with a current timestamp.
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = original.header.frame_id
 
@@ -138,7 +152,7 @@ class GripperVisualizer(Node):
         self.publish_combined_state()
 
         response.success = True
-        response.message = "2FG7 visualization opened"
+        response.message = "Robotiq 2F-140 visualization opened"
         return response
 
     def close_callback(self, request, response):
@@ -146,30 +160,34 @@ class GripperVisualizer(Node):
         self.publish_combined_state()
 
         response.success = True
-        response.message = "2FG7 visualization closed"
+        response.message = "Robotiq 2F-140 visualization closed"
         return response
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GripperVisualizer()
+    node = RobotiqGripperVisualizer()
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except RuntimeError as exc:
+        # ROS 2 Humble can raise this from the executor when SIGINT arrives
+        # while a subscription message is being taken. It is a shutdown race,
+        # not a runtime failure of the visualizer.
+        if "Unable to convert call argument to Python object" not in str(exc):
+            raise
     finally:
-        # ros2 launch sends SIGINT during STOP. The rclpy context may already
-        # be shutting down at this point, so teardown must be idempotent.
         try:
             node.destroy_node()
-        except (KeyboardInterrupt, Exception):
+        except (KeyboardInterrupt, RuntimeError):
             pass
 
         if rclpy.ok():
             try:
                 rclpy.shutdown()
-            except (KeyboardInterrupt, Exception):
+            except (KeyboardInterrupt, RuntimeError):
                 pass
 
 

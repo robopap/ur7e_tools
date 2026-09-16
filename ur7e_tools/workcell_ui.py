@@ -137,6 +137,7 @@ PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 WORKCELL_PROCESS_MARKERS = (
     "dual_ur7e.launch.py",
     "single_ur3.launch.py",
+    "single_ur7e.launch.py",
     "ur_ros2_control_node",
     "controller_stopper_node",
     "robot_state_publisher",
@@ -1208,11 +1209,16 @@ class WorkcellUI(QMainWindow):
         # -----------------------------------------------------
 
         self.ur3_ping_process = QProcess(self)
+        self.single_ur7e_ping_process = QProcess(self)
         self.robot1_ping_process = QProcess(self)
         self.robot2_ping_process = QProcess(self)
 
         self.ur3_ping_process.finished.connect(
             self.ur3_ping_finished
+        )
+
+        self.single_ur7e_ping_process.finished.connect(
+            self.single_ur7e_ping_finished
         )
 
         self.robot1_ping_process.finished.connect(
@@ -1467,6 +1473,7 @@ class WorkcellUI(QMainWindow):
         self.setup_combo = QComboBox()
         self.setup_combo.addItems([
             "Single UR3",
+            "Single UR7e",
             "Dual UR7e",
         ])
         self.setup_combo.setCurrentText("Dual UR7e")
@@ -1586,23 +1593,12 @@ class WorkcellUI(QMainWindow):
             self.ur3_group
         )
 
-        ur3_form = QFormLayout()
+        # The single workcell has one fixed robot model: UR3.
+        # Keep only the controls that are useful during operation.
 
-        self.ur3_type = QComboBox()
-        self.ur3_type.addItems([
-            "ur3",
-            "ur3e",
-        ])
-
-        ur3_form.addRow(
-            "Robot type:",
-            self.ur3_type
-        )
-
-        ur3_layout.addLayout(ur3_form)
-
-        # IP + TEST
+        # IP + TEST + status
         ur3_connection_layout = QHBoxLayout()
+        ur3_connection_layout.setSpacing(8)
 
         self.ur3_ip = QLineEdit(
             "127.0.0.1"
@@ -1629,14 +1625,8 @@ class WorkcellUI(QMainWindow):
             self.ur3_test_button
         )
 
-        ur3_layout.addLayout(
-            ur3_connection_layout
-        )
-
-        # Status
-        ur3_status_layout = QHBoxLayout()
-
-        ur3_status_layout.addWidget(
+        ur3_connection_layout.addSpacing(6)
+        ur3_connection_layout.addWidget(
             QLabel("Connection:")
         )
 
@@ -1647,17 +1637,18 @@ class WorkcellUI(QMainWindow):
             "connectionUnknown"
         )
 
-        ur3_status_layout.addWidget(
+        ur3_connection_layout.addWidget(
             self.ur3_connection_status
         )
 
-        ur3_status_layout.addStretch()
-
         ur3_layout.addLayout(
-            ur3_status_layout
+            ur3_connection_layout
         )
 
-        # HOME
+        # HOME + application selector
+        ur3_actions_layout = QHBoxLayout()
+        ur3_actions_layout.setSpacing(8)
+
         self.ur3_home_button = QPushButton(
             "MOVE UR3 TO HOME"
         )
@@ -1674,12 +1665,125 @@ class WorkcellUI(QMainWindow):
             "Move the UR3 to its saved HOME joint configuration."
         )
 
-        ur3_layout.addWidget(
+        ur3_actions_layout.addWidget(
             self.ur3_home_button
+        )
+        ur3_actions_layout.addStretch()
+        ur3_actions_layout.addWidget(
+            QLabel("Application:")
+        )
+
+        self.ur3_application_combo = QComboBox()
+        self.ur3_application_combo.addItems([
+            "Polishing",
+            "TV Assembly",
+        ])
+        self.ur3_application_combo.setCurrentText(
+            "Polishing"
+        )
+        self.ur3_application_combo.setMinimumWidth(150)
+        self.ur3_application_combo.setToolTip(
+            "Select the application workspace shown below. "
+            "The UR3 ROS 2 bringup is shared by both applications."
+        )
+        self.ur3_application_combo.currentIndexChanged.connect(
+            self.update_ur3_application_view
+        )
+
+        ur3_actions_layout.addWidget(
+            self.ur3_application_combo
+        )
+
+        ur3_layout.addLayout(
+            ur3_actions_layout
         )
 
         main_layout.addWidget(
             self.ur3_group
+        )
+
+        # =====================================================
+        # SINGLE UR7e
+        # =====================================================
+
+        self.single_ur7e_group = QGroupBox(
+            "Single UR7e configuration"
+        )
+        single_ur7e_layout = QVBoxLayout(
+            self.single_ur7e_group
+        )
+
+        single_ur7e_connection_layout = QHBoxLayout()
+        single_ur7e_connection_layout.setSpacing(8)
+
+        self.single_ur7e_ip = QLineEdit(
+            "127.0.0.1"
+        )
+        self.single_ur7e_test_button = QPushButton(
+            "TEST"
+        )
+        self.single_ur7e_test_button.clicked.connect(
+            self.test_single_ur7e_connection
+        )
+
+        single_ur7e_connection_layout.addWidget(
+            QLabel("Robot IP:")
+        )
+        single_ur7e_connection_layout.addWidget(
+            self.single_ur7e_ip,
+            1
+        )
+        single_ur7e_connection_layout.addWidget(
+            self.single_ur7e_test_button
+        )
+        single_ur7e_connection_layout.addSpacing(6)
+        single_ur7e_connection_layout.addWidget(
+            QLabel("Connection:")
+        )
+
+        self.single_ur7e_connection_status = QLabel(
+            "NOT TESTED"
+        )
+        self.single_ur7e_connection_status.setObjectName(
+            "connectionUnknown"
+        )
+        single_ur7e_connection_layout.addWidget(
+            self.single_ur7e_connection_status
+        )
+
+        single_ur7e_layout.addLayout(
+            single_ur7e_connection_layout
+        )
+
+        single_ur7e_gripper_layout = QHBoxLayout()
+        single_ur7e_gripper_layout.addWidget(
+            QLabel("Gripper:")
+        )
+
+        self.single_ur7e_gripper_combo = QComboBox()
+        self.single_ur7e_gripper_combo.addItems([
+            "OnRobot 2FG7",
+            "Robotiq 2F-140",
+        ])
+        self.single_ur7e_gripper_combo.setCurrentText(
+            "OnRobot 2FG7"
+        )
+        self.single_ur7e_gripper_combo.setMinimumWidth(180)
+        self.single_ur7e_gripper_combo.setToolTip(
+            "Select the gripper model/backend before START SYSTEM. "
+            "The selector applies to both Simulation and Real Robot mode."
+        )
+
+        single_ur7e_gripper_layout.addWidget(
+            self.single_ur7e_gripper_combo
+        )
+        single_ur7e_gripper_layout.addStretch()
+        single_ur7e_layout.addLayout(
+            single_ur7e_gripper_layout
+        )
+
+        main_layout.addWidget(
+            self.single_ur7e_group
         )
 
         # =====================================================
@@ -2178,6 +2282,201 @@ class WorkcellUI(QMainWindow):
         self.refresh_analysis_trials(
             preserve_selection=False
         )
+
+        # =====================================================
+        # SINGLE UR3 — TV ASSEMBLY MISSION CONTROL (UI SHELL)
+        # =====================================================
+        #
+        # This is intentionally a ROS 2 / PySide6-native shell.
+        # The legacy TV-assembly ROS1/Python2 processes are NOT launched
+        # from here. They will be ported and connected one-by-one after
+        # the application layout is validated.
+
+        self.tv_assembly_group = QGroupBox(
+            "TV Assembly — ROS 2 Mission Control"
+        )
+        tv_layout = QVBoxLayout(self.tv_assembly_group)
+        tv_layout.setSpacing(8)
+
+        tv_header = QHBoxLayout()
+        tv_title = QLabel("UR3 TV Assembly")
+        tv_title.setObjectName("tvAssemblyTitle")
+        tv_header.addWidget(tv_title)
+        tv_header.addStretch()
+        tv_header.addWidget(QLabel("Backend:"))
+        self.tv_assembly_backend_status = QLabel(
+            "ROS 2 PORT PENDING"
+        )
+        self.tv_assembly_backend_status.setObjectName(
+            "connectionUnknown"
+        )
+        self.tv_assembly_backend_status.setToolTip(
+            "The dashboard layout is ready. Legacy ROS1 TV-assembly "
+            "processes are not connected yet."
+        )
+        tv_header.addWidget(self.tv_assembly_backend_status)
+        tv_layout.addLayout(tv_header)
+
+        tv_main_splitter = QSplitter(Qt.Horizontal)
+        tv_main_splitter.setChildrenCollapsible(False)
+        tv_main_splitter.setHandleWidth(7)
+
+        # ---------------- Camera workspace ----------------
+        tv_camera_frame = QFrame()
+        tv_camera_frame.setObjectName("tvPanel")
+        tv_camera_layout = QGridLayout(tv_camera_frame)
+        tv_camera_layout.setContentsMargins(8, 8, 8, 8)
+        tv_camera_layout.setHorizontalSpacing(8)
+        tv_camera_layout.setVerticalSpacing(6)
+
+        pose_title = QLabel("POSE CAMERA")
+        pose_title.setObjectName("tvPanelTitle")
+        gesture_title = QLabel("GESTURE CAMERA")
+        gesture_title.setObjectName("tvPanelTitle")
+        tv_camera_layout.addWidget(pose_title, 0, 0)
+        tv_camera_layout.addWidget(gesture_title, 0, 1)
+
+        self.tv_pose_camera_placeholder = QLabel(
+            "Pose-estimation stream\nROS 2 port pending"
+        )
+        self.tv_pose_camera_placeholder.setObjectName(
+            "tvCameraPlaceholder"
+        )
+        self.tv_pose_camera_placeholder.setAlignment(
+            Qt.AlignCenter
+        )
+        self.tv_pose_camera_placeholder.setMinimumHeight(230)
+
+        self.tv_gesture_camera_placeholder = QLabel(
+            "Gesture-recognition stream\nROS 2 port pending"
+        )
+        self.tv_gesture_camera_placeholder.setObjectName(
+            "tvCameraPlaceholder"
+        )
+        self.tv_gesture_camera_placeholder.setAlignment(
+            Qt.AlignCenter
+        )
+        self.tv_gesture_camera_placeholder.setMinimumHeight(230)
+
+        tv_camera_layout.addWidget(
+            self.tv_pose_camera_placeholder,
+            1,
+            0,
+        )
+        tv_camera_layout.addWidget(
+            self.tv_gesture_camera_placeholder,
+            1,
+            1,
+        )
+        tv_camera_layout.setColumnStretch(0, 1)
+        tv_camera_layout.setColumnStretch(1, 1)
+        tv_camera_layout.setRowStretch(1, 1)
+
+        # ---------------- Mission controls / telemetry ----------------
+        tv_control_frame = QFrame()
+        tv_control_frame.setObjectName("tvPanel")
+        tv_control_layout = QVBoxLayout(tv_control_frame)
+        tv_control_layout.setContentsMargins(8, 8, 8, 8)
+        tv_control_layout.setSpacing(7)
+
+        actions_title = QLabel("TV ASSEMBLY ACTIONS")
+        actions_title.setObjectName("tvPanelTitle")
+        tv_control_layout.addWidget(actions_title)
+
+        tv_action_grid = QGridLayout()
+        tv_action_grid.setSpacing(7)
+
+        self.tv_physical_button = QPushButton(
+            "PHYSICAL INTERACTION"
+        )
+        self.tv_pose_button = QPushButton(
+            "POSE ESTIMATION"
+        )
+        self.tv_gesture_button = QPushButton(
+            "GESTURE RECOGNITION"
+        )
+        self.tv_stop_button = QPushButton(
+            "STOP TV ASSEMBLY"
+        )
+        self.tv_stop_button.setObjectName("stopButton")
+
+        for button in (
+            self.tv_physical_button,
+            self.tv_pose_button,
+            self.tv_gesture_button,
+            self.tv_stop_button,
+        ):
+            button.setMinimumHeight(42)
+            button.setEnabled(False)
+            button.setToolTip(
+                "UI preview only — this action will be enabled after "
+                "its ROS 2 backend is ported."
+            )
+
+        tv_action_grid.addWidget(
+            self.tv_physical_button, 0, 0
+        )
+        tv_action_grid.addWidget(
+            self.tv_pose_button, 0, 1
+        )
+        tv_action_grid.addWidget(
+            self.tv_gesture_button, 1, 0
+        )
+        tv_action_grid.addWidget(
+            self.tv_stop_button, 1, 1
+        )
+        tv_control_layout.addLayout(tv_action_grid)
+
+        tv_control_layout.addSpacing(4)
+        force_title = QLabel("EXTERNAL F/T TELEMETRY")
+        force_title.setObjectName("tvPanelTitle")
+        tv_control_layout.addWidget(force_title)
+
+        ft_grid = QGridLayout()
+        ft_grid.setHorizontalSpacing(10)
+        ft_grid.setVerticalSpacing(5)
+        self.tv_ft_value_labels = {}
+        for index, channel in enumerate((
+            "Fx", "Fy", "Fz", "Mx", "My", "Mz"
+        )):
+            unit = "N" if channel.startswith("F") else "Nm"
+            name_label = QLabel(f"{channel}:")
+            value_label = QLabel(f"-- {unit}")
+            value_label.setObjectName("tvTelemetryValue")
+            ft_grid.addWidget(name_label, index // 2, (index % 2) * 2)
+            ft_grid.addWidget(
+                value_label,
+                index // 2,
+                (index % 2) * 2 + 1,
+            )
+            self.tv_ft_value_labels[channel] = value_label
+
+        tv_control_layout.addLayout(ft_grid)
+        tv_control_layout.addStretch(1)
+
+        tv_main_splitter.addWidget(tv_camera_frame)
+        tv_main_splitter.addWidget(tv_control_frame)
+        tv_main_splitter.setStretchFactor(0, 72)
+        tv_main_splitter.setStretchFactor(1, 28)
+        tv_main_splitter.setSizes([900, 360])
+        tv_layout.addWidget(tv_main_splitter, 1)
+
+        console_title = QLabel("TV ASSEMBLY CONSOLE")
+        console_title.setObjectName("tvPanelTitle")
+        tv_layout.addWidget(console_title)
+
+        self.tv_assembly_console = QPlainTextEdit()
+        self.tv_assembly_console.setReadOnly(True)
+        self.tv_assembly_console.setMaximumHeight(115)
+        self.tv_assembly_console.setPlainText(
+            "TV Assembly UI shell loaded.\n"
+            "Next step: port the legacy ROS1/Python2 TV-assembly backends "
+            "to ROS 2 Humble and connect them here."
+        )
+        tv_layout.addWidget(self.tv_assembly_console)
+
+        main_layout.addWidget(self.tv_assembly_group, 1)
+        self.tv_assembly_group.setVisible(False)
 
         self.robot1_ip.textChanged.connect(
             lambda _text: self.set_connection_status(
@@ -3764,37 +4063,58 @@ class WorkcellUI(QMainWindow):
     # Setup visibility
     # =========================================================
 
-    def update_setup_view(self):
+    def update_ur3_application_view(self):
+        """Switch the Single-UR3 workspace between applications."""
 
         single = (
             self.setup_combo.currentText()
             == "Single UR3"
         )
 
-        self.ur3_group.setVisible(
+        tv_assembly = (
             single
+            and hasattr(self, "ur3_application_combo")
+            and self.ur3_application_combo.currentText()
+            == "TV Assembly"
         )
 
-        self.dual_group.setVisible(
-            not single
-        )
+        if hasattr(self, "tv_assembly_group"):
+            self.tv_assembly_group.setVisible(tv_assembly)
+
+        # Polishing keeps the exact workspace that the Single UR3 had
+        # before this selector was added. Dual UR7e always keeps it too.
+        if hasattr(self, "lower_workspace_splitter"):
+            self.lower_workspace_splitter.setVisible(
+                not tv_assembly
+            )
+
+    def update_setup_view(self):
+
+        setup = self.setup_combo.currentText()
+        single_ur3 = (setup == "Single UR3")
+        single_ur7e = (setup == "Single UR7e")
+        dual = (setup == "Dual UR7e")
+
+        self.ur3_group.setVisible(single_ur3)
+        self.single_ur7e_group.setVisible(single_ur7e)
+        self.dual_group.setVisible(dual)
 
         if hasattr(self, "experiment_group"):
-            self.experiment_group.setVisible(not single)
+            self.experiment_group.setVisible(dual)
             self.update_experiment_controls()
 
         if hasattr(self, "robots_ready_label"):
-            self.robots_ready_label.setVisible(not single)
+            self.robots_ready_label.setVisible(dual)
 
         if hasattr(self, "health_status_label"):
-            self.health_status_label.setVisible(not single)
+            self.health_status_label.setVisible(dual)
 
         if hasattr(self, "start_guard_label"):
             self.start_guard_label.clear()
             self.start_guard_label.setVisible(False)
 
         dual_real = (
-            not single
+            dual
             and self.mode_combo.currentText()
             == "Real Robot(s)"
         )
@@ -3814,20 +4134,16 @@ class WorkcellUI(QMainWindow):
         if hasattr(self, "home_process"):
             self.update_home_buttons()
 
-        if hasattr(
-            self,
-            "internal_ft_zero_processes",
-        ):
+        if hasattr(self, "internal_ft_zero_processes"):
             self.update_internal_ft_controls()
 
-        if hasattr(
-            self,
-            "external_ft_start_button",
-        ):
+        if hasattr(self, "external_ft_start_button"):
             self.update_external_ft_controls()
 
         if hasattr(self, "wrench_panels"):
             self.update_recording_controls()
+
+        self.update_ur3_application_view()
 
     # =========================================================
     # IP validation
@@ -3962,6 +4278,35 @@ class WorkcellUI(QMainWindow):
 
             self.set_connection_status(
                 self.ur3_connection_status,
+                "OFFLINE"
+            )
+
+    # =========================================================
+    # Single UR7e ping
+    # =========================================================
+
+    def test_single_ur7e_connection(self):
+
+        self.start_ping(
+            self.single_ur7e_ip.text().strip(),
+            self.single_ur7e_ping_process,
+            self.single_ur7e_connection_status,
+        )
+
+    def single_ur7e_ping_finished(
+        self,
+        exit_code,
+        exit_status
+    ):
+
+        if exit_code == 0:
+            self.set_connection_status(
+                self.single_ur7e_connection_status,
+                "REACHABLE"
+            )
+        else:
+            self.set_connection_status(
+                self.single_ur7e_connection_status,
                 "OFFLINE"
             )
 
@@ -4767,19 +5112,23 @@ class WorkcellUI(QMainWindow):
             == QProcess.NotRunning
         )
 
-        single = (
+        single_ur3 = (
             self.setup_combo.currentText()
             == "Single UR3"
+        )
+        dual = (
+            self.setup_combo.currentText()
+            == "Dual UR7e"
         )
 
         self.ur3_home_button.setEnabled(
             system_running
             and motion_idle
-            and single
+            and single_ur3
         )
 
         dual_real = (
-            not single
+            dual
             and self.mode_combo.currentText() == "Real Robot(s)"
         )
 
@@ -4797,14 +5146,14 @@ class WorkcellUI(QMainWindow):
         self.robot1_home_button.setEnabled(
             system_running
             and motion_idle
-            and not single
+            and dual
             and robot1_ready
         )
 
         self.robot2_home_button.setEnabled(
             system_running
             and motion_idle
-            and not single
+            and dual
             and robot2_ready
         )
 
@@ -6178,57 +6527,49 @@ class WorkcellUI(QMainWindow):
 
     def validate_configuration(self):
 
-        if (
-            self.mode_combo.currentText()
-            == "Simulation"
-        ):
+        if self.mode_combo.currentText() == "Simulation":
             return True
 
-        if (
-            self.setup_combo.currentText()
-            == "Single UR3"
-        ):
+        setup = self.setup_combo.currentText()
 
+        if setup == "Single UR3":
             ip = self.ur3_ip.text().strip()
-
             if not self.valid_ip(ip):
-
                 QMessageBox.warning(
                     self,
                     "Invalid IP",
                     f"Invalid UR3 IP address:\n{ip}",
                 )
+                return False
 
+        elif setup == "Single UR7e":
+            ip = self.single_ur7e_ip.text().strip()
+            if not self.valid_ip(ip):
+                QMessageBox.warning(
+                    self,
+                    "Invalid IP",
+                    f"Invalid UR7e IP address:\n{ip}",
+                )
                 return False
 
         else:
-
-            ip1 = (
-                self.robot1_ip.text().strip()
-            )
-
-            ip2 = (
-                self.robot2_ip.text().strip()
-            )
+            ip1 = self.robot1_ip.text().strip()
+            ip2 = self.robot2_ip.text().strip()
 
             if not self.valid_ip(ip1):
-
                 QMessageBox.warning(
                     self,
                     "Invalid IP",
                     f"Invalid Robot 1 IP address:\n{ip1}",
                 )
-
                 return False
 
             if not self.valid_ip(ip2):
-
                 QMessageBox.warning(
                     self,
                     "Invalid IP",
                     f"Invalid Robot 2 IP address:\n{ip2}",
                 )
-
                 return False
 
         return True
@@ -6243,47 +6584,44 @@ class WorkcellUI(QMainWindow):
             self.mode_combo.currentText()
             == "Simulation"
         )
+        fake = "true" if simulation else "false"
+        setup = self.setup_combo.currentText()
 
-        fake = (
-            "true"
-            if simulation
-            else "false"
-        )
-
-        if (
-            self.setup_combo.currentText()
-            == "Single UR3"
-        ):
-
-            robot_type = (
-                self.ur3_type.currentText()
-            )
-
-            robot_ip = (
-                self.ur3_ip.text().strip()
-            )
-
+        if setup == "Single UR3":
+            robot_ip = self.ur3_ip.text().strip()
             command = [
                 "ros2",
                 "launch",
                 "ur7e_tools",
                 "single_ur3.launch.py",
-                f"ur_type:={robot_type}",
+                "ur_type:=ur3",
                 f"robot_ip:={robot_ip}",
                 f"use_fake_hardware:={fake}",
                 "launch_rviz:=true",
             ]
 
+        elif setup == "Single UR7e":
+            robot_ip = self.single_ur7e_ip.text().strip()
+            gripper_type = (
+                "onrobot"
+                if self.single_ur7e_gripper_combo.currentText()
+                == "OnRobot 2FG7"
+                else "robotiq"
+            )
+            command = [
+                "ros2",
+                "launch",
+                "ur7e_tools",
+                "single_ur7e.launch.py",
+                f"robot_ip:={robot_ip}",
+                f"gripper_type:={gripper_type}",
+                f"use_fake_hardware:={fake}",
+                "launch_rviz:=true",
+            ]
+
         else:
-
-            robot1_ip = (
-                self.robot1_ip.text().strip()
-            )
-
-            robot2_ip = (
-                self.robot2_ip.text().strip()
-            )
-
+            robot1_ip = self.robot1_ip.text().strip()
+            robot2_ip = self.robot2_ip.text().strip()
             command = [
                 "ros2",
                 "launch",
@@ -6312,17 +6650,26 @@ class WorkcellUI(QMainWindow):
         if not self.validate_configuration():
             return
 
+        setup = self.setup_combo.currentText()
+        real_mode = (self.mode_combo.currentText() == "Real Robot(s)")
+
         if (
-            self.setup_combo.currentText() == "Dual UR7e"
-            and self.mode_combo.currentText() == "Real Robot(s)"
+            setup in ("Single UR7e", "Dual UR7e")
+            and real_mode
             and not self.preflight_before_start()
         ):
             return
 
-        if (
-            self.setup_combo.currentText() == "Dual UR7e"
-            and self.mode_combo.currentText() == "Real Robot(s)"
-        ):
+        if setup == "Single UR7e" and real_mode:
+            if self.single_ur7e_connection_status.text() != "REACHABLE":
+                self.start_guard_label.setText(
+                    "Press TEST for the UR7e connection before starting "
+                    "the real robot."
+                )
+                self.start_guard_label.setVisible(True)
+                return
+
+        if setup == "Dual UR7e" and real_mode:
             robot1_ready = (
                 self.robot1_connection_status.text()
                 == "REACHABLE"
@@ -6501,13 +6848,12 @@ class WorkcellUI(QMainWindow):
             False
         )
 
-        self.ur3_type.setEnabled(
-            False
-        )
-
         self.ur3_ip.setEnabled(
             False
         )
+
+        self.single_ur7e_ip.setEnabled(False)
+        self.single_ur7e_gripper_combo.setEnabled(False)
 
         self.robot1_ip.setEnabled(
             False
@@ -6574,13 +6920,12 @@ class WorkcellUI(QMainWindow):
             True
         )
 
-        self.ur3_type.setEnabled(
-            True
-        )
-
         self.ur3_ip.setEnabled(
             True
         )
+
+        self.single_ur7e_ip.setEnabled(True)
+        self.single_ur7e_gripper_combo.setEnabled(True)
 
         self.robot1_ip.setEnabled(
             True
@@ -6919,6 +7264,43 @@ class WorkcellUI(QMainWindow):
                 border-radius: 6px;
             }
 
+            QFrame#tvPanel {
+                background: #292a2d;
+                border: 1px solid #3c4043;
+                border-radius: 7px;
+            }
+
+            QLabel#tvAssemblyTitle {
+                font-size: 17px;
+                font-weight: 700;
+                color: #e8eaed;
+            }
+
+            QLabel#tvPanelTitle {
+                font-size: 12px;
+                font-weight: 800;
+                color: #bdc1c6;
+                letter-spacing: 1px;
+            }
+
+            QLabel#tvCameraPlaceholder {
+                background: #151618;
+                border: 1px solid #4a4d51;
+                border-radius: 6px;
+                color: #80868b;
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            QLabel#tvTelemetryValue {
+                background: #303134;
+                border: 1px solid #4a4d51;
+                border-radius: 4px;
+                padding: 4px 8px;
+                min-width: 70px;
+                font-family: monospace;
+                font-weight: 700;
+            }
 
             QFrame#recordingBar {
                 background: #292a2d;

@@ -38,6 +38,7 @@ setup(
             'saved_pose = ur7e_tools.saved_pose:main',
             'home_pose = ur7e_tools.home_pose:main',
             'gripper_visualizer = ur7e_tools.gripper_visualizer:main',
+            'robotiq_gripper_visualizer = ur7e_tools.robotiq_gripper_visualizer:main',
             'ft_sensor = ur7e_tools.ft_sensor_node:main',
         ],
     },
