@@ -136,7 +136,7 @@ PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 #
 WORKCELL_PROCESS_MARKERS = (
     "dual_ur7e.launch.py",
-    "single_ur5.launch.py",
+    "single_ur3.launch.py",
     "ur_ros2_control_node",
     "controller_stopper_node",
     "robot_state_publisher",
@@ -1207,12 +1207,12 @@ class WorkcellUI(QMainWindow):
         # Ping processes
         # -----------------------------------------------------
 
-        self.ur5_ping_process = QProcess(self)
+        self.ur3_ping_process = QProcess(self)
         self.robot1_ping_process = QProcess(self)
         self.robot2_ping_process = QProcess(self)
 
-        self.ur5_ping_process.finished.connect(
-            self.ur5_ping_finished
+        self.ur3_ping_process.finished.connect(
+            self.ur3_ping_finished
         )
 
         self.robot1_ping_process.finished.connect(
@@ -1229,8 +1229,8 @@ class WorkcellUI(QMainWindow):
         # This single process serializes setup motions. For the
         # Dual UR7e setup it runs the saved_pose backend, whose
         # mandatory full-path workcell safety gate cannot be
-        # bypassed by the UI. The legacy UR5 HOME path remains
-        # available for the Single UR5 setup.
+        # bypassed by the UI. The legacy UR3 HOME path remains
+        # available for the Single UR3 setup.
         # -----------------------------------------------------
 
         self.home_process = QProcess(self)
@@ -1466,7 +1466,7 @@ class WorkcellUI(QMainWindow):
 
         self.setup_combo = QComboBox()
         self.setup_combo.addItems([
-            "Single UR5",
+            "Single UR3",
             "Dual UR7e",
         ])
         self.setup_combo.setCurrentText("Dual UR7e")
@@ -1575,111 +1575,111 @@ class WorkcellUI(QMainWindow):
         main_layout.addWidget(setup_group)
 
         # =====================================================
-        # SINGLE UR5
+        # SINGLE UR3
         # =====================================================
 
-        self.ur5_group = QGroupBox(
-            "Single UR5 configuration"
+        self.ur3_group = QGroupBox(
+            "Single UR3 configuration"
         )
 
-        ur5_layout = QVBoxLayout(
-            self.ur5_group
+        ur3_layout = QVBoxLayout(
+            self.ur3_group
         )
 
-        ur5_form = QFormLayout()
+        ur3_form = QFormLayout()
 
-        self.ur5_type = QComboBox()
-        self.ur5_type.addItems([
-            "ur5",
-            "ur5e",
+        self.ur3_type = QComboBox()
+        self.ur3_type.addItems([
+            "ur3",
+            "ur3e",
         ])
 
-        ur5_form.addRow(
+        ur3_form.addRow(
             "Robot type:",
-            self.ur5_type
+            self.ur3_type
         )
 
-        ur5_layout.addLayout(ur5_form)
+        ur3_layout.addLayout(ur3_form)
 
         # IP + TEST
-        ur5_connection_layout = QHBoxLayout()
+        ur3_connection_layout = QHBoxLayout()
 
-        self.ur5_ip = QLineEdit(
+        self.ur3_ip = QLineEdit(
             "127.0.0.1"
         )
 
-        self.ur5_test_button = QPushButton(
+        self.ur3_test_button = QPushButton(
             "TEST"
         )
 
-        self.ur5_test_button.clicked.connect(
-            self.test_ur5_connection
+        self.ur3_test_button.clicked.connect(
+            self.test_ur3_connection
         )
 
-        ur5_connection_layout.addWidget(
+        ur3_connection_layout.addWidget(
             QLabel("Robot IP:")
         )
 
-        ur5_connection_layout.addWidget(
-            self.ur5_ip,
+        ur3_connection_layout.addWidget(
+            self.ur3_ip,
             1
         )
 
-        ur5_connection_layout.addWidget(
-            self.ur5_test_button
+        ur3_connection_layout.addWidget(
+            self.ur3_test_button
         )
 
-        ur5_layout.addLayout(
-            ur5_connection_layout
+        ur3_layout.addLayout(
+            ur3_connection_layout
         )
 
         # Status
-        ur5_status_layout = QHBoxLayout()
+        ur3_status_layout = QHBoxLayout()
 
-        ur5_status_layout.addWidget(
+        ur3_status_layout.addWidget(
             QLabel("Connection:")
         )
 
-        self.ur5_connection_status = QLabel(
+        self.ur3_connection_status = QLabel(
             "NOT TESTED"
         )
-        self.ur5_connection_status.setObjectName(
+        self.ur3_connection_status.setObjectName(
             "connectionUnknown"
         )
 
-        ur5_status_layout.addWidget(
-            self.ur5_connection_status
+        ur3_status_layout.addWidget(
+            self.ur3_connection_status
         )
 
-        ur5_status_layout.addStretch()
+        ur3_status_layout.addStretch()
 
-        ur5_layout.addLayout(
-            ur5_status_layout
+        ur3_layout.addLayout(
+            ur3_status_layout
         )
 
         # HOME
-        self.ur5_home_button = QPushButton(
-            "MOVE UR5 TO HOME"
+        self.ur3_home_button = QPushButton(
+            "MOVE UR3 TO HOME"
         )
 
-        self.ur5_home_button.setEnabled(
+        self.ur3_home_button.setEnabled(
             False
         )
 
-        self.ur5_home_button.clicked.connect(
-            lambda: self.move_to_home("ur5")
+        self.ur3_home_button.clicked.connect(
+            lambda: self.move_to_home("ur3")
         )
 
-        self.ur5_home_button.setToolTip(
-            "Move the UR5 to its saved HOME joint configuration."
+        self.ur3_home_button.setToolTip(
+            "Move the UR3 to its saved HOME joint configuration."
         )
 
-        ur5_layout.addWidget(
-            self.ur5_home_button
+        ur3_layout.addWidget(
+            self.ur3_home_button
         )
 
         main_layout.addWidget(
-            self.ur5_group
+            self.ur3_group
         )
 
         # =====================================================
@@ -3768,10 +3768,10 @@ class WorkcellUI(QMainWindow):
 
         single = (
             self.setup_combo.currentText()
-            == "Single UR5"
+            == "Single UR3"
         )
 
-        self.ur5_group.setVisible(
+        self.ur3_group.setVisible(
             single
         )
 
@@ -3934,18 +3934,18 @@ class WorkcellUI(QMainWindow):
         )
 
     # =========================================================
-    # UR5 ping
+    # UR3 ping
     # =========================================================
 
-    def test_ur5_connection(self):
+    def test_ur3_connection(self):
 
         self.start_ping(
-            self.ur5_ip.text().strip(),
-            self.ur5_ping_process,
-            self.ur5_connection_status,
+            self.ur3_ip.text().strip(),
+            self.ur3_ping_process,
+            self.ur3_connection_status,
         )
 
-    def ur5_ping_finished(
+    def ur3_ping_finished(
         self,
         exit_code,
         exit_status
@@ -3954,14 +3954,14 @@ class WorkcellUI(QMainWindow):
         if exit_code == 0:
 
             self.set_connection_status(
-                self.ur5_connection_status,
+                self.ur3_connection_status,
                 "REACHABLE"
             )
 
         else:
 
             self.set_connection_status(
-                self.ur5_connection_status,
+                self.ur3_connection_status,
                 "OFFLINE"
             )
 
@@ -4752,7 +4752,7 @@ class WorkcellUI(QMainWindow):
             )
 
     def update_home_buttons(self):
-        """Update UR5 HOME and Dual-UR7e MOVE ROBOT controls."""
+        """Update UR3 HOME and Dual-UR7e MOVE ROBOT controls."""
 
         system_running = (
             self.status_label.text() == "RUNNING"
@@ -4769,10 +4769,10 @@ class WorkcellUI(QMainWindow):
 
         single = (
             self.setup_combo.currentText()
-            == "Single UR5"
+            == "Single UR3"
         )
 
-        self.ur5_home_button.setEnabled(
+        self.ur3_home_button.setEnabled(
             system_running
             and motion_idle
             and single
@@ -4809,13 +4809,13 @@ class WorkcellUI(QMainWindow):
         )
 
     def move_to_home(self, target):
-        """Legacy UR5 HOME entry point; dual robots use saved_pose safely."""
+        """Legacy UR3 HOME entry point; dual robots use saved_pose safely."""
 
         if target in ("robot1", "robot2"):
             self.move_robot_to_pose(target, "home")
             return
 
-        if target != "ur5":
+        if target != "ur3":
             return
 
         if self.status_label.text() != "RUNNING":
@@ -4830,8 +4830,8 @@ class WorkcellUI(QMainWindow):
         if self.mode_combo.currentText() == "Real Robot(s)":
             answer = QMessageBox.question(
                 self,
-                "Move UR5 to HOME",
-                "Move UR5 to its saved HOME position?",
+                "Move UR3 to HOME",
+                "Move UR3 to its saved HOME position?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -4844,7 +4844,7 @@ class WorkcellUI(QMainWindow):
 
         command = (
             "ros2 run ur7e_tools home_pose "
-            "--target ur5 --move --duration 5.0"
+            "--target ur3 --move --duration 5.0"
         )
 
         full_command = (
@@ -4854,8 +4854,8 @@ class WorkcellUI(QMainWindow):
         )
 
         self.active_setup_motion = (
-            "ur5_home",
-            "ur5",
+            "ur3_home",
+            "ur3",
             "home",
         )
         self.setup_motion_output_buffer = ""
@@ -4864,7 +4864,7 @@ class WorkcellUI(QMainWindow):
             f"\n$ {command}\n"
         )
 
-        self.ur5_home_button.setEnabled(False)
+        self.ur3_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
 
@@ -4983,7 +4983,7 @@ class WorkcellUI(QMainWindow):
         )
 
         # Serialize setup motion: never allow a second robot move in parallel.
-        self.ur5_home_button.setEnabled(False)
+        self.ur3_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
 
@@ -5042,7 +5042,7 @@ class WorkcellUI(QMainWindow):
                 )
             else:
                 self.log_output.appendPlainText(
-                    "\n[HOME completed: ur5]"
+                    f"\n[HOME completed: ur3]"
                 )
         else:
             blocked = "MOVE BLOCKED" in output
@@ -6186,17 +6186,17 @@ class WorkcellUI(QMainWindow):
 
         if (
             self.setup_combo.currentText()
-            == "Single UR5"
+            == "Single UR3"
         ):
 
-            ip = self.ur5_ip.text().strip()
+            ip = self.ur3_ip.text().strip()
 
             if not self.valid_ip(ip):
 
                 QMessageBox.warning(
                     self,
                     "Invalid IP",
-                    f"Invalid UR5 IP address:\n{ip}",
+                    f"Invalid UR3 IP address:\n{ip}",
                 )
 
                 return False
@@ -6252,22 +6252,22 @@ class WorkcellUI(QMainWindow):
 
         if (
             self.setup_combo.currentText()
-            == "Single UR5"
+            == "Single UR3"
         ):
 
             robot_type = (
-                self.ur5_type.currentText()
+                self.ur3_type.currentText()
             )
 
             robot_ip = (
-                self.ur5_ip.text().strip()
+                self.ur3_ip.text().strip()
             )
 
             command = [
                 "ros2",
                 "launch",
                 "ur7e_tools",
-                "single_ur5.launch.py",
+                "single_ur3.launch.py",
                 f"ur_type:={robot_type}",
                 f"robot_ip:={robot_ip}",
                 f"use_fake_hardware:={fake}",
@@ -6501,11 +6501,11 @@ class WorkcellUI(QMainWindow):
             False
         )
 
-        self.ur5_type.setEnabled(
+        self.ur3_type.setEnabled(
             False
         )
 
-        self.ur5_ip.setEnabled(
+        self.ur3_ip.setEnabled(
             False
         )
 
@@ -6574,11 +6574,11 @@ class WorkcellUI(QMainWindow):
             True
         )
 
-        self.ur5_type.setEnabled(
+        self.ur3_type.setEnabled(
             True
         )
 
-        self.ur5_ip.setEnabled(
+        self.ur3_ip.setEnabled(
             True
         )
 
@@ -6600,7 +6600,7 @@ class WorkcellUI(QMainWindow):
             "Workcell is stopped.",
         )
 
-        self.ur5_home_button.setEnabled(False)
+        self.ur3_home_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
 
