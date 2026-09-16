@@ -1887,6 +1887,29 @@ class WorkcellUI(QMainWindow):
         robot1_actions.addWidget(
             QLabel("Gripper:")
         )
+
+        self.robot1_gripper_combo = QComboBox()
+        self.robot1_gripper_combo.addItems([
+            "OnRobot 2FG7",
+            "Robotiq 2F-140",
+        ])
+        self.robot1_gripper_combo.setCurrentText(
+            "OnRobot 2FG7"
+        )
+        self.robot1_gripper_combo.setMinimumWidth(145)
+        self.robot1_gripper_combo.setToolTip(
+            "Select Robot 1 gripper before START SYSTEM. "
+            "The selector applies to Simulation and Real Robot mode. "
+            "Real Robotiq motion control is intentionally disabled until "
+            "its physical backend is configured."
+        )
+        self.robot1_gripper_combo.currentIndexChanged.connect(
+            self.update_gripper_buttons
+        )
+        robot1_actions.addWidget(
+            self.robot1_gripper_combo
+        )
+
         robot1_actions.addWidget(
             QLabel("0.0")
         )
@@ -1900,7 +1923,7 @@ class WorkcellUI(QMainWindow):
         self.robot1_gripper_slider.setSingleStep(1)
         self.robot1_gripper_slider.setPageStep(10)
         self.robot1_gripper_slider.setToolTip(
-            "2FG7 command value: 0.0 = closed, 1.0 = open."
+            "Normalized gripper command: 0.0 = closed, 1.0 = open."
         )
         robot1_actions.addWidget(
             self.robot1_gripper_slider,
@@ -1935,8 +1958,9 @@ class WorkcellUI(QMainWindow):
             )
         )
         self.robot1_gripper_move_button.setToolTip(
-            "Send the selected 0.0-1.0 command to Robot 1 2FG7. "
-            "Simulation: RViz. Real: physical gripper + RViz."
+            "Send the selected 0.0-1.0 command to Robot 1 gripper. "
+            "Simulation supports OnRobot and Robotiq visualization. "
+            "Real motion is currently enabled only for OnRobot 2FG7."
         )
         robot1_actions.addWidget(
             self.robot1_gripper_move_button
@@ -2039,6 +2063,29 @@ class WorkcellUI(QMainWindow):
         robot2_actions.addWidget(
             QLabel("Gripper:")
         )
+
+        self.robot2_gripper_combo = QComboBox()
+        self.robot2_gripper_combo.addItems([
+            "OnRobot 2FG7",
+            "Robotiq 2F-140",
+        ])
+        self.robot2_gripper_combo.setCurrentText(
+            "OnRobot 2FG7"
+        )
+        self.robot2_gripper_combo.setMinimumWidth(145)
+        self.robot2_gripper_combo.setToolTip(
+            "Select Robot 2 gripper before START SYSTEM. "
+            "The selector applies to Simulation and Real Robot mode. "
+            "Real Robotiq motion control is intentionally disabled until "
+            "its physical backend is configured."
+        )
+        self.robot2_gripper_combo.currentIndexChanged.connect(
+            self.update_gripper_buttons
+        )
+        robot2_actions.addWidget(
+            self.robot2_gripper_combo
+        )
+
         robot2_actions.addWidget(
             QLabel("0.0")
         )
@@ -2052,7 +2099,7 @@ class WorkcellUI(QMainWindow):
         self.robot2_gripper_slider.setSingleStep(1)
         self.robot2_gripper_slider.setPageStep(10)
         self.robot2_gripper_slider.setToolTip(
-            "2FG7 command value: 0.0 = closed, 1.0 = open."
+            "Normalized gripper command: 0.0 = closed, 1.0 = open."
         )
         robot2_actions.addWidget(
             self.robot2_gripper_slider,
@@ -2087,8 +2134,9 @@ class WorkcellUI(QMainWindow):
             )
         )
         self.robot2_gripper_move_button.setToolTip(
-            "Send the selected 0.0-1.0 command to Robot 2 2FG7. "
-            "Simulation: RViz. Real: physical gripper + RViz."
+            "Send the selected 0.0-1.0 command to Robot 2 gripper. "
+            "Simulation supports OnRobot and Robotiq visualization. "
+            "Real motion is currently enabled only for OnRobot 2FG7."
         )
         robot2_actions.addWidget(
             self.robot2_gripper_move_button
@@ -5473,6 +5521,13 @@ class WorkcellUI(QMainWindow):
             self.robot_ready["robot1"]
             and self.robot_ready["robot2"]
         )
+        real_gripper_backend_ready = (
+            not real_mode
+            or (
+                self._dual_gripper_type("robot1") == "onrobot"
+                and self._dual_gripper_type("robot2") == "onrobot"
+            )
+        )
 
         enabled = (
             dual
@@ -5481,7 +5536,17 @@ class WorkcellUI(QMainWindow):
             and analysis_idle
             and setup_idle
             and (not real_mode or robots_ready)
+            and real_gripper_backend_ready
         )
+
+        if real_mode and not real_gripper_backend_ready:
+            self.run_experiment_button.setToolTip(
+                "Real experiments are blocked while a Robotiq 2F-140 is "
+                "selected because its physical command backend is not "
+                "configured yet."
+            )
+        else:
+            self.run_experiment_button.setToolTip("")
         self.run_experiment_button.setEnabled(enabled)
 
         analysis_has_trial = (
@@ -5685,6 +5750,25 @@ class WorkcellUI(QMainWindow):
         real_mode = (
             self.mode_combo.currentText() == "Real Robot(s)"
         )
+
+        if (
+            real_mode
+            and (
+                self._dual_gripper_type("robot1") == "robotiq"
+                or self._dual_gripper_type("robot2") == "robotiq"
+            )
+        ):
+            QMessageBox.information(
+                self,
+                "Robotiq real backend not configured",
+                (
+                    "A Robotiq 2F-140 is selected for the real Dual UR7e "
+                    "setup. The robot system may be launched for validation, "
+                    "but experiment execution is blocked until the physical "
+                    "Robotiq command backend is configured."
+                ),
+            )
+            return
 
         if real_mode:
             if not (
@@ -6322,8 +6406,23 @@ class WorkcellUI(QMainWindow):
             self.experiment_process.terminate()
 
     # =========================================================
-    # 2FG7 gripper control
+    # Dual gripper control
     # =========================================================
+
+    def _dual_gripper_type(self, robot):
+
+        if robot == "robot1":
+            combo = self.robot1_gripper_combo
+        elif robot == "robot2":
+            combo = self.robot2_gripper_combo
+        else:
+            raise ValueError(f"Unknown robot: {robot}")
+
+        return (
+            "onrobot"
+            if combo.currentText() == "OnRobot 2FG7"
+            else "robotiq"
+        )
 
     def update_gripper_buttons(self):
 
@@ -6363,8 +6462,18 @@ class WorkcellUI(QMainWindow):
             and self.mode_combo.currentText() == "Real Robot(s)"
         )
 
+        robot1_real_backend_ready = (
+            not dual_real
+            or self._dual_gripper_type("robot1") == "onrobot"
+        )
+        robot2_real_backend_ready = (
+            not dual_real
+            or self._dual_gripper_type("robot2") == "onrobot"
+        )
+
         self.robot1_gripper_move_button.setEnabled(
             base_enabled
+            and robot1_real_backend_ready
             and (
                 not dual_real
                 or self.robot_ready["robot1"]
@@ -6372,20 +6481,51 @@ class WorkcellUI(QMainWindow):
         )
         self.robot2_gripper_move_button.setEnabled(
             base_enabled
+            and robot2_real_backend_ready
             and (
                 not dual_real
                 or self.robot_ready["robot2"]
             )
         )
 
-        slider_enabled = (
+        slider_base_enabled = (
             dual
             and command_idle
             and setup_motion_idle
             and experiment_idle
         )
-        self.robot1_gripper_slider.setEnabled(slider_enabled)
-        self.robot2_gripper_slider.setEnabled(slider_enabled)
+        self.robot1_gripper_slider.setEnabled(
+            slider_base_enabled
+            and robot1_real_backend_ready
+        )
+        self.robot2_gripper_slider.setEnabled(
+            slider_base_enabled
+            and robot2_real_backend_ready
+        )
+
+        if dual_real and not robot1_real_backend_ready:
+            self.robot1_gripper_move_button.setToolTip(
+                "Real Robotiq 2F-140 control is not configured yet. "
+                "The UR7e and Robotiq model can still be launched."
+            )
+        else:
+            self.robot1_gripper_move_button.setToolTip(
+                "Send the selected 0.0-1.0 command to Robot 1 gripper. "
+                "Simulation supports OnRobot and Robotiq visualization. "
+                "Real motion is currently enabled only for OnRobot 2FG7."
+            )
+
+        if dual_real and not robot2_real_backend_ready:
+            self.robot2_gripper_move_button.setToolTip(
+                "Real Robotiq 2F-140 control is not configured yet. "
+                "The UR7e and Robotiq model can still be launched."
+            )
+        else:
+            self.robot2_gripper_move_button.setToolTip(
+                "Send the selected 0.0-1.0 command to Robot 2 gripper. "
+                "Simulation supports OnRobot and Robotiq visualization. "
+                "Real motion is currently enabled only for OnRobot 2FG7."
+            )
 
     def command_gripper_position(self, robot, value):
 
@@ -6408,8 +6548,26 @@ class WorkcellUI(QMainWindow):
         if robot not in ("robot1", "robot2"):
             return
 
-        if (
+        gripper_type = self._dual_gripper_type(robot)
+        real_mode = (
             self.mode_combo.currentText() == "Real Robot(s)"
+        )
+
+        if real_mode and gripper_type == "robotiq":
+            QMessageBox.information(
+                self,
+                "Robotiq real control not configured",
+                (
+                    f"{robot} is configured with a Robotiq 2F-140.\n\n"
+                    "The real UR7e and Robotiq model can be launched, but "
+                    "physical Robotiq OPEN/CLOSE/MOVE control has not been "
+                    "configured yet. No gripper command was sent."
+                ),
+            )
+            return
+
+        if (
+            real_mode
             and not self.robot_ready[robot]
         ):
             self.show_robot_not_ready_warning(robot)
@@ -6417,15 +6575,17 @@ class WorkcellUI(QMainWindow):
 
         value = max(0.0, min(1.0, float(value)))
 
-        simulation = (
-            self.mode_combo.currentText() == "Simulation"
-        )
+        simulation = not real_mode
 
         workspace_setup = os.path.expanduser(
             "~/ros2_ws/install/setup.bash"
         )
 
-        visual_topic = f"/{robot}/gripper_visual/position"
+        if gripper_type == "onrobot":
+            visual_topic = f"/{robot}/gripper_visual/position"
+        else:
+            visual_topic = f"/{robot}/robotiq_visual/position"
+
         visual_command = (
             f"timeout 3s ros2 topic pub --once {visual_topic} "
             "std_msgs/msg/Float64 "
@@ -6435,6 +6595,8 @@ class WorkcellUI(QMainWindow):
         if simulation:
             command = visual_command
         else:
+            # Real Robotiq is blocked above. Keep the validated OnRobot
+            # analog-output backend exactly as before.
             real_service = (
                 f"/{robot}/io_and_status_controller/"
                 "set_analog_output"
@@ -6622,6 +6784,8 @@ class WorkcellUI(QMainWindow):
         else:
             robot1_ip = self.robot1_ip.text().strip()
             robot2_ip = self.robot2_ip.text().strip()
+            robot1_gripper_type = self._dual_gripper_type("robot1")
+            robot2_gripper_type = self._dual_gripper_type("robot2")
             command = [
                 "ros2",
                 "launch",
@@ -6629,6 +6793,8 @@ class WorkcellUI(QMainWindow):
                 "dual_ur7e.launch.py",
                 f"robot1_ip:={robot1_ip}",
                 f"robot2_ip:={robot2_ip}",
+                f"robot1_gripper_type:={robot1_gripper_type}",
+                f"robot2_gripper_type:={robot2_gripper_type}",
                 f"use_fake_hardware:={fake}",
                 "launch_rviz:=true",
             ]
@@ -6858,10 +7024,12 @@ class WorkcellUI(QMainWindow):
         self.robot1_ip.setEnabled(
             False
         )
+        self.robot1_gripper_combo.setEnabled(False)
 
         self.robot2_ip.setEnabled(
             False
         )
+        self.robot2_gripper_combo.setEnabled(False)
 
         if self.setup_combo.currentText() == "Dual UR7e":
             if self.mode_combo.currentText() == "Simulation":
@@ -6930,10 +7098,12 @@ class WorkcellUI(QMainWindow):
         self.robot1_ip.setEnabled(
             True
         )
+        self.robot1_gripper_combo.setEnabled(True)
 
         self.robot2_ip.setEnabled(
             True
         )
+        self.robot2_gripper_combo.setEnabled(True)
 
         self.wrench_listener.set_health_monitor_enabled(False)
         self.system_session_started_at = None

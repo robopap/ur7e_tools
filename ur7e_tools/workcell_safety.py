@@ -153,46 +153,138 @@ def build_robot_q(
 
     q = np.zeros(scene.model.nq)
 
-    values = {
-        f"{scene.name}_{joint}": float(value)
-        for joint, value in zip(
-            ARM_JOINTS,
-            arm_q,
-        )
-    }
+    # Pinocchio getJointId() does not provide a safe "not found -> 0"
+    # contract for this use.  Work from the model's actual joint names first
+    # so that a missing gripper-family joint can never produce an out-of-range
+    # access into model.joints.
+    model_joint_names = set(
+        str(name)
+        for name in scene.model.names
+    )
 
-    # 2FG7 mimic:
-    # right_finger_joint =
-    # 1.0 * gripper_joint
-    values[
-        f"{scene.name}_gripper_gripper_joint"
-    ] = float(gripper_position)
+    def set_joint(
+        joint_name,
+        value,
+        *,
+        required=False,
+    ):
+        if joint_name not in model_joint_names:
+            if required:
+                raise RuntimeError(
+                    f"Joint not found: {joint_name}"
+                )
+            return False
 
-    values[
-        f"{scene.name}_gripper_right_finger_joint"
-    ] = float(gripper_position)
-
-    for joint_name, value in values.items():
         jid = scene.model.getJointId(
             joint_name
         )
 
-        if jid == 0:
+        if (
+            jid <= 0
+            or jid >= scene.model.njoints
+        ):
             raise RuntimeError(
-                f"Joint not found: {joint_name}"
+                f"Invalid joint id for "
+                f"{joint_name}: {jid}"
             )
 
         joint = scene.model.joints[jid]
 
+        # Some Pinocchio versions can represent URDF mimic joints without
+        # allocating an independent configuration variable.  In that case
+        # there is nothing to write into q for that mimic joint.
+        if joint.nq == 0:
+            return True
+
         if joint.nq != 1:
             raise RuntimeError(
-                f"{joint_name}: expected nq=1"
+                f"{joint_name}: expected nq=1 "
+                f"or mimic nq=0, got {joint.nq}"
             )
 
-        q[joint.idx_q] = value
+        q[joint.idx_q] = float(value)
+        return True
+
+    # UR arm joints: always required.
+    for joint, value in zip(
+        ARM_JOINTS,
+        arm_q,
+    ):
+        set_joint(
+            f"{scene.name}_{joint}",
+            value,
+            required=True,
+        )
+
+    # ---------------------------------------------------------
+    # Gripper joints
+    # ---------------------------------------------------------
+    #
+    # OnRobot 2FG7:
+    #   gripper_gripper_joint is the commanded joint.
+    #   right_finger_joint follows it with multiplier +1.
+    #
+    # Robotiq 2F-140:
+    #   finger_joint is the commanded joint.
+    #   The remaining revolute joints are URDF mimic joints:
+    #       right_outer_knuckle  = -finger
+    #       left_inner_knuckle   = -finger
+    #       left_inner_finger    = +finger
+    #       right_inner_knuckle  = -finger
+    #       right_inner_finger   = +finger
+    #
+    # We explicitly populate any independent mimic joints that Pinocchio
+    # exposes.  If Pinocchio represents a mimic with nq=0, set_joint()
+    # intentionally leaves q unchanged for that joint.
+
+    onrobot_main = (
+        f"{scene.name}_gripper_gripper_joint"
+    )
+    robotiq_main = (
+        f"{scene.name}_gripper_finger_joint"
+    )
+
+    if onrobot_main in model_joint_names:
+        set_joint(
+            onrobot_main,
+            gripper_position,
+            required=True,
+        )
+        set_joint(
+            f"{scene.name}_gripper_right_finger_joint",
+            gripper_position,
+        )
+
+    elif robotiq_main in model_joint_names:
+        p = float(gripper_position)
+
+        set_joint(
+            robotiq_main,
+            p,
+            required=True,
+        )
+
+        robotiq_mimics = {
+            f"{scene.name}_gripper_right_outer_knuckle_joint": -p,
+            f"{scene.name}_gripper_left_inner_knuckle_joint": -p,
+            f"{scene.name}_gripper_left_inner_finger_joint": p,
+            f"{scene.name}_gripper_right_inner_knuckle_joint": -p,
+            f"{scene.name}_gripper_right_inner_finger_joint": p,
+        }
+
+        for joint_name, value in robotiq_mimics.items():
+            set_joint(
+                joint_name,
+                value,
+            )
+
+    else:
+        raise RuntimeError(
+            f"{scene.name}: supported gripper joint "
+            "not found in Pinocchio model"
+        )
 
     return q
-
 
 def update_robot_scene(scene, q):
     pin.updateGeometryPlacements(

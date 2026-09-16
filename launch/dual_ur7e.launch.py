@@ -7,7 +7,7 @@ from launch.actions import (
     IncludeLaunchDescription,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import PushRosNamespace, Node
 from launch.conditions import IfCondition
 
@@ -22,6 +22,8 @@ def generate_launch_description():
     robot2_ip = LaunchConfiguration("robot2_ip")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
     use_wrist_camera = LaunchConfiguration("use_wrist_camera")
+    robot1_gripper_type = LaunchConfiguration("robot1_gripper_type")
+    robot2_gripper_type = LaunchConfiguration("robot2_gripper_type")
     robot1_x = LaunchConfiguration("robot1_x")
     robot1_y = LaunchConfiguration("robot1_y")
     robot1_z = LaunchConfiguration("robot1_z")
@@ -38,6 +40,19 @@ def generate_launch_description():
 
     own_share = get_package_share_directory("ur7e_tools")
 
+    robot1_onrobot_selected = IfCondition(
+        PythonExpression(["'", robot1_gripper_type, "' == 'onrobot'"])
+    )
+    robot1_robotiq_selected = IfCondition(
+        PythonExpression(["'", robot1_gripper_type, "' == 'robotiq'"])
+    )
+    robot2_onrobot_selected = IfCondition(
+        PythonExpression(["'", robot2_gripper_type, "' == 'onrobot'"])
+    )
+    robot2_robotiq_selected = IfCondition(
+        PythonExpression(["'", robot2_gripper_type, "' == 'robotiq'"])
+    )
+
     gripper_visualizer_robot1 = Node(
         package="ur7e_tools",
         executable="gripper_visualizer",
@@ -50,6 +65,22 @@ def generate_launch_description():
                     "robot1_gripper_gripper_joint"
             }
         ],
+        condition=robot1_onrobot_selected,
+    )
+
+    robotiq_visualizer_robot1 = Node(
+        package="ur7e_tools",
+        executable="robotiq_gripper_visualizer",
+        namespace="robot1",
+        name="robotiq_gripper_visualizer",
+        output="screen",
+        parameters=[
+            {
+                "gripper_joint_name":
+                    "robot1_gripper_finger_joint"
+            }
+        ],
+        condition=robot1_robotiq_selected,
     )
 
     gripper_visualizer_robot2 = Node(
@@ -64,6 +95,22 @@ def generate_launch_description():
                     "robot2_gripper_gripper_joint"
             }
         ],
+        condition=robot2_onrobot_selected,
+    )
+
+    robotiq_visualizer_robot2 = Node(
+        package="ur7e_tools",
+        executable="robotiq_gripper_visualizer",
+        namespace="robot2",
+        name="robotiq_gripper_visualizer",
+        output="screen",
+        parameters=[
+            {
+                "gripper_joint_name":
+                    "robot2_gripper_finger_joint"
+            }
+        ],
+        condition=robot2_robotiq_selected,
     )
 
     rviz_config = os.path.join(    own_share,    "config",    "dual_ur7e.rviz",)
@@ -96,22 +143,26 @@ def generate_launch_description():
     robot1_kinematics = os.path.join(own_share, "config", "calibration", "robot1_ur7e_calibration.yaml")
     robot2_kinematics = os.path.join(own_share, "config", "calibration", "robot2_ur7e_calibration.yaml")
 
-    ur_launch = os.path.join(
+    onrobot_ur_launch = os.path.join(
         own_share,
         "launch",
         "ur_control_namespaced.launch.py",
     )
+    robotiq_ur_launch = os.path.join(
+        own_share,
+        "launch",
+        "ur_control_namespaced_robotiq.launch.py",
+    )
 
-    robot1 = GroupAction(
+    robot1_onrobot = GroupAction(
         actions=[
             PushRosNamespace("robot1"),
-
             IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(ur_launch),
+                PythonLaunchDescriptionSource(onrobot_ur_launch),
+                condition=robot1_onrobot_selected,
                 launch_arguments={
                     "ur_type": "ur7e",
                     "robot_ip": robot1_ip,
-
                     "tf_prefix": "robot1_",
                     "use_2fg7": "true",
                     "use_wrist_camera": use_wrist_camera,
@@ -121,18 +172,13 @@ def generate_launch_description():
                     "base_roll": robot1_roll,
                     "base_pitch": robot1_pitch,
                     "base_yaw": robot1_yaw,
-
                     "controllers_file": robot1_controllers,
                     "kinematics_params_file": robot1_kinematics,
-
                     "use_fake_hardware": use_fake_hardware,
                     "fake_sensor_commands": "true",
-
                     "initial_joint_controller":
                         "joint_trajectory_controller",
-
                     "launch_rviz": "false",
-
                     "reverse_port": "50001",
                     "script_sender_port": "50002",
                     "trajectory_port": "50003",
@@ -142,16 +188,49 @@ def generate_launch_description():
         ]
     )
 
-    robot2 = GroupAction(
+    robot1_robotiq = GroupAction(
+        actions=[
+            PushRosNamespace("robot1"),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(robotiq_ur_launch),
+                condition=robot1_robotiq_selected,
+                launch_arguments={
+                    "ur_type": "ur7e",
+                    "robot_ip": robot1_ip,
+                    "tf_prefix": "robot1_",
+                    "use_2fg7": "false",
+                    "use_wrist_camera": use_wrist_camera,
+                    "base_x": robot1_x,
+                    "base_y": robot1_y,
+                    "base_z": robot1_z,
+                    "base_roll": robot1_roll,
+                    "base_pitch": robot1_pitch,
+                    "base_yaw": robot1_yaw,
+                    "controllers_file": robot1_controllers,
+                    "kinematics_params_file": robot1_kinematics,
+                    "use_fake_hardware": use_fake_hardware,
+                    "fake_sensor_commands": "true",
+                    "initial_joint_controller":
+                        "joint_trajectory_controller",
+                    "launch_rviz": "false",
+                    "reverse_port": "50001",
+                    "script_sender_port": "50002",
+                    "trajectory_port": "50003",
+                    "script_command_port": "50004",
+                }.items(),
+            ),
+        ]
+    )
+
+    robot2_onrobot = GroupAction(
         actions=[
             PushRosNamespace("robot2"),
-
             IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(ur_launch),
+                PythonLaunchDescriptionSource(onrobot_ur_launch),
+                condition=robot2_onrobot_selected,
                 launch_arguments={
                     "ur_type": "ur7e",
                     "robot_ip": robot2_ip,
-
                     "tf_prefix": "robot2_",
                     "use_2fg7": "true",
                     "use_wrist_camera": use_wrist_camera,
@@ -161,18 +240,47 @@ def generate_launch_description():
                     "base_roll": robot2_roll,
                     "base_pitch": robot2_pitch,
                     "base_yaw": robot2_yaw,
-
                     "controllers_file": robot2_controllers,
                     "kinematics_params_file": robot2_kinematics,
-
                     "use_fake_hardware": use_fake_hardware,
                     "fake_sensor_commands": "true",
-
                     "initial_joint_controller":
                         "joint_trajectory_controller",
-
                     "launch_rviz": "false",
+                    "reverse_port": "50011",
+                    "script_sender_port": "50012",
+                    "trajectory_port": "50013",
+                    "script_command_port": "50014",
+                }.items(),
+            ),
+        ]
+    )
 
+    robot2_robotiq = GroupAction(
+        actions=[
+            PushRosNamespace("robot2"),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(robotiq_ur_launch),
+                condition=robot2_robotiq_selected,
+                launch_arguments={
+                    "ur_type": "ur7e",
+                    "robot_ip": robot2_ip,
+                    "tf_prefix": "robot2_",
+                    "use_2fg7": "false",
+                    "use_wrist_camera": use_wrist_camera,
+                    "base_x": robot2_x,
+                    "base_y": robot2_y,
+                    "base_z": robot2_z,
+                    "base_roll": robot2_roll,
+                    "base_pitch": robot2_pitch,
+                    "base_yaw": robot2_yaw,
+                    "controllers_file": robot2_controllers,
+                    "kinematics_params_file": robot2_kinematics,
+                    "use_fake_hardware": use_fake_hardware,
+                    "fake_sensor_commands": "true",
+                    "initial_joint_controller":
+                        "joint_trajectory_controller",
+                    "launch_rviz": "false",
                     "reverse_port": "50011",
                     "script_sender_port": "50012",
                     "trajectory_port": "50013",
@@ -187,6 +295,16 @@ def generate_launch_description():
         DeclareLaunchArgument("robot2_ip", default_value="127.0.0.1"),
         DeclareLaunchArgument("use_fake_hardware", default_value="true"),
         DeclareLaunchArgument("use_wrist_camera", default_value="true"),
+        DeclareLaunchArgument(
+            "robot1_gripper_type",
+            default_value="onrobot",
+            choices=["onrobot", "robotiq"],
+        ),
+        DeclareLaunchArgument(
+            "robot2_gripper_type",
+            default_value="onrobot",
+            choices=["onrobot", "robotiq"],
+        ),
         DeclareLaunchArgument("launch_rviz", default_value="true"),
         DeclareLaunchArgument("robot1_x", default_value="0.27"),
         DeclareLaunchArgument("robot1_y", default_value="0.275"),
@@ -206,9 +324,13 @@ def generate_launch_description():
         DeclareLaunchArgument("robot2_yaw", default_value="-1.5708"),
 
         workcell_state_publisher,
-        robot1,
-        robot2,
+        robot1_onrobot,
+        robot1_robotiq,
+        robot2_onrobot,
+        robot2_robotiq,
         rviz_node,
         gripper_visualizer_robot1,
+        robotiq_visualizer_robot1,
         gripper_visualizer_robot2,
+        robotiq_visualizer_robot2,
     ])

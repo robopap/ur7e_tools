@@ -139,10 +139,6 @@ class LiveWorkcellSafety:
             robot,
         )
 
-        name = (
-            f"{robot}_gripper_gripper_joint"
-        )
-
         values = dict(
             zip(
                 msg.name,
@@ -150,13 +146,22 @@ class LiveWorkcellSafety:
             )
         )
 
-        if name not in values:
-            raise RuntimeError(
-                f"{robot}: gripper state "
-                "not available in visual_joint_states"
-            )
+        # Keep the existing OnRobot 2FG7 path unchanged, but also
+        # accept the Robotiq 2F-140 main joint used by its visualizer.
+        candidate_names = [
+            f"{robot}_gripper_gripper_joint",
+            f"{robot}_gripper_finger_joint",
+        ]
 
-        return float(values[name])
+        for name in candidate_names:
+            if name in values:
+                return float(values[name])
+
+        raise RuntimeError(
+            f"{robot}: gripper state not available in "
+            "visual_joint_states; expected one of: "
+            + ", ".join(candidate_names)
+        )
 
     def get_robot_description(self, robot):
         remote = (

@@ -68,7 +68,7 @@ def generate_launch_description():
     robotiq_control_launch = os.path.join(
         own_share,
         "launch",
-        "ur_control_single_ur7e_robotiq.launch.py",
+        "ur_control_namespaced_robotiq.launch.py",
     )
 
     common_args = {
@@ -81,7 +81,6 @@ def generate_launch_description():
         "use_fake_hardware": use_fake_hardware,
         "fake_sensor_commands": "true",
         "initial_joint_controller": "joint_trajectory_controller",
-        "controller_spawner_settle_time": "1.0",
         "launch_rviz": "false",
         "reverse_port": "50001",
         "script_sender_port": "50002",
