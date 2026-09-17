@@ -80,8 +80,12 @@ RUN source /opt/ros/humble/setup.bash && \
         robotiq_description
 
 COPY docker_windows/start_container.sh /opt/ur7e_docker/start_container.sh
+COPY docker_windows/start_container_wslg.sh /opt/ur7e_docker/start_container_wslg.sh
 COPY docker_windows/patch_dual_reverse_ip.py /opt/ur7e_docker/patch_dual_reverse_ip.py
-RUN chmod +x /opt/ur7e_docker/start_container.sh
+
+RUN chmod +x \
+    /opt/ur7e_docker/start_container.sh \
+    /opt/ur7e_docker/start_container_wslg.sh
 
 ENV DISPLAY=:1 \
     QT_QPA_PLATFORM=xcb \

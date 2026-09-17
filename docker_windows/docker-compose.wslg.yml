@@ -1,0 +1,44 @@
+name: ur7e-tools-windows-wslg
+
+services:
+  workcell:
+    build:
+      context: ..
+      dockerfile: docker_windows/Dockerfile
+    image: ur7e-tools-windows:humble
+    container_name: ur7e_tools_windows_wslg
+
+    entrypoint:
+      - /opt/ur7e_docker/start_container_wslg.sh
+
+    environment:
+      UR_REVERSE_IP: ${UR_REVERSE_IP:-0.0.0.0}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+
+      DISPLAY: :0
+      QT_QPA_PLATFORM: xcb
+      QT_X11_NO_MITSHM: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+
+    ports:
+      - "50001:50001/tcp"
+      - "50002:50002/tcp"
+      - "50003:50003/tcp"
+      - "50004:50004/tcp"
+
+      - "50011:50011/tcp"
+      - "50012:50012/tcp"
+      - "50013:50013/tcp"
+      - "50014:50014/tcp"
+
+      - "33333:33333/udp"
+
+    volumes:
+      - ..:/root/ros2_ws/src/ur7e_tools
+      - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
+
+    shm_size: "1gb"
+    stdin_open: true
+    tty: true
+    restart: "no"
