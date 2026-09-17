@@ -4,6 +4,7 @@ import argparse
 import re
 import sys
 import time
+import os
 from pathlib import Path
 
 import yaml
@@ -46,10 +47,21 @@ TARGETS = {
 }
 
 
-CONFIG_DIR = (
-    Path(__file__).resolve().parents[1]
+SOURCE_CONFIG_DIR = (
+    Path.home()
+    / "ros2_ws"
+    / "src"
+    / "ur7e_tools"
     / "config"
 )
+
+if SOURCE_CONFIG_DIR.is_dir():
+    CONFIG_DIR = SOURCE_CONFIG_DIR
+else:
+    CONFIG_DIR = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+    )
 
 START_HOLD_SEC = 1.0
 DEFAULT_DURATION_SEC = 5.0

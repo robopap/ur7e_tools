@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import rclpy
 
+from ament_index_python.packages import get_package_share_directory
 from rcl_interfaces.srv import GetParameters
 from sensor_msgs.msg import JointState
 
@@ -17,8 +18,7 @@ from ur7e_tools.workcell_safety import (
     load_table_scene,
 )
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(get_package_share_directory("ur7e_tools"))
 
 ROBOT_ROBOT_MARGIN_M = 0.0
 TABLE_MARGIN_M = 0.0

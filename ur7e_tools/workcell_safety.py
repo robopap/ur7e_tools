@@ -8,11 +8,15 @@ import coal
 import numpy as np
 import pinocchio as pin
 import yaml
-
+import os
 
 PACKAGE_DIRS = [
-    "/home/mines/ros2_ws/src",
-    "/opt/ros/humble/share",
+    str(Path(prefix) / "share")
+    for prefix in os.environ.get(
+        "AMENT_PREFIX_PATH",
+        "",
+    ).split(os.pathsep)
+    if prefix
 ]
 
 ARM_JOINTS = [

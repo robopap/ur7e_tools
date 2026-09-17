@@ -1,0 +1,42 @@
+name: ur7e-tools-windows
+
+services:
+  workcell:
+    build:
+      context: ..
+      dockerfile: docker_windows/Dockerfile
+    image: ur7e-tools-windows:humble
+    container_name: ur7e_tools_windows
+    environment:
+      UR_REVERSE_IP: ${UR_REVERSE_IP:-0.0.0.0}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      DISPLAY: :1
+      QT_QPA_PLATFORM: xcb
+      QT_X11_NO_MITSHM: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+    ports:
+      # Browser-only access to the Linux desktop/UI.
+      - "127.0.0.1:6080:6080/tcp"
+
+      # UR1 reverse/script/trajectory/script-command ports.
+      - "50001:50001/tcp"
+      - "50002:50002/tcp"
+      - "50003:50003/tcp"
+      - "50004:50004/tcp"
+
+      # UR2 reverse/script/trajectory/script-command ports.
+      - "50011:50011/tcp"
+      - "50012:50012/tcp"
+      - "50013:50013/tcp"
+      - "50014:50014/tcp"
+
+      # Current NANSENSE UDP receiver port.
+      - "33333:33333/udp"
+    volumes:
+      # The repository remains on Windows and is mounted into the Linux ROS 2 workspace.
+      - ..:/root/ros2_ws/src/ur7e_tools
+    shm_size: "1gb"
+    stdin_open: true
+    tty: true
+    restart: "no"
