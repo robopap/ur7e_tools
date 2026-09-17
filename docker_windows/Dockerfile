@@ -46,6 +46,9 @@ RUN git clone --depth 1 \
       https://github.com/touchlab-avatarx/onrobot_2fg7_description.git \
       /root/ros2_ws/src/onrobot_2fg7_description
 
+RUN git clone --recurse-submodules https://github.com/robotiq/ros.git \
+    /root/ros2_ws/src/robotiq_ros
+
 # Read dependency declarations from the checked-out ur7e_tools repository.
 COPY package.xml /tmp/ur7e_pkg/package.xml
 COPY requirements.txt /tmp/ur7e_pkg/requirements.txt
@@ -56,7 +59,9 @@ RUN apt-get update && \
     if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then rosdep init; fi && \
     rosdep update && \
     source /opt/ros/humble/setup.bash && \
-    rosdep install --from-paths /tmp/ur7e_pkg --ignore-src -r -y && \
+    rosdep install \
+        --from-paths /tmp/ur7e_pkg /root/ros2_ws/src/robotiq_ros \
+        --ignore-src -r -y && \
     rm -rf /var/lib/apt/lists/*
 
 # Keep the same dedicated Python environment used by the native Ubuntu setup.
@@ -69,7 +74,10 @@ RUN python3 -m venv --system-site-packages /root/venvs/ur7e_ui && \
 # Build the external description package once into the image.
 RUN source /opt/ros/humble/setup.bash && \
     cd /root/ros2_ws && \
-    colcon build --packages-select onrobot_2fg7_description
+    colcon build \
+        --packages-up-to \
+        onrobot_2fg7_description \
+        robotiq_description
 
 COPY docker_windows/start_container.sh /opt/ur7e_docker/start_container.sh
 COPY docker_windows/patch_dual_reverse_ip.py /opt/ur7e_docker/patch_dual_reverse_ip.py
