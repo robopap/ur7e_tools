@@ -5,6 +5,7 @@ import ipaddress
 import glob
 import json
 import math
+import numpy as np
 import os
 import shlex
 import shutil
@@ -23,13 +24,14 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import Point, WrenchStamped
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
 from visualization_msgs.msg import Marker, MarkerArray
 
 from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractScrollArea,
@@ -67,6 +69,27 @@ FORCE_BAR_LIMIT = 50.0
 TORQUE_BAR_LIMIT = 5.0
 WRENCH_UI_REFRESH_MS = 50
 WRENCH_STALE_SEC = 0.5
+
+CAMERA_UI_REFRESH_MS = 67
+CAMERA_STALE_SEC = 0.75
+CAMERA_CONFIG = {
+    "camera1": {
+        "display_name": "Camera 1",
+        "serial": "832112071651",
+        "namespace": "robot1",
+        "tf_prefix": "robot1_",
+        "color_topic": "/robot1/camera/color/image_raw",
+        "depth_topic": "/robot1/camera/depth/image_rect_raw",
+    },
+    "camera2": {
+        "display_name": "Camera 2",
+        "serial": "141722070904",
+        "namespace": "robot2",
+        "tf_prefix": "robot2_",
+        "color_topic": "/robot2/camera/color/image_raw",
+        "depth_topic": "/robot2/camera/depth/image_rect_raw",
+    },
+}
 
 NANSENSE_MARKER_TOPIC = "/nansense/skeleton_markers"
 NANSENSE_RAW_TOPIC = "/nansense/raw_frame"
@@ -293,7 +316,7 @@ class CenteredBar(QWidget):
         self.value = 0.0
 
         self.setMinimumHeight(16)
-        self.setMinimumWidth(110)
+        self.setMinimumWidth(60)
         self.setToolTip(f"Visual scale: ±{self.max_abs:g}")
 
     def set_value(self, value):
@@ -421,6 +444,14 @@ class WrenchListenerNode(Node):
         "external": "/external_ft",
     }
 
+    CAMERA_TOPICS = {
+        camera_key: {
+            "color": config["color_topic"],
+            "depth": config["depth_topic"],
+        }
+        for camera_key, config in CAMERA_CONFIG.items()
+    }
+
     PROGRAM_TOPICS = {
         "robot1": "/robot1/io_and_status_controller/robot_program_running",
         "robot2": "/robot2/io_and_status_controller/robot_program_running",
@@ -441,6 +472,7 @@ class WrenchListenerNode(Node):
 
         self._lock = threading.Lock()
         self._latest = {}
+        self._latest_cameras = {}
         self._program_states = {}
         self._robot_modes = {}
         self._recordings = {}
@@ -505,6 +537,17 @@ class WrenchListenerNode(Node):
                 qos_profile_sensor_data,
             )
             self._subscriptions.append(subscription)
+
+        for camera_key, stream_topics in self.CAMERA_TOPICS.items():
+            for stream_name, topic in stream_topics.items():
+                subscription = self.create_subscription(
+                    Image,
+                    topic,
+                    lambda msg, camera_key=camera_key, stream_name=stream_name:
+                        self._camera_callback(camera_key, stream_name, msg),
+                    qos_profile_sensor_data,
+                )
+                self._subscriptions.append(subscription)
 
         # Use VOLATILE depth-1 subscriptions for runtime robot state.
         # Readiness accepts only samples received after START SYSTEM, so a
@@ -1071,6 +1114,21 @@ class WrenchListenerNode(Node):
                             f"CSV recording error for {key}: {exc}"
                         )
 
+    def _camera_callback(self, key, stream_name, msg):
+        with self._lock:
+            streams = self._latest_cameras.setdefault(key, {})
+            streams[stream_name] = (
+                time.monotonic(),
+                msg,
+            )
+
+    def camera_snapshot(self):
+        with self._lock:
+            return {
+                camera_key: dict(streams)
+                for camera_key, streams in self._latest_cameras.items()
+            }
+
     def snapshot(self):
         with self._lock:
             return dict(self._latest)
@@ -1299,6 +1357,36 @@ class WorkcellUI(QMainWindow):
         self.analysis_report_paths = []
 
         # -----------------------------------------------------
+        # Wrist RealSense camera processes
+        # -----------------------------------------------------
+
+        self.camera_processes = {}
+        self.camera_stopping = {
+            key: False for key in CAMERA_CONFIG
+        }
+
+        for camera_key in CAMERA_CONFIG:
+            process = QProcess(self)
+            process.setProcessChannelMode(QProcess.MergedChannels)
+            process.readyReadStandardOutput.connect(
+                lambda camera_key=camera_key:
+                    self.read_camera_output(camera_key)
+            )
+            process.started.connect(
+                lambda camera_key=camera_key:
+                    self.camera_process_started(camera_key)
+            )
+            process.finished.connect(
+                lambda exit_code, exit_status, camera_key=camera_key:
+                    self.camera_process_finished(
+                        camera_key,
+                        exit_code,
+                        exit_status,
+                    )
+            )
+            self.camera_processes[camera_key] = process
+
+        # -----------------------------------------------------
         # Per-robot readiness state for the current UI-owned launch
         # -----------------------------------------------------
 
@@ -1416,6 +1504,13 @@ class WorkcellUI(QMainWindow):
             self.refresh_wrench_display
         )
         self.wrench_refresh_timer.start()
+
+        self.camera_refresh_timer = QTimer(self)
+        self.camera_refresh_timer.setInterval(CAMERA_UI_REFRESH_MS)
+        self.camera_refresh_timer.timeout.connect(
+            self.refresh_camera_display
+        )
+        self.camera_refresh_timer.start()
 
         # Robot READY state is refreshed independently from the wrench UI.
         self.robot_state_timer = QTimer(self)
@@ -2164,11 +2259,11 @@ class WorkcellUI(QMainWindow):
         experiment_layout.setSpacing(8)
 
         # -----------------------------------------------------
-        # Experiment execution row
+        # Experiment execution + compact analysis row
         # -----------------------------------------------------
 
         experiment_controls_layout = QHBoxLayout()
-        experiment_controls_layout.setSpacing(8)
+        experiment_controls_layout.setSpacing(5)
 
         experiment_controls_layout.addWidget(QLabel("Task:"))
         self.experiment_task_combo = QComboBox()
@@ -2219,7 +2314,7 @@ class WorkcellUI(QMainWindow):
         self.experiment_speed_spin.setDecimals(2)
         self.experiment_speed_spin.setValue(0.20)
         self.experiment_speed_spin.setSuffix(" ×")
-        self.experiment_speed_spin.setFixedWidth(90)
+        self.experiment_speed_spin.setFixedWidth(82)
         self.experiment_speed_spin.setToolTip(
             "Experiment trajectory speed scale. "
             "1.00 = expert timing; 0.20 = five times slower."
@@ -2244,36 +2339,25 @@ class WorkcellUI(QMainWindow):
         self.experiment_status_label.setObjectName(
             "connectionUnknown"
         )
-        self.experiment_status_label.setMinimumWidth(82)
+        self.experiment_status_label.setMinimumWidth(68)
         experiment_controls_layout.addWidget(
             self.experiment_status_label
         )
 
-        experiment_controls_layout.addStretch()
-        experiment_layout.addLayout(
-            experiment_controls_layout
-        )
-
-        # -----------------------------------------------------
-        # Analysis row
-        # -----------------------------------------------------
-
-        analysis_layout = QHBoxLayout()
-        analysis_layout.setSpacing(8)
-
-        analysis_layout.addWidget(QLabel("Analysis trial:"))
+        experiment_controls_layout.addSpacing(8)
+        experiment_controls_layout.addWidget(QLabel("Trial:"))
 
         self.analysis_trial_combo = QComboBox()
         self.analysis_trial_combo.setObjectName(
             "analysisTrialCombo"
         )
-        self.analysis_trial_combo.setMinimumContentsLength(38)
+        self.analysis_trial_combo.setMinimumWidth(150)
+        self.analysis_trial_combo.setMaximumWidth(220)
         self.analysis_trial_combo.setToolTip(
             "Choose a completed experiment trial to analyze."
         )
-        analysis_layout.addWidget(
-            self.analysis_trial_combo,
-            1,
+        experiment_controls_layout.addWidget(
+            self.analysis_trial_combo
         )
 
         self.refresh_analysis_button = QPushButton("REFRESH")
@@ -2285,7 +2369,7 @@ class WorkcellUI(QMainWindow):
                 preserve_selection=True
             )
         )
-        analysis_layout.addWidget(
+        experiment_controls_layout.addWidget(
             self.refresh_analysis_button
         )
 
@@ -2294,7 +2378,7 @@ class WorkcellUI(QMainWindow):
         self.analyze_trial_button.clicked.connect(
             self.analyze_selected_trial
         )
-        analysis_layout.addWidget(
+        experiment_controls_layout.addWidget(
             self.analyze_trial_button
         )
 
@@ -2302,12 +2386,15 @@ class WorkcellUI(QMainWindow):
         self.analysis_status_label.setObjectName(
             "connectionUnknown"
         )
-        self.analysis_status_label.setMinimumWidth(82)
-        analysis_layout.addWidget(
+        self.analysis_status_label.setMinimumWidth(64)
+        experiment_controls_layout.addWidget(
             self.analysis_status_label
         )
 
-        experiment_layout.addLayout(analysis_layout)
+        experiment_controls_layout.addStretch(1)
+        experiment_layout.addLayout(
+            experiment_controls_layout
+        )
 
         for combo in (
             self.experiment_task_combo,
@@ -2542,8 +2629,9 @@ class WorkcellUI(QMainWindow):
 
         # =====================================================
         # LOWER WORKSPACE
-        # Left: F/T + ROS output
-        # Right: live NANSENSE skeleton
+        # Left: compact F/T + ROS output (25%)
+        # Center: live NANSENSE skeleton (37.5%)
+        # Right: Camera 1 / Camera 2 stacked vertically (37.5%)
         # =====================================================
 
         self.lower_workspace_splitter = QSplitter(Qt.Horizontal)
@@ -2557,7 +2645,7 @@ class WorkcellUI(QMainWindow):
 
         # Keep expanding sensor/ROS sections from changing the
         # top-level window minimum height. If the left column needs
-        # more vertical space, it scrolls inside its own half instead.
+        # more vertical space, it scrolls inside its own pane instead.
         sensor_scroll = QScrollArea()
         sensor_scroll.setObjectName("sensorScroll")
         sensor_scroll.setWidget(sensor_column)
@@ -2584,6 +2672,7 @@ class WorkcellUI(QMainWindow):
         sensor_scroll.setSizeAdjustPolicy(
             QAbstractScrollArea.AdjustIgnored
         )
+        sensor_scroll.setMinimumWidth(280)
 
         self.nansense_widget = NansenseLiveWidget(
             frame_callback=self.wrench_listener.update_nansense_frame,
@@ -2594,18 +2683,126 @@ class WorkcellUI(QMainWindow):
                 self.wrench_listener.publish_nansense_raw_frame
             ),
         )
-        self.nansense_widget.setMinimumWidth(650)
+        self.nansense_widget.setMinimumWidth(300)
 
-        sensor_scroll.setMinimumWidth(430)
+        # Camera workspace shell. Camera 1 and Camera 2 are intentionally
+        # always visible beside NANSENSE for the Dual UR7e setup. The live
+        # RealSense process/subscription backend is connected separately.
+        self.camera_column = QWidget()
+        self.camera_column.setObjectName("cameraWorkspace")
+        camera_column_layout = QVBoxLayout(self.camera_column)
+        camera_column_layout.setContentsMargins(0, 0, 0, 0)
+        camera_column_layout.setSpacing(5)
+
+        camera_workspace_header = QHBoxLayout()
+        camera_workspace_title = QLabel("CAMERAS")
+        camera_workspace_title.setObjectName("cameraWorkspaceTitle")
+        camera_workspace_header.addWidget(camera_workspace_title)
+        camera_workspace_header.addStretch(1)
+
+        self.camera_workspace_status = QLabel("OFF")
+        self.camera_workspace_status.setObjectName("connectionUnknown")
+        camera_workspace_header.addWidget(self.camera_workspace_status)
+        camera_column_layout.addLayout(camera_workspace_header)
+
+        self.camera_splitter = QSplitter(Qt.Vertical)
+        self.camera_splitter.setChildrenCollapsible(False)
+        self.camera_splitter.setHandleWidth(7)
+
+        self.camera_preview_labels = {}
+        self.camera_status_labels = {}
+        self.camera_action_buttons = {}
+
+        for camera_key, config in CAMERA_CONFIG.items():
+            camera_frame = QFrame()
+            camera_frame.setObjectName("cameraPanel")
+            camera_layout = QVBoxLayout(camera_frame)
+            camera_layout.setContentsMargins(7, 7, 7, 7)
+            camera_layout.setSpacing(6)
+
+            camera_header = QHBoxLayout()
+            camera_title = QLabel(config["display_name"])
+            camera_title.setObjectName("cameraTitle")
+            camera_header.addWidget(camera_title)
+            camera_header.addStretch(1)
+
+            camera_button = QPushButton("START")
+            camera_button.clicked.connect(
+                lambda checked=False, camera_key=camera_key:
+                    self.toggle_camera(camera_key)
+            )
+            camera_header.addWidget(camera_button)
+
+            camera_status = QLabel("OFF")
+            camera_status.setObjectName("connectionUnknown")
+            camera_header.addWidget(camera_status)
+            camera_layout.addLayout(camera_header)
+
+            stream_row = QHBoxLayout()
+            stream_row.setContentsMargins(0, 0, 0, 0)
+            stream_row.setSpacing(6)
+
+            stream_previews = {}
+            for stream_name, stream_title in (
+                ("color", "RGB 640×480"),
+                ("depth", "DEPTH 640×480"),
+            ):
+                stream_frame = QFrame()
+                stream_frame.setObjectName("cameraStreamPanel")
+                stream_layout = QVBoxLayout(stream_frame)
+                stream_layout.setContentsMargins(0, 0, 0, 0)
+                stream_layout.setSpacing(3)
+
+                title_label = QLabel(stream_title)
+                title_label.setObjectName("cameraStreamTitle")
+                title_label.setAlignment(Qt.AlignCenter)
+                stream_layout.addWidget(title_label)
+
+                preview = QLabel("STREAM INACTIVE")
+                preview.setObjectName("cameraPreviewPlaceholder")
+                preview.setAlignment(Qt.AlignCenter)
+                preview.setMinimumSize(110, 90)
+                stream_layout.addWidget(preview, 1)
+
+                stream_row.addWidget(stream_frame, 1)
+                stream_previews[stream_name] = preview
+
+            camera_layout.addLayout(stream_row, 1)
+
+            self.camera_splitter.addWidget(camera_frame)
+            self.camera_preview_labels[camera_key] = stream_previews
+            self.camera_status_labels[camera_key] = camera_status
+            self.camera_action_buttons[camera_key] = camera_button
+
+        self.camera_splitter.setStretchFactor(0, 1)
+        self.camera_splitter.setStretchFactor(1, 1)
+        saved_camera_splitter = self.settings.value(
+            "camera_workspace_splitter"
+        )
+        if saved_camera_splitter is not None:
+            self.camera_splitter.restoreState(saved_camera_splitter)
+        else:
+            self.camera_splitter.setSizes([400, 400])
+
+        camera_column_layout.addWidget(self.camera_splitter, 1)
+        self.camera_column.setMinimumWidth(300)
+
         self.lower_workspace_splitter.addWidget(sensor_scroll)
         self.lower_workspace_splitter.addWidget(self.nansense_widget)
-        self.lower_workspace_splitter.setStretchFactor(0, 42)
-        self.lower_workspace_splitter.setStretchFactor(1, 58)
-        saved_splitter = self.settings.value("lower_workspace_splitter")
+        self.lower_workspace_splitter.addWidget(self.camera_column)
+
+        # 2:3:3 -> 25% / 37.5% / 37.5% at the default window width.
+        self.lower_workspace_splitter.setStretchFactor(0, 2)
+        self.lower_workspace_splitter.setStretchFactor(1, 3)
+        self.lower_workspace_splitter.setStretchFactor(2, 3)
+
+        # Use a new settings key because the old saved state described a
+        # two-pane splitter and should not distort the new three-pane layout.
+        saved_splitter = self.settings.value("lower_workspace_splitter_v2")
         if saved_splitter is not None:
             self.lower_workspace_splitter.restoreState(saved_splitter)
         else:
-            self.lower_workspace_splitter.setSizes([560, 780])
+            self.lower_workspace_splitter.setSizes([400, 600, 600])
 
         main_layout.addWidget(
             self.lower_workspace_splitter,
@@ -2669,8 +2866,15 @@ class WorkcellUI(QMainWindow):
             self.recording_folder_button
         )
 
-        sensor_layout.addWidget(
+        self.recording_settings_section = CollapsibleSection(
+            "Recording settings",
+            expanded=False,
+        )
+        self.recording_settings_section.body_layout.addWidget(
             self.recording_folder_frame
+        )
+        sensor_layout.addWidget(
+            self.recording_settings_section
         )
 
         # Internal UR7e sensors.
@@ -2778,12 +2982,12 @@ class WorkcellUI(QMainWindow):
         outer_layout.setContentsMargins(7, 5, 7, 5)
         outer_layout.setSpacing(4)
 
+        # Primary row: live state and sensor actions only. Recording controls
+        # are kept on their own compact row so the card remains usable when
+        # the left splitter pane is narrow.
         header_layout = QHBoxLayout()
         header_layout.setSpacing(5)
-
-        header_layout.addWidget(
-            QLabel("Status:")
-        )
+        header_layout.addWidget(QLabel("Status:"))
 
         status_label = QLabel(
             "STOPPED"
@@ -2799,8 +3003,7 @@ class WorkcellUI(QMainWindow):
         recording_label.setObjectName("recordingActive")
         recording_label.setVisible(False)
         header_layout.addWidget(recording_label)
-
-        header_layout.addStretch()
+        header_layout.addStretch(1)
 
         internal_zero_button = None
 
@@ -2864,6 +3067,11 @@ class WorkcellUI(QMainWindow):
                 internal_zero_button
             )
 
+        outer_layout.addLayout(header_layout)
+
+        recording_controls = QHBoxLayout()
+        recording_controls.setSpacing(5)
+
         view_button = QPushButton(
             "HIDE TORQUES"
         )
@@ -2872,9 +3080,9 @@ class WorkcellUI(QMainWindow):
         view_button.setToolTip(
             "Show or hide torque channels. Recording follows this selection."
         )
-        header_layout.addWidget(view_button)
-
-        header_layout.addWidget(QLabel("REC RATE:"))
+        recording_controls.addWidget(view_button)
+        recording_controls.addStretch(1)
+        recording_controls.addWidget(QLabel("REC RATE:"))
 
         rate_combo = QComboBox()
         rate_combo.addItem("100 Hz", 100)
@@ -2883,11 +3091,12 @@ class WorkcellUI(QMainWindow):
         rate_combo.addItem("20 Hz", 20)
         rate_combo.addItem("10 Hz", 10)
         rate_combo.setCurrentIndex(0)
+        rate_combo.setMaximumWidth(92)
         rate_combo.setToolTip(
             "CSV recording rate only. The wrench sensor and ROS topic "
             "continue running at the full ~100 Hz source rate."
         )
-        header_layout.addWidget(rate_combo)
+        recording_controls.addWidget(rate_combo)
 
         start_record_button = QPushButton(
             "START REC"
@@ -2903,7 +3112,7 @@ class WorkcellUI(QMainWindow):
             lambda checked=False, sensor_key=key:
                 self.start_wrench_recording(sensor_key)
         )
-        header_layout.addWidget(start_record_button)
+        recording_controls.addWidget(start_record_button)
 
         stop_record_button = QPushButton(
             "STOP REC"
@@ -2919,15 +3128,16 @@ class WorkcellUI(QMainWindow):
             lambda checked=False, sensor_key=key:
                 self.stop_wrench_recording(sensor_key)
         )
-        header_layout.addWidget(stop_record_button)
+        recording_controls.addWidget(stop_record_button)
+        outer_layout.addLayout(recording_controls)
 
-        outer_layout.addLayout(header_layout)
-
-        body_layout = QHBoxLayout()
-        body_layout.setSpacing(6)
+        # Forces and torques are stacked vertically instead of side-by-side.
+        # This costs a little height when torques are visible but removes the
+        # large horizontal minimum that made the telemetry unreadable after
+        # narrowing the splitter.
+        body_layout = QVBoxLayout()
+        body_layout.setSpacing(4)
         body_layout.setContentsMargins(0, 0, 0, 0)
-
-        # ---------------- Forces ----------------
 
         force_widget = QWidget()
         force_layout = QGridLayout(force_widget)
@@ -2944,8 +3154,6 @@ class WorkcellUI(QMainWindow):
             1,
             3,
         )
-
-        # ---------------- Torques ----------------
 
         torque_widget = QWidget()
         torque_layout = QGridLayout(torque_widget)
@@ -2983,7 +3191,7 @@ class WorkcellUI(QMainWindow):
         ):
             name_label = QLabel(display)
             value_label = QLabel("--")
-            value_label.setMinimumWidth(64)
+            value_label.setMinimumWidth(62)
             bar = CenteredBar(FORCE_BAR_LIMIT)
 
             force_layout.addWidget(name_label, row, 0)
@@ -2993,13 +3201,23 @@ class WorkcellUI(QMainWindow):
             labels[component] = value_label
             bars[component] = bar
 
+        magnitude_name = QLabel("|F|")
+        magnitude_label = QLabel("--")
+        magnitude_label.setObjectName("wrenchMagnitude")
+        magnitude_label.setToolTip(
+            "Force-vector magnitude sqrt(Fx² + Fy² + Fz²)."
+        )
+        force_layout.addWidget(magnitude_name, 4, 0)
+        force_layout.addWidget(magnitude_label, 4, 1)
+        force_layout.addWidget(QLabel("vector magnitude"), 4, 2)
+
         for row, (component, display) in enumerate(
             torque_components,
             start=1,
         ):
             name_label = QLabel(display)
             value_label = QLabel("--")
-            value_label.setMinimumWidth(72)
+            value_label.setMinimumWidth(70)
             bar = CenteredBar(TORQUE_BAR_LIMIT)
 
             torque_layout.addWidget(name_label, row, 0)
@@ -3012,8 +3230,8 @@ class WorkcellUI(QMainWindow):
         force_layout.setColumnStretch(2, 1)
         torque_layout.setColumnStretch(2, 1)
 
-        body_layout.addWidget(force_widget, 1)
-        body_layout.addWidget(torque_widget, 1)
+        body_layout.addWidget(force_widget)
+        body_layout.addWidget(torque_widget)
         outer_layout.addLayout(body_layout)
 
         self.wrench_panels[key] = {
@@ -3026,6 +3244,7 @@ class WorkcellUI(QMainWindow):
             "stop_record_button": stop_record_button,
             "force_widget": force_widget,
             "torque_widget": torque_widget,
+            "magnitude_label": magnitude_label,
             "labels": labels,
             "bars": bars,
         }
@@ -3132,6 +3351,15 @@ class WorkcellUI(QMainWindow):
                 value
             )
 
+        force_magnitude = math.sqrt(
+            values[0] ** 2
+            + values[1] ** 2
+            + values[2] ** 2
+        )
+        panel["magnitude_label"].setText(
+            f"{force_magnitude:.2f} N"
+        )
+
     def clear_wrench_values(
         self,
         key,
@@ -3148,6 +3376,8 @@ class WorkcellUI(QMainWindow):
             "bars"
         ].values():
             bar.set_value(0.0)
+
+        panel["magnitude_label"].setText("--")
 
     def refresh_wrench_display(self):
 
@@ -3273,6 +3503,367 @@ class WorkcellUI(QMainWindow):
         self.update_internal_ft_controls()
         self.update_external_ft_controls()
         self.update_recording_controls()
+
+    # =========================================================
+    # Wrist RealSense cameras
+    # =========================================================
+
+    def _set_camera_status(self, camera_key, text, state):
+        label = self.camera_status_labels[camera_key]
+        label.setText(text)
+        object_names = {
+            "live": "connectionReachable",
+            "waiting": "connectionTesting",
+            "off": "connectionUnknown",
+            "error": "connectionOffline",
+        }
+        label.setObjectName(
+            object_names.get(state, "connectionUnknown")
+        )
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _camera_stream_fresh(
+        self,
+        camera_key,
+        stream_name="color",
+        snapshot=None,
+    ):
+        if snapshot is None:
+            snapshot = self.wrench_listener.camera_snapshot()
+        streams = snapshot.get(camera_key, {})
+        data = streams.get(stream_name)
+        return (
+            data is not None
+            and time.monotonic() - data[0] <= CAMERA_STALE_SEC
+        )
+
+    def toggle_camera(self, camera_key):
+        process = self.camera_processes[camera_key]
+        if process.state() == QProcess.NotRunning:
+            self.start_camera(camera_key)
+        else:
+            self.stop_camera(camera_key)
+
+    def start_camera(self, camera_key):
+        if camera_key not in CAMERA_CONFIG:
+            return
+
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+
+        process = self.camera_processes[camera_key]
+        if process.state() != QProcess.NotRunning:
+            return
+
+        if self._camera_stream_fresh(camera_key):
+            return
+
+        config = CAMERA_CONFIG[camera_key]
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+        serial_arg = (
+            "serial_no:=\"'" + config["serial"] + "'\""
+        )
+        command = (
+            "ros2 launch realsense2_camera rs_launch.py "
+            f"camera_namespace:={config['namespace']} "
+            "camera_name:=camera "
+            f"{serial_arg} "
+            f"tf_prefix:={config['tf_prefix']} "
+            "publish_tf:=false "
+            "enable_depth:=true "
+            "enable_color:=true "
+            "rgb_camera.color_profile:=640x480x30 "
+            "depth_module.depth_profile:=640x480x30"
+        )
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && exec setsid {command}"
+        )
+
+        self.camera_stopping[camera_key] = False
+        self.log_output.appendPlainText(
+            f"\n$ {command}\n"
+        )
+        self._set_camera_status(camera_key, "STARTING", "waiting")
+        self.camera_action_buttons[camera_key].setEnabled(False)
+        process.start(
+            "/bin/bash",
+            ["-lc", full_command],
+        )
+
+    def stop_camera(self, camera_key):
+        process = self.camera_processes[camera_key]
+        if process.state() == QProcess.NotRunning:
+            return
+
+        self.camera_stopping[camera_key] = True
+        self._set_camera_status(camera_key, "STOPPING", "waiting")
+
+        pid = int(process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+        QTimer.singleShot(
+            1500,
+            lambda camera_key=camera_key:
+                self.force_stop_camera_if_needed(camera_key),
+        )
+
+    def force_stop_camera_if_needed(self, camera_key):
+        process = self.camera_processes[camera_key]
+        if process.state() == QProcess.NotRunning:
+            return
+
+        pid = int(process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def camera_process_started(self, camera_key):
+        self.camera_action_buttons[camera_key].setText("STOP")
+        self.camera_action_buttons[camera_key].setEnabled(True)
+        self._set_camera_status(camera_key, "WAITING", "waiting")
+
+    def camera_process_finished(
+        self,
+        camera_key,
+        exit_code,
+        exit_status,
+    ):
+        was_stopping = self.camera_stopping[camera_key]
+        self.camera_stopping[camera_key] = False
+        self.camera_action_buttons[camera_key].setText("START")
+        self.camera_action_buttons[camera_key].setEnabled(True)
+
+        if was_stopping or exit_code == 0:
+            self._set_camera_status(camera_key, "OFF", "off")
+        else:
+            self._set_camera_status(
+                camera_key,
+                f"ERROR ({exit_code})",
+                "error",
+            )
+
+        display_name = CAMERA_CONFIG[camera_key]["display_name"]
+        self.log_output.appendPlainText(
+            f"\n[{display_name} process stopped - exit code {exit_code}]"
+        )
+
+    def read_camera_output(self, camera_key):
+        process = self.camera_processes[camera_key]
+        text = bytes(
+            process.readAllStandardOutput()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+        if text:
+            display_name = CAMERA_CONFIG[camera_key]["display_name"]
+            self.log_output.appendPlainText(
+                f"[{display_name}] {text.rstrip()}"
+            )
+
+    @staticmethod
+    def _camera_message_to_qimage(msg):
+        formats = {
+            "rgb8": QImage.Format_RGB888,
+            "bgr8": QImage.Format_BGR888,
+            "mono8": QImage.Format_Grayscale8,
+        }
+        image_format = formats.get(msg.encoding.lower())
+        if image_format is None:
+            return None
+
+        return QImage(
+            memoryview(msg.data),
+            int(msg.width),
+            int(msg.height),
+            int(msg.step),
+            image_format,
+        ).copy()
+
+    @staticmethod
+    def _depth_message_to_qimage(msg):
+        """Colorize a Z16/16UC1 depth image for UI visualization only."""
+        if msg.encoding.lower() not in ("16uc1", "mono16"):
+            return None
+
+        width = int(msg.width)
+        height = int(msg.height)
+        row_values = int(msg.step) // 2
+        if width <= 0 or height <= 0 or row_values < width:
+            return None
+
+        depth = np.frombuffer(msg.data, dtype=np.uint16)
+        needed = height * row_values
+        if depth.size < needed:
+            return None
+
+        depth = depth[:needed].reshape(height, row_values)[:, :width]
+
+        # D4xx depth values are normally millimetre-scale units. A fixed
+        # visualization window avoids frame-to-frame color flicker while
+        # keeping the raw ROS depth topic untouched for later processing.
+        near_mm = 200.0
+        far_mm = 2500.0
+        valid = depth > 0
+        normalized = np.clip(
+            (depth.astype(np.float32) - near_mm) / (far_mm - near_mm),
+            0.0,
+            1.0,
+        )
+
+        # Compact jet-like map: close -> warm, far -> cool.
+        x = 1.0 - normalized
+        red = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
+        green = np.clip(1.5 - np.abs(4.0 * x - 2.0), 0.0, 1.0)
+        blue = np.clip(1.5 - np.abs(4.0 * x - 1.0), 0.0, 1.0)
+        rgb = np.stack((red, green, blue), axis=-1)
+        rgb = (rgb * 255.0).astype(np.uint8)
+        rgb[~valid] = 0
+        rgb = np.ascontiguousarray(rgb)
+
+        return QImage(
+            rgb.data,
+            width,
+            height,
+            int(rgb.strides[0]),
+            QImage.Format_RGB888,
+        ).copy()
+
+    @staticmethod
+    def _set_camera_preview(preview, image, unsupported_text):
+        if image is None:
+            preview.setPixmap(QPixmap())
+            preview.setText(unsupported_text)
+            return
+
+        pixmap = QPixmap.fromImage(image).scaled(
+            preview.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        preview.setText("")
+        preview.setPixmap(pixmap)
+
+    def refresh_camera_display(self):
+        if not hasattr(self, "camera_preview_labels"):
+            return
+
+        snapshot = self.wrench_listener.camera_snapshot()
+        live_count = 0
+
+        for camera_key, config in CAMERA_CONFIG.items():
+            process = self.camera_processes[camera_key]
+            previews = self.camera_preview_labels[camera_key]
+            button = self.camera_action_buttons[camera_key]
+            streams = snapshot.get(camera_key, {})
+
+            color_data = streams.get("color")
+            depth_data = streams.get("depth")
+            color_fresh = (
+                color_data is not None
+                and time.monotonic() - color_data[0] <= CAMERA_STALE_SEC
+            )
+            depth_fresh = (
+                depth_data is not None
+                and time.monotonic() - depth_data[0] <= CAMERA_STALE_SEC
+            )
+
+            if color_fresh:
+                color_image = self._camera_message_to_qimage(color_data[1])
+                self._set_camera_preview(
+                    previews["color"],
+                    color_image,
+                    f"UNSUPPORTED RGB ENCODING\n{color_data[1].encoding}",
+                )
+            else:
+                previews["color"].setPixmap(QPixmap())
+                previews["color"].setText(
+                    "WAITING FOR RGB..."
+                    if process.state() != QProcess.NotRunning
+                    else "STREAM INACTIVE"
+                )
+
+            if depth_fresh:
+                depth_image = self._depth_message_to_qimage(depth_data[1])
+                self._set_camera_preview(
+                    previews["depth"],
+                    depth_image,
+                    f"UNSUPPORTED DEPTH ENCODING\n{depth_data[1].encoding}",
+                )
+            else:
+                previews["depth"].setPixmap(QPixmap())
+                previews["depth"].setText(
+                    "WAITING FOR DEPTH..."
+                    if process.state() != QProcess.NotRunning
+                    else "STREAM INACTIVE"
+                )
+
+            both_fresh = color_fresh and depth_fresh
+            any_fresh = color_fresh or depth_fresh
+
+            if both_fresh:
+                live_count += 1
+                self._set_camera_status(camera_key, "LIVE", "live")
+                if process.state() == QProcess.NotRunning:
+                    button.setText("EXTERNAL")
+                    button.setEnabled(False)
+                else:
+                    button.setText("STOP")
+                    button.setEnabled(True)
+
+            elif process.state() != QProcess.NotRunning:
+                self._set_camera_status(camera_key, "WAITING", "waiting")
+                button.setText("STOP")
+                button.setEnabled(True)
+
+            elif any_fresh:
+                self._set_camera_status(camera_key, "EXTERNAL", "waiting")
+                button.setText("EXTERNAL")
+                button.setEnabled(False)
+
+            else:
+                self._set_camera_status(camera_key, "OFF", "off")
+                button.setText("START")
+                button.setEnabled(
+                    self.setup_combo.currentText() == "Dual UR7e"
+                )
+
+        if live_count == 2:
+            text = "2/2 LIVE"
+            state = "live"
+        elif live_count == 1:
+            text = "1/2 LIVE"
+            state = "waiting"
+        else:
+            text = "OFF"
+            state = "off"
+
+        self.camera_workspace_status.setText(text)
+        object_names = {
+            "live": "connectionReachable",
+            "waiting": "connectionTesting",
+            "off": "connectionUnknown",
+        }
+        self.camera_workspace_status.setObjectName(
+            object_names[state]
+        )
+        self.camera_workspace_status.style().unpolish(
+            self.camera_workspace_status
+        )
+        self.camera_workspace_status.style().polish(
+            self.camera_workspace_status
+        )
 
     # =========================================================
     # Wrench CSV recording
@@ -4151,6 +4742,9 @@ class WorkcellUI(QMainWindow):
             self.experiment_group.setVisible(dual)
             self.update_experiment_controls()
 
+        if hasattr(self, "camera_column"):
+            self.camera_column.setVisible(dual)
+
         if hasattr(self, "robots_ready_label"):
             self.robots_ready_label.setVisible(dual)
 
@@ -4167,8 +4761,8 @@ class WorkcellUI(QMainWindow):
             == "Real Robot(s)"
         )
 
-        if hasattr(self, "recording_folder_frame"):
-            self.recording_folder_frame.setVisible(dual_real)
+        if hasattr(self, "recording_settings_section"):
+            self.recording_settings_section.setVisible(dual_real)
 
         if hasattr(self, "internal_wrench_section"):
             self.internal_wrench_section.setVisible(dual_real)
@@ -7273,8 +7867,14 @@ class WorkcellUI(QMainWindow):
 
         if hasattr(self, "lower_workspace_splitter"):
             self.settings.setValue(
-                "lower_workspace_splitter",
+                "lower_workspace_splitter_v2",
                 self.lower_workspace_splitter.saveState(),
+            )
+
+        if hasattr(self, "camera_splitter"):
+            self.settings.setValue(
+                "camera_workspace_splitter",
+                self.camera_splitter.saveState(),
             )
 
         if (
@@ -7342,6 +7942,12 @@ class WorkcellUI(QMainWindow):
                 1000
             )
 
+        if hasattr(self, "camera_processes"):
+            for camera_key, process in self.camera_processes.items():
+                if process.state() != QProcess.NotRunning:
+                    self.stop_camera(camera_key)
+                    process.waitForFinished(2000)
+
         if hasattr(self, "wrench_listener"):
             self.wrench_listener.set_health_monitor_enabled(False)
 
@@ -7350,6 +7956,12 @@ class WorkcellUI(QMainWindow):
             "wrench_refresh_timer",
         ):
             self.wrench_refresh_timer.stop()
+
+        if hasattr(
+            self,
+            "camera_refresh_timer",
+        ):
+            self.camera_refresh_timer.stop()
 
         if hasattr(
             self,
@@ -7460,6 +8072,38 @@ class WorkcellUI(QMainWindow):
                 color: #80868b;
                 font-size: 14px;
                 font-weight: 600;
+            }
+
+            QLabel#cameraWorkspaceTitle {
+                font-size: 12px;
+                font-weight: 800;
+                color: #bdc1c6;
+                letter-spacing: 1px;
+            }
+
+            QFrame#cameraPanel {
+                background: #292a2d;
+                border: 1px solid #3c4043;
+                border-radius: 7px;
+            }
+
+            QLabel#cameraTitle {
+                font-size: 14px;
+                font-weight: 700;
+            }
+
+            QLabel#cameraPreviewPlaceholder {
+                background: #151618;
+                border: 1px solid #4a4d51;
+                border-radius: 6px;
+                color: #80868b;
+                font-size: 14px;
+                font-weight: 700;
+            }
+
+            QLabel#wrenchMagnitude {
+                font-weight: 800;
+                color: #e8eaed;
             }
 
             QLabel#tvTelemetryValue {
