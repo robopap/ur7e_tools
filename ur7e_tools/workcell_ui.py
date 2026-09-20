@@ -170,6 +170,7 @@ WORKCELL_PROCESS_MARKERS = (
     "gripper_visualizer",
     "rviz2",
     "ft_sensor",
+    "workcell_cloud_crop",
     "/controller_manager/spawner",
 )
 
@@ -1361,6 +1362,7 @@ class WorkcellUI(QMainWindow):
         # -----------------------------------------------------
 
         self.camera_processes = {}
+        self.camera_crop_processes = {}
         self.camera_stopping = {
             key: False for key in CAMERA_CONFIG
         }
@@ -1385,6 +1387,22 @@ class WorkcellUI(QMainWindow):
                     )
             )
             self.camera_processes[camera_key] = process
+
+            crop_process = QProcess(self)
+            crop_process.setProcessChannelMode(QProcess.MergedChannels)
+            crop_process.readyReadStandardOutput.connect(
+                lambda camera_key=camera_key:
+                    self.read_camera_crop_output(camera_key)
+            )
+            crop_process.finished.connect(
+                lambda exit_code, exit_status, camera_key=camera_key:
+                    self.camera_crop_process_finished(
+                        camera_key,
+                        exit_code,
+                        exit_status,
+                    )
+            )
+            self.camera_crop_processes[camera_key] = crop_process
 
         # -----------------------------------------------------
         # Per-robot readiness state for the current UI-owned launch
@@ -3576,7 +3594,10 @@ class WorkcellUI(QMainWindow):
             "enable_depth:=true "
             "enable_color:=true "
             "rgb_camera.color_profile:=640x480x30 "
-            "depth_module.depth_profile:=640x480x30"
+            "depth_module.depth_profile:=640x480x30 "
+            "pointcloud.enable:=true "
+            "decimation_filter.enable:=true "
+            "decimation_filter.filter_magnitude:=2"
         )
         full_command = (
             "source /opt/ros/humble/setup.bash"
@@ -3595,13 +3616,40 @@ class WorkcellUI(QMainWindow):
             ["-lc", full_command],
         )
 
-    def stop_camera(self, camera_key):
-        process = self.camera_processes[camera_key]
-        if process.state() == QProcess.NotRunning:
+    def start_camera_crop(self, camera_key):
+        if camera_key not in CAMERA_CONFIG:
             return
 
-        self.camera_stopping[camera_key] = True
-        self._set_camera_status(camera_key, "STOPPING", "waiting")
+        process = self.camera_crop_processes[camera_key]
+        if process.state() != QProcess.NotRunning:
+            return
+
+        config = CAMERA_CONFIG[camera_key]
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+        command = (
+            "python3 -m ur7e_tools.workcell_cloud_crop "
+            f"--robot {shlex.quote(config['namespace'])}"
+        )
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && exec setsid {command}"
+        )
+
+        self.log_output.appendPlainText(
+            f"\n$ {command}\n"
+        )
+        process.start(
+            "/bin/bash",
+            ["-lc", full_command],
+        )
+
+    def stop_camera_crop(self, camera_key):
+        process = self.camera_crop_processes[camera_key]
+        if process.state() == QProcess.NotRunning:
+            return
 
         pid = int(process.processId())
         if pid > 0:
@@ -3609,6 +3657,72 @@ class WorkcellUI(QMainWindow):
                 os.killpg(pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
+
+        QTimer.singleShot(
+            1500,
+            lambda camera_key=camera_key:
+                self.force_stop_camera_crop_if_needed(camera_key),
+        )
+
+    def force_stop_camera_crop_if_needed(self, camera_key):
+        process = self.camera_crop_processes[camera_key]
+        if process.state() == QProcess.NotRunning:
+            return
+
+        pid = int(process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def camera_crop_process_finished(
+        self,
+        camera_key,
+        exit_code,
+        exit_status,
+    ):
+        display_name = CAMERA_CONFIG[camera_key]["display_name"]
+        self.log_output.appendPlainText(
+            f"\n[{display_name} point-cloud crop stopped "
+            f"- exit code {exit_code}]"
+        )
+
+    def read_camera_crop_output(self, camera_key):
+        process = self.camera_crop_processes[camera_key]
+        text = bytes(
+            process.readAllStandardOutput()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+        if text:
+            display_name = CAMERA_CONFIG[camera_key]["display_name"]
+            self.log_output.appendPlainText(
+                f"[{display_name} crop] {text.rstrip()}"
+            )
+
+    def stop_camera(self, camera_key):
+        process = self.camera_processes[camera_key]
+        crop_process = self.camera_crop_processes[camera_key]
+        if (
+            process.state() == QProcess.NotRunning
+            and crop_process.state() == QProcess.NotRunning
+        ):
+            return
+
+        self.camera_stopping[camera_key] = True
+        self._set_camera_status(camera_key, "STOPPING", "waiting")
+
+        if process.state() != QProcess.NotRunning:
+            pid = int(process.processId())
+            if pid > 0:
+                try:
+                    os.killpg(pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+
+        self.stop_camera_crop(camera_key)
 
         QTimer.singleShot(
             1500,
@@ -3632,6 +3746,7 @@ class WorkcellUI(QMainWindow):
         self.camera_action_buttons[camera_key].setText("STOP")
         self.camera_action_buttons[camera_key].setEnabled(True)
         self._set_camera_status(camera_key, "WAITING", "waiting")
+        self.start_camera_crop(camera_key)
 
     def camera_process_finished(
         self,
@@ -3639,6 +3754,7 @@ class WorkcellUI(QMainWindow):
         exit_code,
         exit_status,
     ):
+        self.stop_camera_crop(camera_key)
         was_stopping = self.camera_stopping[camera_key]
         self.camera_stopping[camera_key] = False
         self.camera_action_buttons[camera_key].setText("START")
@@ -7946,6 +8062,12 @@ class WorkcellUI(QMainWindow):
             for camera_key, process in self.camera_processes.items():
                 if process.state() != QProcess.NotRunning:
                     self.stop_camera(camera_key)
+                    process.waitForFinished(2000)
+
+        if hasattr(self, "camera_crop_processes"):
+            for camera_key, process in self.camera_crop_processes.items():
+                if process.state() != QProcess.NotRunning:
+                    self.stop_camera_crop(camera_key)
                     process.waitForFinished(2000)
 
         if hasattr(self, "wrench_listener"):
