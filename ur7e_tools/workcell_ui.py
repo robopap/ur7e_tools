@@ -2149,6 +2149,48 @@ class WorkcellUI(QMainWindow):
             robot1_actions
         )
 
+
+
+        # -----------------------------------------------------
+        # Robot 1 Cartesian micro-jog (ROBOT BASE frame)
+        # -----------------------------------------------------
+        robot1_jog_layout = QHBoxLayout()
+        robot1_jog_layout.setSpacing(4)
+        robot1_jog_layout.addWidget(QLabel("Base jog:"))
+
+        self.robot1_jog_step_combo = QComboBox()
+        self.robot1_jog_step_combo.addItem("5 mm", 5)
+        self.robot1_jog_step_combo.addItem("10 mm", 10)
+        self.robot1_jog_step_combo.addItem("20 mm", 20)
+        self.robot1_jog_step_combo.setCurrentText("10 mm")
+        robot1_jog_layout.addWidget(self.robot1_jog_step_combo)
+
+        self.robot1_jog_buttons = []
+        for axis in ("x", "y", "z"):
+            for direction, suffix in ((-1, "-"), (1, "+")):
+                button = QPushButton(f"{axis.upper()}{suffix}")
+                button.setEnabled(False)
+                button.setMaximumWidth(42)
+                button.clicked.connect(
+                    lambda checked=False, axis=axis, direction=direction:
+                    self.jog_robot_base("robot1", axis, direction)
+                )
+                self.robot1_jog_buttons.append(button)
+                robot1_jog_layout.addWidget(button)
+
+        robot1_jog_layout.addWidget(QLabel("Save pose:"))
+        self.robot1_pose_name_edit = QLineEdit("jewelry_approach")
+        self.robot1_pose_name_edit.setMinimumWidth(120)
+        robot1_jog_layout.addWidget(self.robot1_pose_name_edit, 1)
+
+        self.robot1_save_pose_button = QPushButton("SAVE")
+        self.robot1_save_pose_button.setEnabled(False)
+        self.robot1_save_pose_button.clicked.connect(
+            lambda: self.save_robot_current_pose("robot1")
+        )
+        robot1_jog_layout.addWidget(self.robot1_save_pose_button)
+        robot1_layout.addLayout(robot1_jog_layout)
+
         dual_layout.addWidget(
             robot1_box,
             1,
@@ -2324,6 +2366,47 @@ class WorkcellUI(QMainWindow):
         robot2_layout.addLayout(
             robot2_actions
         )
+
+
+        # -----------------------------------------------------
+        # Robot 2 Cartesian micro-jog (ROBOT BASE frame)
+        # -----------------------------------------------------
+        robot2_jog_layout = QHBoxLayout()
+        robot2_jog_layout.setSpacing(4)
+        robot2_jog_layout.addWidget(QLabel("Base jog:"))
+
+        self.robot2_jog_step_combo = QComboBox()
+        self.robot2_jog_step_combo.addItem("5 mm", 5)
+        self.robot2_jog_step_combo.addItem("10 mm", 10)
+        self.robot2_jog_step_combo.addItem("20 mm", 20)
+        self.robot2_jog_step_combo.setCurrentText("10 mm")
+        robot2_jog_layout.addWidget(self.robot2_jog_step_combo)
+
+        self.robot2_jog_buttons = []
+        for axis in ("x", "y", "z"):
+            for direction, suffix in ((-1, "-"), (1, "+")):
+                button = QPushButton(f"{axis.upper()}{suffix}")
+                button.setEnabled(False)
+                button.setMaximumWidth(42)
+                button.clicked.connect(
+                    lambda checked=False, axis=axis, direction=direction:
+                    self.jog_robot_base("robot2", axis, direction)
+                )
+                self.robot2_jog_buttons.append(button)
+                robot2_jog_layout.addWidget(button)
+
+        robot2_jog_layout.addWidget(QLabel("Save pose:"))
+        self.robot2_pose_name_edit = QLineEdit("anchor_adjusted")
+        self.robot2_pose_name_edit.setMinimumWidth(120)
+        robot2_jog_layout.addWidget(self.robot2_pose_name_edit, 1)
+
+        self.robot2_save_pose_button = QPushButton("SAVE")
+        self.robot2_save_pose_button.setEnabled(False)
+        self.robot2_save_pose_button.clicked.connect(
+            lambda: self.save_robot_current_pose("robot2")
+        )
+        robot2_jog_layout.addWidget(self.robot2_save_pose_button)
+        robot2_layout.addLayout(robot2_jog_layout)
 
         dual_layout.addWidget(
             robot2_box,
@@ -6038,6 +6121,149 @@ class WorkcellUI(QMainWindow):
             and robot2_ready
         )
 
+
+
+        for robot in ("robot1", "robot2"):
+            ready = self.robot_ready[robot] if dual_real else True
+            jog_enabled = system_running and motion_idle and dual and ready
+
+            for button in getattr(self, f"{robot}_jog_buttons", []):
+                button.setEnabled(jog_enabled)
+
+            combo = getattr(self, f"{robot}_jog_step_combo", None)
+            if combo is not None:
+                combo.setEnabled(jog_enabled)
+
+            edit = getattr(self, f"{robot}_pose_name_edit", None)
+            if edit is not None:
+                edit.setEnabled(jog_enabled)
+
+            save = getattr(self, f"{robot}_save_pose_button", None)
+            if save is not None:
+                save.setEnabled(jog_enabled)
+
+    def jog_robot_base(self, robot, axis, direction):
+        if robot not in ("robot1", "robot2"):
+            return
+        if axis not in ("x", "y", "z") or direction not in (-1, 1):
+            return
+        if self.status_label.text() != "RUNNING":
+            return
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+        if (
+            self.home_process.state() != QProcess.NotRunning
+            or self.gripper_process.state() != QProcess.NotRunning
+            or self.experiment_process.state() != QProcess.NotRunning
+        ):
+            return
+
+        real_mode = self.mode_combo.currentText() == "Real Robot(s)"
+        if real_mode and not self.robot_ready[robot]:
+            self.show_robot_not_ready_warning(robot)
+            return
+
+        step_mm = int(getattr(self, f"{robot}_jog_step_combo").currentData())
+        delta_m = float(direction) * float(step_mm) / 1000.0
+        axis_arg = {"x": "--dx", "y": "--dy", "z": "--dz"}[axis]
+        suffix = "+" if direction > 0 else "-"
+        label = f"BASE {axis.upper()}{suffix} {step_mm} mm"
+
+        workspace_setup = os.path.expanduser("~/ros2_ws/install/setup.bash")
+        repo_root = Path(__file__).resolve().parents[1]
+
+        backend_command = (
+            "/usr/bin/python3 -u -m ur7e_tools.cartesian_jog "
+            f"--robot {shlex.quote(robot)} "
+            f"{axis_arg} {delta_m:.6f} --duration 1.0 --yes"
+        )
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && cd {shlex.quote(str(repo_root))}"
+            f" && exec {backend_command}"
+        )
+
+        self.active_setup_motion = ("cartesian_jog", robot, label)
+        self.setup_motion_output_buffer = ""
+        self.log_output.appendPlainText(f"\n$ {backend_command}\n")
+        self.home_process.start("/bin/bash", ["-lc", full_command])
+        self.update_home_buttons()
+        self.update_gripper_buttons()
+        self.update_experiment_controls()
+
+    def save_robot_current_pose(self, robot):
+        if robot not in ("robot1", "robot2"):
+            return
+        if self.status_label.text() != "RUNNING":
+            return
+        if self.setup_combo.currentText() != "Dual UR7e":
+            return
+        if (
+            self.home_process.state() != QProcess.NotRunning
+            or self.gripper_process.state() != QProcess.NotRunning
+            or self.experiment_process.state() != QProcess.NotRunning
+        ):
+            return
+
+        real_mode = self.mode_combo.currentText() == "Real Robot(s)"
+        if real_mode and not self.robot_ready[robot]:
+            self.show_robot_not_ready_warning(robot)
+            return
+
+        pose_name = getattr(self, f"{robot}_pose_name_edit").text().strip()
+        allowed = set(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        )
+        if (
+            not pose_name
+            or not pose_name[0].isalnum()
+            or any(ch not in allowed for ch in pose_name)
+        ):
+            QMessageBox.warning(
+                self,
+                "Invalid pose name",
+                "Use only letters, numbers, '_' or '-'.",
+            )
+            return
+
+        repo_root = Path(__file__).resolve().parents[1]
+        pose_path = repo_root / "config" / f"pose_{robot}_{pose_name}.yaml"
+
+        overwrite_arg = ""
+        if pose_path.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace saved pose?",
+                f"Replace existing pose?\n\n{pose_path}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            overwrite_arg = " --overwrite"
+
+        workspace_setup = os.path.expanduser("~/ros2_ws/install/setup.bash")
+        backend_command = (
+            "/usr/bin/python3 -u -m ur7e_tools.cartesian_jog "
+            f"--robot {shlex.quote(robot)} "
+            f"--save-as {shlex.quote(pose_name)}{overwrite_arg}"
+        )
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && cd {shlex.quote(str(repo_root))}"
+            f" && exec {backend_command}"
+        )
+
+        self.active_setup_motion = ("save_pose", robot, pose_name)
+        self.setup_motion_output_buffer = ""
+        self.log_output.appendPlainText(f"\n$ {backend_command}\n")
+        self.home_process.start("/bin/bash", ["-lc", full_command])
+        self.update_home_buttons()
+        self.update_gripper_buttons()
+        self.update_experiment_controls()
+
     def move_to_home(self, target):
         """Legacy UR3 HOME entry point; dual robots use saved_pose safely."""
 
@@ -6263,13 +6489,26 @@ class WorkcellUI(QMainWindow):
             return
 
         kind, target, pose_name = motion
-        display_pose = self._pose_display_name(pose_name)
+        display_pose = (
+            pose_name
+            if kind == "cartesian_jog"
+            else self._pose_display_name(pose_name)
+        )
 
         if exit_code == 0:
             if kind == "saved_pose":
                 self.log_output.appendPlainText(
                     f"\n[POSE completed: {target} -> {display_pose}]"
                 )
+            elif kind == "cartesian_jog":
+                self.log_output.appendPlainText(
+                    f"\n[CARTESIAN JOG completed: {display_pose}]"
+                )
+            elif kind == "save_pose":
+                self.log_output.appendPlainText(
+                    f"\n[POSE SAVED: {target} -> {pose_name}]"
+                )
+                self.refresh_robot_pose_menu("robot1")
             else:
                 self.log_output.appendPlainText(
                     f"\n[HOME completed: ur3]"
@@ -6277,7 +6516,7 @@ class WorkcellUI(QMainWindow):
         else:
             blocked = "MOVE BLOCKED" in output
 
-            if kind == "saved_pose" and blocked:
+            if kind in ("saved_pose", "cartesian_jog") and blocked:
                 self.log_output.appendPlainText(
                     f"\n[MOVE BLOCKED: {target} -> {display_pose}]"
                 )
@@ -6285,9 +6524,22 @@ class WorkcellUI(QMainWindow):
                     self,
                     "Move blocked",
                     (
-                        f"{target} was NOT moved to {display_pose}.\n\n"
-                        "The saved-pose safety backend blocked the path.\n"
+                        f"{target} was NOT moved: {display_pose}.\n\n"
+                        "The workcell safety backend blocked the path.\n"
                         "See ROS 2 output for the collision/clearance details."
+                    ),
+                )
+            elif kind == "save_pose":
+                self.log_output.appendPlainText(
+                    f"\n[SAVE POSE failed: {pose_name} - "
+                    f"exit code {exit_code}]"
+                )
+                QMessageBox.warning(
+                    self,
+                    "Save pose failed",
+                    (
+                        f"{target} pose '{pose_name}' was not saved.\n\n"
+                        "See ROS 2 output for details."
                     ),
                 )
             else:
