@@ -157,6 +157,9 @@ PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 # are running. This prevents a stale previous run from contaminating the next
 # UI session while avoiding deletion of resources used by a live workcell.
 #
+# Broad marker set used only by the startup FastDDS cleanup gate.  Keep
+# sensor/helper processes here: deleting FastDDS shared-memory files while one
+# of those processes is alive would be unsafe.
 WORKCELL_PROCESS_MARKERS = (
     "dual_ur7e.launch.py",
     "single_ur3.launch.py",
@@ -174,6 +177,24 @@ WORKCELL_PROCESS_MARKERS = (
     "/controller_manager/spawner",
 )
 
+# Runtime START SYSTEM must only be blocked by an already-running robot
+# workcell.  Cameras, the external F/T sensor, point-cloud crop helpers and a
+# standalone RViz session are allowed to stay live while the robot stack is
+# started.
+SYSTEM_BLOCKING_PROCESS_MARKERS = (
+    "dual_ur7e.launch.py",
+    "single_ur3.launch.py",
+    "single_ur7e.launch.py",
+    "ur_ros2_control_node",
+    "controller_stopper_node",
+    "robot_state_publisher",
+    "dashboard_client",
+    "urscript_interface",
+    "trajectory_until_node",
+    "gripper_visualizer",
+    "/controller_manager/spawner",
+)
+
 
 def _process_cmdline(pid):
     try:
@@ -187,8 +208,8 @@ def _process_cmdline(pid):
     ).strip()
 
 
-def find_running_workcell_processes():
-    """Return live ROS/workcell processes, excluding this UI process."""
+def _find_running_processes(markers):
+    """Return live processes whose command line contains one of *markers*."""
 
     current_pid = os.getpid()
     found = []
@@ -205,10 +226,39 @@ def find_running_workcell_processes():
         if not cmdline:
             continue
 
-        if any(marker in cmdline for marker in WORKCELL_PROCESS_MARKERS):
+        if any(marker in cmdline for marker in markers):
             found.append((pid, cmdline))
 
     return sorted(found, key=lambda item: item[0])
+
+
+def find_running_workcell_processes():
+    """Return processes that make startup FastDDS cleanup unsafe."""
+
+    return _find_running_processes(WORKCELL_PROCESS_MARKERS)
+
+
+def find_running_system_blocking_processes():
+    """Return robot-workcell processes that must block START SYSTEM."""
+
+    return _find_running_processes(SYSTEM_BLOCKING_PROCESS_MARKERS)
+
+
+def _process_group_exists(pgid):
+    """Return True while a Linux process group still has live members."""
+
+    if pgid is None or int(pgid) <= 0:
+        return False
+
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A permission error still proves that the process group exists.
+        return True
+
+    return True
 
 
 def _fastdds_shared_memory_paths():
@@ -1263,6 +1313,13 @@ class WorkcellUI(QMainWindow):
             self.on_process_finished
         )
 
+        # The launch command is started with ``setsid``.  Persist its process
+        # group ID separately from QProcess: the launch leader can exit before
+        # one of its children, at which point QProcess reports NotRunning even
+        # though the workcell process group still needs cleanup.
+        self.ros_process_group_id = None
+        self.ros_shutdown_in_progress = False
+
         # -----------------------------------------------------
         # Ping processes
         # -----------------------------------------------------
@@ -1511,6 +1568,15 @@ class WorkcellUI(QMainWindow):
         self.apply_style()
         self.update_setup_view()
         self.apply_startup_preflight_report()
+
+        # Keep the stopped-state preflight badge truthful.  This also makes a
+        # manually cleared blocker disappear from the UI without restarting it.
+        self.preflight_refresh_timer = QTimer(self)
+        self.preflight_refresh_timer.setInterval(1000)
+        self.preflight_refresh_timer.timeout.connect(
+            self.refresh_runtime_preflight_status
+        )
+        self.preflight_refresh_timer.start()
 
         # UI display is intentionally throttled to 20 Hz.
         # The ROS topics themselves remain at their native rates (~100 Hz).
@@ -4748,8 +4814,65 @@ class WorkcellUI(QMainWindow):
                 message,
             )
 
+    def refresh_runtime_preflight_status(self):
+        """Refresh the stopped-state START SYSTEM blocker indication."""
+
+        if not hasattr(self, "status_label"):
+            return
+
+        # While our own workcell is starting/running/stopping it is expected to
+        # match the blocker markers, so runtime preflight is meaningful only
+        # when the UI says the system is stopped.
+        if self.status_label.text() != "STOPPED":
+            return
+
+        startup_state = self.startup_preflight_report.get(
+            "state",
+            "UNKNOWN",
+        )
+
+        if startup_state not in ("CLEAN", "CLEANED"):
+            self.set_preflight_status(
+                "RESTART REQUIRED",
+                "blocked",
+                "Startup FastDDS cleanup was not completed safely. "
+                "Stop old ROS/workcell processes, close this UI, "
+                "and open it again.",
+            )
+            return
+
+        blockers = find_running_system_blocking_processes()
+
+        if blockers:
+            details = "\n".join(
+                f"PID {pid}: {cmdline}"
+                for pid, cmdline in blockers[:8]
+            )
+            self.set_preflight_status(
+                "BLOCKED",
+                "blocked",
+                "Existing robot-workcell processes detected.\n\n"
+                + details,
+            )
+            return
+
+        self.set_preflight_status(
+            "CLEAN",
+            "clean",
+            "No existing robot-workcell processes detected.",
+        )
+
+        if (
+            hasattr(self, "start_guard_label")
+            and self.start_guard_label.text().startswith(
+                "Preflight blocked:"
+            )
+        ):
+            self.start_guard_label.clear()
+            self.start_guard_label.setVisible(False)
+
     def preflight_before_start(self):
-        """Fail closed if another workcell ROS stack is already running."""
+        """Fail closed if another robot workcell is already running."""
 
         self.set_preflight_status(
             "CHECKING...",
@@ -4780,7 +4903,7 @@ class WorkcellUI(QMainWindow):
             self.start_guard_label.setVisible(True)
             return False
 
-        blockers = find_running_workcell_processes()
+        blockers = find_running_system_blocking_processes()
 
         if blockers:
             details = "\n".join(
@@ -4791,7 +4914,7 @@ class WorkcellUI(QMainWindow):
             self.set_preflight_status(
                 "BLOCKED",
                 "blocked",
-                "Existing workcell ROS processes detected.\n\n"
+                "Existing robot-workcell processes detected.\n\n"
                 + details,
             )
 
@@ -7623,6 +7746,20 @@ class WorkcellUI(QMainWindow):
     # Stop
     # =========================================================
 
+    def _signal_ros_process_group(self, sig):
+        """Signal the saved workcell process group, if it still exists."""
+
+        pgid = self.ros_process_group_id
+        if not _process_group_exists(pgid):
+            return False
+
+        try:
+            os.killpg(int(pgid), sig)
+        except ProcessLookupError:
+            return False
+
+        return True
+
     def stop_system(self):
 
         if (
@@ -7631,10 +7768,18 @@ class WorkcellUI(QMainWindow):
         ):
             self.stop_experiment()
 
+        # Capture the launch PGID while QProcess still knows its PID.  The
+        # command uses ``setsid``, therefore the launch PID is also the PGID.
+        if self.ros_process.state() != QProcess.NotRunning:
+            pid = int(self.ros_process.processId())
+            if pid > 0:
+                self.ros_process_group_id = pid
+
         if (
-            self.ros_process.state()
-            == QProcess.NotRunning
+            self.ros_process.state() == QProcess.NotRunning
+            and not _process_group_exists(self.ros_process_group_id)
         ):
+            self.refresh_runtime_preflight_status()
             return
 
         if (
@@ -7643,6 +7788,7 @@ class WorkcellUI(QMainWindow):
         ):
             self.home_process.terminate()
 
+        self.ros_shutdown_in_progress = True
         self.set_status(
             "STOPPING"
         )
@@ -7655,54 +7801,66 @@ class WorkcellUI(QMainWindow):
         )
         self.reset_robot_readiness("NOT STARTED")
 
-        pid = int(
-            self.ros_process.processId()
-        )
+        # Graceful first: every member of the launch session receives Ctrl-C.
+        self._signal_ros_process_group(signal.SIGINT)
 
-        if pid > 0:
-
-            try:
-                os.killpg(
-                    pid,
-                    signal.SIGINT
-                )
-
-            except ProcessLookupError:
-                pass
-
+        # Crucially, the escalation checks the saved process group itself, not
+        # QProcess.  The launch leader can already be gone while an orphan child
+        # (for example controller_stopper_node) is still alive.
         QTimer.singleShot(
             4000,
             self.force_stop_if_needed,
         )
 
     def force_stop_if_needed(self):
+        """Escalate a surviving workcell process group to SIGTERM."""
 
-        if (
-            self.ros_process.state()
-            == QProcess.NotRunning
-        ):
+        if self._signal_ros_process_group(signal.SIGTERM):
+            QTimer.singleShot(
+                2000,
+                self.kill_stop_if_needed,
+            )
+        else:
+            self.finish_ros_group_cleanup()
+
+    def kill_stop_if_needed(self):
+        """Final shutdown escalation for a process group that ignored TERM."""
+
+        if self._signal_ros_process_group(signal.SIGKILL):
+            QTimer.singleShot(
+                500,
+                self.finish_ros_group_cleanup,
+            )
+        else:
+            self.finish_ros_group_cleanup()
+
+    def finish_ros_group_cleanup(self):
+        """Forget a dead PGID and immediately refresh the preflight badge."""
+
+        if _process_group_exists(self.ros_process_group_id):
+            # Extremely unusual (for example an uninterruptible kernel sleep).
+            # Keep the PGID so the operator can see that cleanup is incomplete.
+            self.set_preflight_status(
+                "BLOCKED",
+                "blocked",
+                "Workcell process group is still alive after SIGKILL: "
+                f"PGID {self.ros_process_group_id}",
+            )
             return
 
-        pid = int(
-            self.ros_process.processId()
-        )
-
-        if pid > 0:
-
-            try:
-                os.killpg(
-                    pid,
-                    signal.SIGTERM
-                )
-
-            except ProcessLookupError:
-                pass
+        self.ros_process_group_id = None
+        self.ros_shutdown_in_progress = False
+        self.refresh_runtime_preflight_status()
 
     # =========================================================
     # Process events
     # =========================================================
 
     def on_process_started(self):
+
+        pid = int(self.ros_process.processId())
+        self.ros_process_group_id = pid if pid > 0 else None
+        self.ros_shutdown_in_progress = False
 
         self.set_status(
             "RUNNING"
@@ -7837,6 +7995,15 @@ class WorkcellUI(QMainWindow):
         self.log_output.appendPlainText(
             f"\n[System stopped - exit code {exit_code}]"
         )
+
+        # If the launch leader exited unexpectedly, clean any surviving process
+        # group members.  During an operator-requested STOP the existing 4 s
+        # graceful-shutdown timer remains in charge.
+        if (
+            not self.ros_shutdown_in_progress
+            and _process_group_exists(self.ros_process_group_id)
+        ):
+            QTimer.singleShot(100, self.force_stop_if_needed)
 
     # =========================================================
     # ROS output
@@ -8004,6 +8171,22 @@ class WorkcellUI(QMainWindow):
                 3000
             )
 
+        # closeEvent is synchronous: do not rely on the QTimer escalation from
+        # stop_system(), because the event loop is already shutting down.  Also
+        # cover the case where the launch leader has exited but a child process
+        # is still alive in the saved process group.
+        if _process_group_exists(self.ros_process_group_id):
+            self._signal_ros_process_group(signal.SIGTERM)
+            time.sleep(0.5)
+
+        if _process_group_exists(self.ros_process_group_id):
+            self._signal_ros_process_group(signal.SIGKILL)
+            time.sleep(0.2)
+
+        if not _process_group_exists(self.ros_process_group_id):
+            self.ros_process_group_id = None
+            self.ros_shutdown_in_progress = False
+
         if (
             self.experiment_process.state()
             != QProcess.NotRunning
@@ -8072,6 +8255,12 @@ class WorkcellUI(QMainWindow):
 
         if hasattr(self, "wrench_listener"):
             self.wrench_listener.set_health_monitor_enabled(False)
+
+        if hasattr(
+            self,
+            "preflight_refresh_timer",
+        ):
+            self.preflight_refresh_timer.stop()
 
         if hasattr(
             self,
