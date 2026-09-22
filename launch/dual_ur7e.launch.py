@@ -22,6 +22,8 @@ def generate_launch_description():
     robot2_ip = LaunchConfiguration("robot2_ip")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
     use_wrist_camera = LaunchConfiguration("use_wrist_camera")
+    robot1_camera_roll = LaunchConfiguration("robot1_camera_roll")
+    robot2_camera_roll = LaunchConfiguration("robot2_camera_roll")
     robot1_gripper_type = LaunchConfiguration("robot1_gripper_type")
     robot2_gripper_type = LaunchConfiguration("robot2_gripper_type")
     robot1_x = LaunchConfiguration("robot1_x")
@@ -166,6 +168,7 @@ def generate_launch_description():
                     "tf_prefix": "robot1_",
                     "use_2fg7": "true",
                     "use_wrist_camera": use_wrist_camera,
+                    "camera_roll": robot1_camera_roll,
                     "base_x": robot1_x,
                     "base_y": robot1_y,
                     "base_z": robot1_z,
@@ -200,6 +203,7 @@ def generate_launch_description():
                     "tf_prefix": "robot1_",
                     "use_2fg7": "false",
                     "use_wrist_camera": use_wrist_camera,
+                    "camera_roll": robot1_camera_roll,
                     "base_x": robot1_x,
                     "base_y": robot1_y,
                     "base_z": robot1_z,
@@ -234,6 +238,7 @@ def generate_launch_description():
                     "tf_prefix": "robot2_",
                     "use_2fg7": "true",
                     "use_wrist_camera": use_wrist_camera,
+                    "camera_roll": robot2_camera_roll,
                     "base_x": robot2_x,
                     "base_y": robot2_y,
                     "base_z": robot2_z,
@@ -268,6 +273,7 @@ def generate_launch_description():
                     "tf_prefix": "robot2_",
                     "use_2fg7": "false",
                     "use_wrist_camera": use_wrist_camera,
+                    "camera_roll": robot2_camera_roll,
                     "base_x": robot2_x,
                     "base_y": robot2_y,
                     "base_z": robot2_z,
@@ -295,6 +301,8 @@ def generate_launch_description():
         DeclareLaunchArgument("robot2_ip", default_value="127.0.0.1"),
         DeclareLaunchArgument("use_fake_hardware", default_value="true"),
         DeclareLaunchArgument("use_wrist_camera", default_value="true"),
+        DeclareLaunchArgument("robot1_camera_roll", default_value="0.0"),
+        DeclareLaunchArgument("robot2_camera_roll", default_value="3.141592653589793"),
         DeclareLaunchArgument(
             "robot1_gripper_type",
             default_value="onrobot",
