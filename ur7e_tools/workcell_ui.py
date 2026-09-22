@@ -30,7 +30,7 @@ from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
 from visualization_msgs.msg import Marker, MarkerArray
 
-from PySide6.QtCore import QProcess, QSettings, QTimer, Qt
+from PySide6.QtCore import QProcess, QRect, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
-    QSlider,
+    QSpinBox,
     QSplitter,
     QStyle,
     QVBoxLayout,
@@ -358,6 +358,38 @@ def perform_startup_fastdds_preflight():
     return report
 
 
+class GripperPercentSpinBox(QSpinBox):
+    """QSpinBox with always-visible white up/down arrows."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        # Some Linux/Qt themes render the native spin arrows too dark for
+        # this UI. Draw a small white overlay in the existing button strip
+        # while keeping the native spin-button hit areas and behaviour.
+        painter = QPainter(self)
+        painter.setPen(QColor("#ffffff"))
+        font = painter.font()
+        font.setBold(True)
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(7.0, font.pointSizeF() - 1.0))
+        painter.setFont(font)
+
+        button_width = 18
+        x = self.width() - button_width
+        half_height = self.height() // 2
+        painter.drawText(
+            QRect(x, 0, button_width, half_height),
+            Qt.AlignCenter,
+            "▲",
+        )
+        painter.drawText(
+            QRect(x, half_height, button_width, self.height() - half_height),
+            Qt.AlignCenter,
+            "▼",
+        )
+
+
 class CenteredBar(QWidget):
     """Simple center-zero bar used for live signed wrench values."""
 
@@ -439,7 +471,7 @@ class CenteredBar(QWidget):
 
 
 class CollapsibleSection(QWidget):
-    """Compact dark collapsible section with an arrow in its header."""
+    """Compact dark collapsible section with an extensible header row."""
 
     def __init__(self, title, expanded=False, parent=None):
         super().__init__(parent)
@@ -449,6 +481,12 @@ class CollapsibleSection(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(3)
+
+        self.header = QFrame()
+        self.header.setObjectName("collapsibleHeader")
+        self.header_layout = QHBoxLayout(self.header)
+        self.header_layout.setContentsMargins(0, 0, 0, 0)
+        self.header_layout.setSpacing(5)
 
         self.toggle_button = QPushButton()
         self.toggle_button.setObjectName("collapseButton")
@@ -460,8 +498,8 @@ class CollapsibleSection(QWidget):
         self.toggle_button.toggled.connect(
             self.set_expanded
         )
-
-        layout.addWidget(self.toggle_button)
+        self.header_layout.addWidget(self.toggle_button, 1)
+        layout.addWidget(self.header)
 
         self.body = QFrame()
         self.body.setObjectName("collapsibleBody")
@@ -1619,35 +1657,18 @@ class WorkcellUI(QMainWindow):
         main_layout.setSpacing(8)
 
         # -----------------------------------------------------
-        # Title
+        # Compact workcell header
         # -----------------------------------------------------
+
+        top_bar_layout = QHBoxLayout()
+        top_bar_layout.setSpacing(7)
 
         title = QLabel("Robot Workcell Control")
         title.setObjectName("title")
+        top_bar_layout.addWidget(title)
+        top_bar_layout.addStretch(1)
 
-        subtitle = QLabel(
-            "ROS 2 control interface for laboratory robot setups"
-        )
-        subtitle.setObjectName("subtitle")
-
-        main_layout.addWidget(title)
-        main_layout.addWidget(subtitle)
-
-        # -----------------------------------------------------
-        # Setup selection + main system controls
-        # -----------------------------------------------------
-
-        setup_group = QGroupBox("System configuration")
-
-        setup_group_layout = QVBoxLayout(setup_group)
-        setup_group_layout.setSpacing(4)
-
-        setup_layout = QHBoxLayout()
-        setup_layout.setSpacing(8)
-
-        setup_group_layout.addLayout(setup_layout)
-
-        setup_layout.addWidget(QLabel("Setup:"))
+        top_bar_layout.addWidget(QLabel("Setup:"))
 
         self.setup_combo = QComboBox()
         self.setup_combo.addItems([
@@ -1656,14 +1677,12 @@ class WorkcellUI(QMainWindow):
             "Dual UR7e",
         ])
         self.setup_combo.setCurrentText("Dual UR7e")
-
         self.setup_combo.currentIndexChanged.connect(
             self.update_setup_view
         )
+        top_bar_layout.addWidget(self.setup_combo)
 
-        setup_layout.addWidget(self.setup_combo)
-
-        setup_layout.addWidget(QLabel("Mode:"))
+        top_bar_layout.addWidget(QLabel("Mode:"))
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
@@ -1671,94 +1690,58 @@ class WorkcellUI(QMainWindow):
             "Real Robot(s)",
         ])
         self.mode_combo.setCurrentText("Real Robot(s)")
-
         self.mode_combo.currentIndexChanged.connect(
             self.update_setup_view
         )
+        top_bar_layout.addWidget(self.mode_combo)
 
-        setup_layout.addWidget(self.mode_combo)
-        setup_layout.addSpacing(8)
+        self.start_button = QPushButton("START SYSTEM")
+        self.start_button.setObjectName("startButton")
+        self.start_button.clicked.connect(self.start_system)
 
-        self.start_button = QPushButton(
-            "START SYSTEM"
-        )
-        self.start_button.setObjectName(
-            "startButton"
-        )
-        self.start_button.clicked.connect(
-            self.start_system
-        )
-
-        self.stop_button = QPushButton(
-            "STOP SYSTEM"
-        )
-        self.stop_button.setObjectName(
-            "stopButton"
-        )
+        self.stop_button = QPushButton("STOP SYSTEM")
+        self.stop_button.setObjectName("stopButton")
         self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(
-            self.stop_system
-        )
+        self.stop_button.clicked.connect(self.stop_system)
 
-        setup_layout.addWidget(self.start_button)
-        setup_layout.addWidget(self.stop_button)
-        setup_layout.addStretch()
+        top_bar_layout.addWidget(self.start_button)
+        top_bar_layout.addWidget(self.stop_button)
+        top_bar_layout.addSpacing(6)
 
-        setup_layout.addWidget(QLabel("Status:"))
+        top_bar_layout.addWidget(QLabel("Status:"))
+        self.status_label = QLabel("STOPPED")
+        self.status_label.setObjectName("statusStopped")
+        top_bar_layout.addWidget(self.status_label)
 
-        self.status_label = QLabel(
-            "STOPPED"
-        )
-        self.status_label.setObjectName(
-            "statusStopped"
-        )
-
-        setup_layout.addWidget(self.status_label)
-
-        setup_layout.addSpacing(6)
-        setup_layout.addWidget(QLabel("Health:"))
-
+        top_bar_layout.addWidget(QLabel("Health:"))
         self.health_status_label = QLabel("STOPPED")
-        self.health_status_label.setObjectName(
-            "connectionUnknown"
-        )
+        self.health_status_label.setObjectName("connectionUnknown")
         self.health_status_label.setToolTip(
             "ROS graph, TF, controller-manager, controller state, "
             "robot mode, and readiness health gates."
         )
-        setup_layout.addWidget(self.health_status_label)
+        top_bar_layout.addWidget(self.health_status_label)
 
-        setup_layout.addSpacing(6)
-        setup_layout.addWidget(QLabel("Robots:"))
-
+        top_bar_layout.addWidget(QLabel("Robots:"))
         self.robots_ready_label = QLabel("NOT READY")
-        self.robots_ready_label.setObjectName(
-            "robotSummaryUnknown"
-        )
-        setup_layout.addWidget(self.robots_ready_label)
+        self.robots_ready_label.setObjectName("robotSummaryUnknown")
+        top_bar_layout.addWidget(self.robots_ready_label)
 
-        setup_layout.addSpacing(6)
-        setup_layout.addWidget(QLabel("Preflight:"))
-
+        top_bar_layout.addWidget(QLabel("Preflight:"))
         self.preflight_status_label = QLabel("UNKNOWN")
-        self.preflight_status_label.setObjectName(
-            "connectionUnknown"
-        )
+        self.preflight_status_label.setObjectName("connectionUnknown")
         self.preflight_status_label.setToolTip(
             "Startup check for leftover workcell processes and stale "
             "FastDDS shared-memory state."
         )
-        setup_layout.addWidget(self.preflight_status_label)
+        top_bar_layout.addWidget(self.preflight_status_label)
+
+        main_layout.addLayout(top_bar_layout)
 
         self.start_guard_label = QLabel("")
         self.start_guard_label.setObjectName("systemWarning")
         self.start_guard_label.setVisible(False)
-
-        setup_group_layout.addWidget(
-            self.start_guard_label
-        )
-
-        main_layout.addWidget(setup_group)
+        main_layout.addWidget(self.start_guard_label)
 
         # =====================================================
         # SINGLE UR3
@@ -1989,93 +1972,105 @@ class WorkcellUI(QMainWindow):
         robot1_layout.setSpacing(5)
 
         robot1_header = QHBoxLayout()
+        robot1_header.setSpacing(5)
 
         robot1_title = QLabel("Robot 1")
-        robot1_title.setObjectName(
-            "robotSectionTitle"
-        )
+        robot1_title.setObjectName("robotSectionTitle")
+        robot1_title.setMinimumWidth(55)
         robot1_header.addWidget(robot1_title)
 
         robot1_header.addWidget(QLabel("IP:"))
+        self.robot1_ip = QLineEdit("10.0.0.1")
+        self.robot1_ip.setFixedWidth(100)
+        robot1_header.addWidget(self.robot1_ip)
 
-        self.robot1_ip = QLineEdit(
-            "10.0.0.1"
+        # Compact clickable network indicator: red -> amber -> green.
+        self.robot1_connection_status = QPushButton("")
+        self.robot1_connection_status.setProperty("compactIndicator", True)
+        self.robot1_connection_status.setFixedSize(30, 30)
+        self.robot1_connection_status.setAccessibleName(
+            "Robot 1 connection test"
         )
-        robot1_header.addWidget(
-            self.robot1_ip,
-            1,
-        )
-
-        self.robot1_test_button = QPushButton(
-            "TEST"
-        )
-        self.robot1_test_button.clicked.connect(
+        self.robot1_connection_status.clicked.connect(
             self.test_robot1_connection
         )
-        robot1_header.addWidget(
-            self.robot1_test_button
+        self.set_connection_status(
+            self.robot1_connection_status,
+            "TEST",
         )
+        robot1_header.addWidget(self.robot1_connection_status)
 
-        robot1_header.addWidget(QLabel("Connection:"))
-
-        self.robot1_connection_status = QLabel(
-            "NOT TESTED"
-        )
-        self.robot1_connection_status.setObjectName(
-            "connectionUnknown"
-        )
-        robot1_header.addWidget(
-            self.robot1_connection_status
-        )
-
-        robot1_header.addWidget(QLabel("Robot:"))
         self.robot1_ready_status = QLabel("NOT STARTED")
-        self.robot1_ready_status.setObjectName(
-            "robotStateStopped"
-        )
-        robot1_header.addWidget(
-            self.robot1_ready_status
-        )
+        self.robot1_ready_status.setObjectName("robotStateStopped")
+        self.robot1_ready_status.setMinimumWidth(108)
+        self.robot1_ready_status.setAlignment(Qt.AlignCenter)
+        robot1_header.addWidget(self.robot1_ready_status)
 
-        robot1_layout.addLayout(robot1_header)
-
-        robot1_actions = QHBoxLayout()
-
-        self.robot1_home_button = QPushButton(
-            "MOVE ROBOT"
-        )
+        self.robot1_home_button = QPushButton("MOVE ROBOT")
+        self.robot1_home_button.setMinimumWidth(110)
         self.robot1_home_button.setEnabled(False)
-        self.robot1_pose_menu = QMenu(
-            self.robot1_home_button
-        )
+        self.robot1_pose_menu = QMenu(self.robot1_home_button)
         self.robot1_pose_menu.aboutToShow.connect(
             lambda: self.refresh_robot_pose_menu("robot1")
         )
-        self.robot1_home_button.setMenu(
-            self.robot1_pose_menu
-        )
+        self.robot1_home_button.setMenu(self.robot1_pose_menu)
         self.robot1_home_button.setToolTip(
             "Choose a saved Robot 1 setup pose. "
             "Every real move is checked against the table and Robot 2 "
             "before any trajectory is sent."
         )
-        robot1_actions.addWidget(
-            self.robot1_home_button
-        )
+        robot1_header.addWidget(self.robot1_home_button)
+        robot1_header.addSpacing(12)
 
-        robot1_actions.addWidget(
-            QLabel("Gripper:")
+        # Keep gripper controls grouped at the far right of the robot row.
+        robot1_header.addStretch(1)
+
+        robot1_gripper_group = QHBoxLayout()
+        robot1_gripper_group.setContentsMargins(0, 0, 0, 0)
+        robot1_gripper_group.setSpacing(2)
+
+        self.robot1_gripper_move_button = QPushButton("MOVE GRIP")
+        self.robot1_gripper_move_button.setMinimumWidth(86)
+        self.robot1_gripper_move_button.setEnabled(False)
+        self.robot1_gripper_move_button.clicked.connect(
+            lambda: self.command_gripper_position(
+                "robot1",
+                self.robot1_gripper_position_spin.value() / 100.0,
+            )
         )
+        self.robot1_gripper_move_button.setToolTip(
+            "Send the selected 0-100% command to Robot 1 gripper. "
+            "Simulation supports OnRobot and Robotiq visualization. "
+            "Real motion is currently enabled only for OnRobot 2FG7."
+        )
+        robot1_gripper_group.addWidget(self.robot1_gripper_move_button)
+
+        self.robot1_gripper_position_spin = GripperPercentSpinBox()
+        self.robot1_gripper_position_spin.setObjectName("gripperPercentSpin")
+        self.robot1_gripper_position_spin.setRange(0, 100)
+        self.robot1_gripper_position_spin.setSingleStep(5)
+        self.robot1_gripper_position_spin.setValue(100)
+        self.robot1_gripper_position_spin.setSuffix("%")
+        self.robot1_gripper_position_spin.setFixedWidth(88)
+        self.robot1_gripper_position_spin.setToolTip(
+            "Gripper opening command. Green: >=20%, amber: 11-19%, red: <=10%."
+        )
+        self.robot1_gripper_position_spin.valueChanged.connect(
+            lambda percent: self.update_gripper_percent_style(
+                self.robot1_gripper_position_spin,
+                percent,
+            )
+        )
+        robot1_gripper_group.addWidget(self.robot1_gripper_position_spin)
 
         self.robot1_gripper_combo = QComboBox()
         self.robot1_gripper_combo.addItems([
-            "OnRobot 2FG7",
-            "Robotiq 2F-140",
+            "OnRobot",
+            "Robotiq",
         ])
-        self.robot1_gripper_combo.setCurrentText(
-            "OnRobot 2FG7"
-        )
-        self.robot1_gripper_combo.setMinimumWidth(145)
+        self.robot1_gripper_combo.setCurrentText("OnRobot")
+        self.robot1_gripper_combo.setObjectName("robotGripperCombo")
+        self.robot1_gripper_combo.setFixedWidth(124)
         self.robot1_gripper_combo.setToolTip(
             "Select Robot 1 gripper before START SYSTEM. "
             "The selector applies to Simulation and Real Robot mode. "
@@ -2085,71 +2080,15 @@ class WorkcellUI(QMainWindow):
         self.robot1_gripper_combo.currentIndexChanged.connect(
             self.update_gripper_buttons
         )
-        robot1_actions.addWidget(
-            self.robot1_gripper_combo
+        robot1_gripper_group.addWidget(self.robot1_gripper_combo)
+
+        self.update_gripper_percent_style(
+            self.robot1_gripper_position_spin,
+            self.robot1_gripper_position_spin.value(),
         )
 
-        robot1_actions.addWidget(
-            QLabel("0.0")
-        )
-
-        self.robot1_gripper_slider = QSlider()
-        self.robot1_gripper_slider.setOrientation(
-            Qt.Horizontal
-        )
-        self.robot1_gripper_slider.setRange(0, 100)
-        self.robot1_gripper_slider.setValue(100)
-        self.robot1_gripper_slider.setSingleStep(1)
-        self.robot1_gripper_slider.setPageStep(10)
-        self.robot1_gripper_slider.setToolTip(
-            "Normalized gripper command: 0.0 = closed, 1.0 = open."
-        )
-        robot1_actions.addWidget(
-            self.robot1_gripper_slider,
-            1,
-        )
-
-        robot1_actions.addWidget(
-            QLabel("1.0")
-        )
-
-        self.robot1_gripper_value = QLabel("1.00")
-        self.robot1_gripper_value.setMinimumWidth(38)
-
-        self.robot1_gripper_slider.valueChanged.connect(
-            lambda value: self.robot1_gripper_value.setText(
-                f"{value / 100.0:.2f}"
-            )
-        )
-
-        robot1_actions.addWidget(
-            self.robot1_gripper_value
-        )
-
-        self.robot1_gripper_move_button = QPushButton(
-            "MOVE GRIP"
-        )
-        self.robot1_gripper_move_button.setEnabled(False)
-        self.robot1_gripper_move_button.clicked.connect(
-            lambda: self.command_gripper_position(
-                "robot1",
-                self.robot1_gripper_slider.value() / 100.0,
-            )
-        )
-        self.robot1_gripper_move_button.setToolTip(
-            "Send the selected 0.0-1.0 command to Robot 1 gripper. "
-            "Simulation supports OnRobot and Robotiq visualization. "
-            "Real motion is currently enabled only for OnRobot 2FG7."
-        )
-        robot1_actions.addWidget(
-            self.robot1_gripper_move_button
-        )
-
-        robot1_layout.addLayout(
-            robot1_actions
-        )
-
-
+        robot1_header.addLayout(robot1_gripper_group)
+        robot1_layout.addLayout(robot1_header)
 
         # -----------------------------------------------------
         # Robot 1 Cartesian micro-jog (ROBOT BASE frame)
@@ -2207,93 +2146,105 @@ class WorkcellUI(QMainWindow):
         robot2_layout.setSpacing(5)
 
         robot2_header = QHBoxLayout()
+        robot2_header.setSpacing(5)
 
         robot2_title = QLabel("Robot 2")
-        robot2_title.setObjectName(
-            "robotSectionTitle"
-        )
+        robot2_title.setObjectName("robotSectionTitle")
+        robot2_title.setMinimumWidth(55)
         robot2_header.addWidget(robot2_title)
 
         robot2_header.addWidget(QLabel("IP:"))
+        self.robot2_ip = QLineEdit("10.0.0.2")
+        self.robot2_ip.setFixedWidth(100)
+        robot2_header.addWidget(self.robot2_ip)
 
-        self.robot2_ip = QLineEdit(
-            "10.0.0.2"
+        # Compact clickable network indicator: red -> amber -> green.
+        self.robot2_connection_status = QPushButton("")
+        self.robot2_connection_status.setProperty("compactIndicator", True)
+        self.robot2_connection_status.setFixedSize(30, 30)
+        self.robot2_connection_status.setAccessibleName(
+            "Robot 2 connection test"
         )
-        robot2_header.addWidget(
-            self.robot2_ip,
-            1,
-        )
-
-        self.robot2_test_button = QPushButton(
-            "TEST"
-        )
-        self.robot2_test_button.clicked.connect(
+        self.robot2_connection_status.clicked.connect(
             self.test_robot2_connection
         )
-        robot2_header.addWidget(
-            self.robot2_test_button
+        self.set_connection_status(
+            self.robot2_connection_status,
+            "TEST",
         )
+        robot2_header.addWidget(self.robot2_connection_status)
 
-        robot2_header.addWidget(QLabel("Connection:"))
-
-        self.robot2_connection_status = QLabel(
-            "NOT TESTED"
-        )
-        self.robot2_connection_status.setObjectName(
-            "connectionUnknown"
-        )
-        robot2_header.addWidget(
-            self.robot2_connection_status
-        )
-
-        robot2_header.addWidget(QLabel("Robot:"))
         self.robot2_ready_status = QLabel("NOT STARTED")
-        self.robot2_ready_status.setObjectName(
-            "robotStateStopped"
-        )
-        robot2_header.addWidget(
-            self.robot2_ready_status
-        )
+        self.robot2_ready_status.setObjectName("robotStateStopped")
+        self.robot2_ready_status.setMinimumWidth(108)
+        self.robot2_ready_status.setAlignment(Qt.AlignCenter)
+        robot2_header.addWidget(self.robot2_ready_status)
 
-        robot2_layout.addLayout(robot2_header)
-
-        robot2_actions = QHBoxLayout()
-
-        self.robot2_home_button = QPushButton(
-            "MOVE ROBOT"
-        )
+        self.robot2_home_button = QPushButton("MOVE ROBOT")
+        self.robot2_home_button.setMinimumWidth(110)
         self.robot2_home_button.setEnabled(False)
-        self.robot2_pose_menu = QMenu(
-            self.robot2_home_button
-        )
+        self.robot2_pose_menu = QMenu(self.robot2_home_button)
         self.robot2_pose_menu.aboutToShow.connect(
             lambda: self.refresh_robot_pose_menu("robot2")
         )
-        self.robot2_home_button.setMenu(
-            self.robot2_pose_menu
-        )
+        self.robot2_home_button.setMenu(self.robot2_pose_menu)
         self.robot2_home_button.setToolTip(
             "Choose a saved Robot 2 setup pose. "
             "Every real move is checked against the table and Robot 1 "
             "before any trajectory is sent."
         )
-        robot2_actions.addWidget(
-            self.robot2_home_button
-        )
+        robot2_header.addWidget(self.robot2_home_button)
+        robot2_header.addSpacing(12)
 
-        robot2_actions.addWidget(
-            QLabel("Gripper:")
+        # Keep gripper controls grouped at the far right of the robot row.
+        robot2_header.addStretch(1)
+
+        robot2_gripper_group = QHBoxLayout()
+        robot2_gripper_group.setContentsMargins(0, 0, 0, 0)
+        robot2_gripper_group.setSpacing(2)
+
+        self.robot2_gripper_move_button = QPushButton("MOVE GRIP")
+        self.robot2_gripper_move_button.setMinimumWidth(86)
+        self.robot2_gripper_move_button.setEnabled(False)
+        self.robot2_gripper_move_button.clicked.connect(
+            lambda: self.command_gripper_position(
+                "robot2",
+                self.robot2_gripper_position_spin.value() / 100.0,
+            )
         )
+        self.robot2_gripper_move_button.setToolTip(
+            "Send the selected 0-100% command to Robot 2 gripper. "
+            "Simulation supports OnRobot and Robotiq visualization. "
+            "Real motion is currently enabled only for OnRobot 2FG7."
+        )
+        robot2_gripper_group.addWidget(self.robot2_gripper_move_button)
+
+        self.robot2_gripper_position_spin = GripperPercentSpinBox()
+        self.robot2_gripper_position_spin.setObjectName("gripperPercentSpin")
+        self.robot2_gripper_position_spin.setRange(0, 100)
+        self.robot2_gripper_position_spin.setSingleStep(5)
+        self.robot2_gripper_position_spin.setValue(100)
+        self.robot2_gripper_position_spin.setSuffix("%")
+        self.robot2_gripper_position_spin.setFixedWidth(88)
+        self.robot2_gripper_position_spin.setToolTip(
+            "Gripper opening command. Green: >=20%, amber: 11-19%, red: <=10%."
+        )
+        self.robot2_gripper_position_spin.valueChanged.connect(
+            lambda percent: self.update_gripper_percent_style(
+                self.robot2_gripper_position_spin,
+                percent,
+            )
+        )
+        robot2_gripper_group.addWidget(self.robot2_gripper_position_spin)
 
         self.robot2_gripper_combo = QComboBox()
         self.robot2_gripper_combo.addItems([
-            "OnRobot 2FG7",
-            "Robotiq 2F-140",
+            "OnRobot",
+            "Robotiq",
         ])
-        self.robot2_gripper_combo.setCurrentText(
-            "OnRobot 2FG7"
-        )
-        self.robot2_gripper_combo.setMinimumWidth(145)
+        self.robot2_gripper_combo.setCurrentText("OnRobot")
+        self.robot2_gripper_combo.setObjectName("robotGripperCombo")
+        self.robot2_gripper_combo.setFixedWidth(124)
         self.robot2_gripper_combo.setToolTip(
             "Select Robot 2 gripper before START SYSTEM. "
             "The selector applies to Simulation and Real Robot mode. "
@@ -2303,70 +2254,15 @@ class WorkcellUI(QMainWindow):
         self.robot2_gripper_combo.currentIndexChanged.connect(
             self.update_gripper_buttons
         )
-        robot2_actions.addWidget(
-            self.robot2_gripper_combo
+        robot2_gripper_group.addWidget(self.robot2_gripper_combo)
+
+        self.update_gripper_percent_style(
+            self.robot2_gripper_position_spin,
+            self.robot2_gripper_position_spin.value(),
         )
 
-        robot2_actions.addWidget(
-            QLabel("0.0")
-        )
-
-        self.robot2_gripper_slider = QSlider()
-        self.robot2_gripper_slider.setOrientation(
-            Qt.Horizontal
-        )
-        self.robot2_gripper_slider.setRange(0, 100)
-        self.robot2_gripper_slider.setValue(100)
-        self.robot2_gripper_slider.setSingleStep(1)
-        self.robot2_gripper_slider.setPageStep(10)
-        self.robot2_gripper_slider.setToolTip(
-            "Normalized gripper command: 0.0 = closed, 1.0 = open."
-        )
-        robot2_actions.addWidget(
-            self.robot2_gripper_slider,
-            1,
-        )
-
-        robot2_actions.addWidget(
-            QLabel("1.0")
-        )
-
-        self.robot2_gripper_value = QLabel("1.00")
-        self.robot2_gripper_value.setMinimumWidth(38)
-
-        self.robot2_gripper_slider.valueChanged.connect(
-            lambda value: self.robot2_gripper_value.setText(
-                f"{value / 100.0:.2f}"
-            )
-        )
-
-        robot2_actions.addWidget(
-            self.robot2_gripper_value
-        )
-
-        self.robot2_gripper_move_button = QPushButton(
-            "MOVE GRIP"
-        )
-        self.robot2_gripper_move_button.setEnabled(False)
-        self.robot2_gripper_move_button.clicked.connect(
-            lambda: self.command_gripper_position(
-                "robot2",
-                self.robot2_gripper_slider.value() / 100.0,
-            )
-        )
-        self.robot2_gripper_move_button.setToolTip(
-            "Send the selected 0.0-1.0 command to Robot 2 gripper. "
-            "Simulation supports OnRobot and Robotiq visualization. "
-            "Real motion is currently enabled only for OnRobot 2FG7."
-        )
-        robot2_actions.addWidget(
-            self.robot2_gripper_move_button
-        )
-
-        robot2_layout.addLayout(
-            robot2_actions
-        )
-
+        robot2_header.addLayout(robot2_gripper_group)
+        robot2_layout.addLayout(robot2_header)
 
         # -----------------------------------------------------
         # Robot 2 Cartesian micro-jog (ROBOT BASE frame)
@@ -2783,14 +2679,14 @@ class WorkcellUI(QMainWindow):
         self.robot1_ip.textChanged.connect(
             lambda _text: self.set_connection_status(
                 self.robot1_connection_status,
-                "NOT TESTED",
+                "TEST",
             )
         )
 
         self.robot2_ip.textChanged.connect(
             lambda _text: self.set_connection_status(
                 self.robot2_connection_status,
-                "NOT TESTED",
+                "TEST",
             )
         )
 
@@ -2859,18 +2755,7 @@ class WorkcellUI(QMainWindow):
         self.camera_column.setObjectName("cameraWorkspace")
         camera_column_layout = QVBoxLayout(self.camera_column)
         camera_column_layout.setContentsMargins(0, 0, 0, 0)
-        camera_column_layout.setSpacing(5)
-
-        camera_workspace_header = QHBoxLayout()
-        camera_workspace_title = QLabel("CAMERAS")
-        camera_workspace_title.setObjectName("cameraWorkspaceTitle")
-        camera_workspace_header.addWidget(camera_workspace_title)
-        camera_workspace_header.addStretch(1)
-
-        self.camera_workspace_status = QLabel("OFF")
-        self.camera_workspace_status.setObjectName("connectionUnknown")
-        camera_workspace_header.addWidget(self.camera_workspace_status)
-        camera_column_layout.addLayout(camera_workspace_header)
+        camera_column_layout.setSpacing(0)
 
         self.camera_splitter = QSplitter(Qt.Vertical)
         self.camera_splitter.setChildrenCollapsible(False)
@@ -3033,72 +2918,95 @@ class WorkcellUI(QMainWindow):
             self.recording_folder_button
         )
 
-        self.recording_settings_section = CollapsibleSection(
-            "Recording settings",
-            expanded=False,
-        )
-        self.recording_settings_section.body_layout.addWidget(
+        sensor_layout.addWidget(
             self.recording_folder_frame
         )
-        sensor_layout.addWidget(
-            self.recording_settings_section
-        )
 
-        # Internal UR7e sensors.
+        # All workcell force/torque telemetry lives in one collapsible section.
+        # The words Force and Torque themselves are the global visibility
+        # toggles; each sensor keeps its own independently selectable CSV rate.
         self.internal_wrench_section = CollapsibleSection(
-            "Force / Torque monitoring",
+            "",
             expanded=False,
         )
+        self.internal_wrench_section.toggle_button.setProperty(
+            "compactHeader", True
+        )
+        self.internal_wrench_section.toggle_button.setFixedWidth(28)
+        self.internal_wrench_section.toggle_button.setToolTip(
+            "Expand or collapse Force / Torque monitoring."
+        )
+        self.internal_wrench_section.header_layout.setStretchFactor(
+            self.internal_wrench_section.toggle_button, 0
+        )
 
-        internal_wrench_layout = QGridLayout()
-        internal_wrench_layout.setContentsMargins(0, 0, 0, 0)
-        internal_wrench_layout.setHorizontalSpacing(8)
-        internal_wrench_layout.setVerticalSpacing(5)
+        self.ft_force_toggle_button = QPushButton("Force")
+        self.ft_force_toggle_button.setObjectName("wrenchHeaderToggleButton")
+        self.ft_force_toggle_button.setCheckable(True)
+        self.ft_force_toggle_button.setChecked(True)
+        self.ft_force_toggle_button.setFixedHeight(26)
+        self.ft_force_toggle_button.setMinimumWidth(52)
+        self.ft_force_toggle_button.setToolTip(
+            "Show or hide force channels for all F/T sensors."
+        )
+        self.ft_force_toggle_button.toggled.connect(
+            self.set_global_wrench_visibility
+        )
+        self.internal_wrench_section.header_layout.addWidget(
+            self.ft_force_toggle_button
+        )
 
-        internal_wrench_layout.addWidget(
+        ft_header_separator = QLabel("/")
+        ft_header_separator.setObjectName("wrenchHeaderText")
+        self.internal_wrench_section.header_layout.addWidget(
+            ft_header_separator
+        )
+
+        self.ft_torque_toggle_button = QPushButton("Torque")
+        self.ft_torque_toggle_button.setObjectName("wrenchHeaderToggleButton")
+        self.ft_torque_toggle_button.setCheckable(True)
+        self.ft_torque_toggle_button.setChecked(False)
+        self.ft_torque_toggle_button.setFixedHeight(26)
+        self.ft_torque_toggle_button.setMinimumWidth(58)
+        self.ft_torque_toggle_button.setToolTip(
+            "Show or hide torque channels for all F/T sensors."
+        )
+        self.ft_torque_toggle_button.toggled.connect(
+            self.set_global_wrench_visibility
+        )
+        self.internal_wrench_section.header_layout.addWidget(
+            self.ft_torque_toggle_button
+        )
+
+        ft_header_suffix = QLabel("monitoring")
+        ft_header_suffix.setObjectName("wrenchHeaderText")
+        self.internal_wrench_section.header_layout.addWidget(
+            ft_header_suffix
+        )
+        self.internal_wrench_section.header_layout.addStretch(1)
+
+        self.internal_wrench_section.body_layout.addWidget(
             self.build_wrench_sensor_panel(
                 "robot1",
-                "Robot 1 — Internal F/T",
-            ),
-            0,
-            0,
+                "R1 Internal",
+            )
         )
-
-        internal_wrench_layout.addWidget(
+        self.internal_wrench_section.body_layout.addWidget(
             self.build_wrench_sensor_panel(
                 "robot2",
-                "Robot 2 — Internal F/T",
-            ),
-            1,
-            0,
+                "R2 Internal",
+            )
         )
-
-        internal_wrench_layout.setColumnStretch(0, 1)
-
-        self.internal_wrench_section.body_layout.addLayout(
-            internal_wrench_layout
-        )
-
-        sensor_layout.addWidget(
-            self.internal_wrench_section
-        )
-
-        # External sensor remains a separate unit.
-        self.external_wrench_section = CollapsibleSection(
-            "External Robotiq FT300-S",
-            expanded=False,
-        )
-
-        self.external_wrench_section.body_layout.addWidget(
+        self.internal_wrench_section.body_layout.addWidget(
             self.build_wrench_sensor_panel(
                 "external",
-                None,
+                "Ext. Robotiq",
                 external=True,
             )
         )
 
         sensor_layout.addWidget(
-            self.external_wrench_section
+            self.internal_wrench_section
         )
 
         # -----------------------------------------------------
@@ -3139,154 +3047,63 @@ class WorkcellUI(QMainWindow):
         external=False,
     ):
 
-        if title:
-            panel = QGroupBox(title)
-        else:
-            panel = QFrame()
-            panel.setObjectName("sensorPanel")
-
+        panel = QFrame()
+        panel.setObjectName("sensorPanel")
         outer_layout = QVBoxLayout(panel)
         outer_layout.setContentsMargins(7, 5, 7, 5)
         outer_layout.setSpacing(4)
 
-        # Primary row: live state and sensor actions only. Recording controls
-        # are kept on their own compact row so the card remains usable when
-        # the left splitter pane is narrow.
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(5)
-        header_layout.addWidget(QLabel("Status:"))
+        title_layout = QHBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(6)
 
-        status_label = QLabel(
-            "STOPPED"
-            if external
-            else "WAITING"
-        )
-        status_label.setObjectName(
-            "connectionUnknown"
-        )
-        header_layout.addWidget(status_label)
-
-        recording_label = QLabel("● REC")
-        recording_label.setObjectName("recordingActive")
-        recording_label.setVisible(False)
-        header_layout.addWidget(recording_label)
-        header_layout.addStretch(1)
-
-        internal_zero_button = None
+        status_indicator = QPushButton("")
+        status_indicator.setObjectName("connectionOffline")
+        status_indicator.setFocusPolicy(Qt.NoFocus)
+        status_indicator.setFixedSize(16, 16)
 
         if external:
-            self.external_ft_start_button = QPushButton(
-                "START"
+            # External F/T: compact square, also used as START/STOP control.
+            status_indicator.setProperty("ftIndicator", True)
+            status_indicator.setToolTip(
+                "Start the external Robotiq F/T stream."
             )
-            self.external_ft_stop_button = QPushButton(
-                "STOP"
+            status_indicator.clicked.connect(
+                self.toggle_external_ft
             )
-            self.external_ft_zero_button = QPushButton(
-                "ZERO"
-            )
-
-            self.external_ft_start_button.setToolTip(
-                "Start the external Robotiq FT300-S stream."
-            )
-            self.external_ft_stop_button.setToolTip(
-                "Stop the external Robotiq FT300-S stream started by this UI."
-            )
-            self.external_ft_zero_button.setToolTip(
-                "Software-zero the external Robotiq FT300-S."
-            )
-
-            self.external_ft_stop_button.setEnabled(False)
-            self.external_ft_zero_button.setEnabled(False)
-
-            self.external_ft_start_button.clicked.connect(
-                self.start_external_ft
-            )
-            self.external_ft_stop_button.clicked.connect(
-                self.stop_external_ft
-            )
-            self.external_ft_zero_button.clicked.connect(
-                self.zero_external_ft
-            )
-
-            header_layout.addWidget(
-                self.external_ft_start_button
-            )
-            header_layout.addWidget(
-                self.external_ft_stop_button
-            )
-            header_layout.addWidget(
-                self.external_ft_zero_button
-            )
-
+            self.external_ft_toggle_button = status_indicator
         else:
-            internal_zero_button = QPushButton(
-                "ZERO"
+            # Internal F/T: compact round traffic-light status dot only.
+            status_indicator.setProperty("ftDot", True)
+            status_indicator.setAttribute(
+                Qt.WA_TransparentForMouseEvents,
+                True,
             )
-            internal_zero_button.setEnabled(False)
-            internal_zero_button.setToolTip(
-                f"Zero the {key} internal UR F/T sensor."
-            )
-            internal_zero_button.clicked.connect(
-                lambda checked=False, sensor_key=key:
-                    self.zero_internal_ft(sensor_key)
-            )
-            header_layout.addWidget(
-                internal_zero_button
+            status_indicator.setToolTip(
+                f"{title} stream is stopped."
             )
 
-        outer_layout.addLayout(header_layout)
+        title_layout.addWidget(status_indicator)
 
-        recording_controls = QHBoxLayout()
-        recording_controls.setSpacing(5)
+        title_label = QLabel(title)
+        title_label.setObjectName("sensorPanelTitle")
+        title_layout.addWidget(title_label)
 
-        view_button = QPushButton(
-            "HIDE TORQUES"
-        )
-        view_button.setCheckable(True)
-        view_button.setChecked(True)
-        view_button.setToolTip(
-            "Show or hide torque channels. Recording follows this selection."
-        )
-        recording_controls.addWidget(view_button)
-        recording_controls.addStretch(1)
-        recording_controls.addWidget(QLabel("REC RATE:"))
-
-        rate_combo = QComboBox()
-        rate_combo.addItem("100 Hz", 100)
-        rate_combo.addItem("50 Hz", 50)
-        rate_combo.addItem("30 Hz", 30)
-        rate_combo.addItem("20 Hz", 20)
-        rate_combo.addItem("10 Hz", 10)
-        rate_combo.setCurrentIndex(0)
-        rate_combo.setMaximumWidth(92)
-        rate_combo.setToolTip(
-            "CSV recording rate only. The wrench sensor and ROS topic "
-            "continue running at the full ~100 Hz source rate."
-        )
-        recording_controls.addWidget(rate_combo)
-
-        start_record_button = QPushButton(
-            "START REC"
-        )
-        start_record_button.setObjectName(
-            "recordStartButton"
-        )
+        start_record_button = QPushButton("●")
+        start_record_button.setObjectName("recordStartButton")
+        start_record_button.setFixedSize(26, 26)
         start_record_button.setEnabled(False)
         start_record_button.setToolTip(
-            "Start CSV recording at the selected rate."
+            "Start CSV recording at this sensor's selected rate."
         )
         start_record_button.clicked.connect(
             lambda checked=False, sensor_key=key:
                 self.start_wrench_recording(sensor_key)
         )
-        recording_controls.addWidget(start_record_button)
 
-        stop_record_button = QPushButton(
-            "STOP REC"
-        )
-        stop_record_button.setObjectName(
-            "recordStopButton"
-        )
+        stop_record_button = QPushButton("■")
+        stop_record_button.setObjectName("recordStopButton")
+        stop_record_button.setFixedSize(26, 26)
         stop_record_button.setEnabled(False)
         stop_record_button.setToolTip(
             "Stop and close this sensor's CSV recording."
@@ -3295,16 +3112,63 @@ class WorkcellUI(QMainWindow):
             lambda checked=False, sensor_key=key:
                 self.stop_wrench_recording(sensor_key)
         )
-        recording_controls.addWidget(stop_record_button)
-        outer_layout.addLayout(recording_controls)
 
-        # Forces and torques are stacked vertically instead of side-by-side.
-        # This costs a little height when torques are visible but removes the
-        # large horizontal minimum that made the telemetry unreadable after
-        # narrowing the splitter.
-        body_layout = QVBoxLayout()
-        body_layout.setSpacing(4)
-        body_layout.setContentsMargins(0, 0, 0, 0)
+        zero_button = QPushButton("")
+        zero_button.setObjectName("zeroIconButton")
+        zero_button.setFixedSize(26, 26)
+        zero_button.setIcon(
+            self.style().standardIcon(QStyle.SP_BrowserReload)
+        )
+        zero_button.setEnabled(False)
+
+        if external:
+            self.external_ft_zero_button = zero_button
+            zero_button.setToolTip(
+                "Software-zero the external Robotiq F/T sensor."
+            )
+            zero_button.clicked.connect(
+                self.zero_external_ft
+            )
+        else:
+            zero_button.setToolTip(
+                f"Zero the {key} internal UR F/T sensor."
+            )
+            zero_button.clicked.connect(
+                lambda checked=False, sensor_key=key:
+                    self.zero_internal_ft(sensor_key)
+            )
+
+        record_rate_combo = QComboBox()
+        record_rate_combo.setObjectName("wrenchRateCombo")
+        for rate in (100, 50, 30, 20, 10):
+            record_rate_combo.addItem(f"{rate} Hz", rate)
+        record_rate_combo.setCurrentIndex(0)
+        record_rate_combo.setFixedWidth(92)
+        record_rate_combo.setMinimumHeight(28)
+        record_rate_combo.setToolTip(
+            f"CSV recording rate for {title}. Live ROS data remain at "
+            "their native source rate."
+        )
+
+        # Keep all per-sensor controls in one aligned header row.
+        # The recording rate stays at the far right on all three cards.
+        title_layout.addStretch(1)
+        title_layout.addWidget(start_record_button)
+        title_layout.addWidget(stop_record_button)
+        title_layout.addWidget(zero_button)
+        title_layout.addWidget(record_rate_combo)
+
+        outer_layout.addLayout(title_layout)
+
+        measurement_widget = QWidget()
+        measurement_layout = QHBoxLayout(measurement_widget)
+        measurement_layout.setContentsMargins(0, 0, 0, 0)
+        measurement_layout.setSpacing(7)
+
+        channels_widget = QWidget()
+        channels_layout = QVBoxLayout(channels_widget)
+        channels_layout.setContentsMargins(0, 0, 0, 0)
+        channels_layout.setSpacing(4)
 
         force_widget = QWidget()
         force_layout = QGridLayout(force_widget)
@@ -3312,31 +3176,11 @@ class WorkcellUI(QMainWindow):
         force_layout.setHorizontalSpacing(5)
         force_layout.setVerticalSpacing(2)
 
-        force_title = QLabel("FORCES [N]")
-        force_title.setObjectName("wrenchColumnTitle")
-        force_layout.addWidget(
-            force_title,
-            0,
-            0,
-            1,
-            3,
-        )
-
         torque_widget = QWidget()
         torque_layout = QGridLayout(torque_widget)
         torque_layout.setContentsMargins(0, 0, 0, 0)
         torque_layout.setHorizontalSpacing(5)
         torque_layout.setVerticalSpacing(2)
-
-        torque_title = QLabel("TORQUES [Nm]")
-        torque_title.setObjectName("wrenchColumnTitle")
-        torque_layout.addWidget(
-            torque_title,
-            0,
-            0,
-            1,
-            3,
-        )
 
         labels = {}
         bars = {}
@@ -3354,7 +3198,7 @@ class WorkcellUI(QMainWindow):
 
         for row, (component, display) in enumerate(
             force_components,
-            start=1,
+            start=0,
         ):
             name_label = QLabel(display)
             value_label = QLabel("--")
@@ -3374,13 +3218,13 @@ class WorkcellUI(QMainWindow):
         magnitude_label.setToolTip(
             "Force-vector magnitude sqrt(Fx² + Fy² + Fz²)."
         )
-        force_layout.addWidget(magnitude_name, 4, 0)
-        force_layout.addWidget(magnitude_label, 4, 1)
-        force_layout.addWidget(QLabel("vector magnitude"), 4, 2)
+        force_layout.addWidget(magnitude_name, 3, 0)
+        force_layout.addWidget(magnitude_label, 3, 1)
+        force_layout.addWidget(QLabel("vector magnitude"), 3, 2)
 
         for row, (component, display) in enumerate(
             torque_components,
-            start=1,
+            start=0,
         ):
             name_label = QLabel(display)
             value_label = QLabel("--")
@@ -3397,57 +3241,96 @@ class WorkcellUI(QMainWindow):
         force_layout.setColumnStretch(2, 1)
         torque_layout.setColumnStretch(2, 1)
 
-        body_layout.addWidget(force_widget)
-        body_layout.addWidget(torque_widget)
-        outer_layout.addLayout(body_layout)
+        section_divider = QFrame()
+        section_divider.setObjectName("wrenchSectionDivider")
+        section_divider.setFrameShape(QFrame.HLine)
+        section_divider.setFixedHeight(1)
+
+        channels_layout.addWidget(force_widget)
+        channels_layout.addWidget(section_divider)
+        channels_layout.addWidget(torque_widget)
+        measurement_layout.addWidget(channels_widget, 1)
+        outer_layout.addWidget(measurement_widget)
 
         self.wrench_panels[key] = {
             "panel": panel,
-            "status": status_label,
-            "recording_label": recording_label,
-            "view_button": view_button,
-            "rate_combo": rate_combo,
+            "status_indicator": status_indicator,
+            "status_state": "stopped",
+            "record_rate_combo": record_rate_combo,
             "start_record_button": start_record_button,
             "stop_record_button": stop_record_button,
+            "zero_button": zero_button,
+            "measurement_widget": measurement_widget,
             "force_widget": force_widget,
+            "section_divider": section_divider,
             "torque_widget": torque_widget,
             "magnitude_label": magnitude_label,
             "labels": labels,
             "bars": bars,
         }
 
-        if internal_zero_button is not None:
-            self.wrench_panels[key]["zero_button"] = (
-                internal_zero_button
-            )
-
-        view_button.toggled.connect(
-            lambda checked, sensor_key=key:
-                self.set_torque_visibility(
-                    sensor_key,
-                    checked,
-                )
+        # The global F/T buttons in the section header control every sensor.
+        force_widget.setVisible(
+            bool(getattr(self, "ft_force_toggle_button", None)
+                 and self.ft_force_toggle_button.isChecked())
         )
+        torque_widget.setVisible(
+            bool(getattr(self, "ft_torque_toggle_button", None)
+                 and self.ft_torque_toggle_button.isChecked())
+        )
+        section_divider.setVisible(
+            force_widget.isVisible() and torque_widget.isVisible()
+        )
+        if external:
+            measurement_widget.setVisible(False)
 
         return panel
 
-    def set_torque_visibility(
-        self,
-        key,
-        show_torques,
-    ):
+    def set_global_wrench_visibility(self, *_args):
+        if not hasattr(self, "wrench_panels"):
+            return
 
-        panel = self.wrench_panels[key]
-
-        panel["torque_widget"].setVisible(
-            show_torques
+        show_forces = bool(
+            hasattr(self, "ft_force_toggle_button")
+            and self.ft_force_toggle_button.isChecked()
+        )
+        show_torques = bool(
+            hasattr(self, "ft_torque_toggle_button")
+            and self.ft_torque_toggle_button.isChecked()
         )
 
-        panel["view_button"].setText(
-            "HIDE TORQUES"
-            if show_torques
-            else "SHOW TORQUES"
-        )
+        for key, panel in self.wrench_panels.items():
+            sensor_visible = key != "external" or self.external_ft_live
+            panel["force_widget"].setVisible(
+                sensor_visible and show_forces
+            )
+            panel["torque_widget"].setVisible(
+                sensor_visible and show_torques
+            )
+            panel["section_divider"].setVisible(
+                sensor_visible and show_forces and show_torques
+            )
+
+        self.update_external_wrench_visibility()
+
+    def update_external_wrench_visibility(self):
+        panel = self.wrench_panels.get("external")
+        if panel is None:
+            return
+
+        live = bool(self.external_ft_live)
+        panel["measurement_widget"].setVisible(live)
+        if live:
+            panel["force_widget"].setVisible(
+                self.ft_force_toggle_button.isChecked()
+            )
+            panel["torque_widget"].setVisible(
+                self.ft_torque_toggle_button.isChecked()
+            )
+            panel["section_divider"].setVisible(
+                self.ft_force_toggle_button.isChecked()
+                and self.ft_torque_toggle_button.isChecked()
+            )
 
     def set_wrench_status(
         self,
@@ -3456,32 +3339,26 @@ class WorkcellUI(QMainWindow):
         state,
     ):
 
-        label = self.wrench_panels[key][
-            "status"
-        ]
+        panel = self.wrench_panels[key]
+        panel["status_state"] = state
 
-        label.setText(text)
-
-        object_names = {
-            "live": "connectionReachable",
-            "waiting": "connectionTesting",
-            "stopped": "connectionUnknown",
-            "error": "connectionOffline",
-        }
-
-        label.setObjectName(
-            object_names.get(
-                state,
-                "connectionUnknown",
+        indicator = panel.get("status_indicator")
+        if indicator is not None:
+            object_names = {
+                "live": "connectionReachable",
+                "waiting": "connectionTesting",
+                "stopped": "connectionOffline",
+                "error": "connectionOffline",
+            }
+            indicator.setObjectName(
+                object_names.get(state, "connectionOffline")
             )
-        )
+            indicator.setToolTip(text)
+            indicator.style().unpolish(indicator)
+            indicator.style().polish(indicator)
 
-        label.style().unpolish(
-            label
-        )
-        label.style().polish(
-            label
-        )
+        if key == "external":
+            self.update_external_wrench_visibility()
 
     def set_wrench_values(
         self,
@@ -4104,32 +3981,6 @@ class WorkcellUI(QMainWindow):
                     self.setup_combo.currentText() == "Dual UR7e"
                 )
 
-        if live_count == 2:
-            text = "2/2 LIVE"
-            state = "live"
-        elif live_count == 1:
-            text = "1/2 LIVE"
-            state = "waiting"
-        else:
-            text = "OFF"
-            state = "off"
-
-        self.camera_workspace_status.setText(text)
-        object_names = {
-            "live": "connectionReachable",
-            "waiting": "connectionTesting",
-            "off": "connectionUnknown",
-        }
-        self.camera_workspace_status.setObjectName(
-            object_names[state]
-        )
-        self.camera_workspace_status.style().unpolish(
-            self.camera_workspace_status
-        )
-        self.camera_workspace_status.style().polish(
-            self.camera_workspace_status
-        )
-
     # =========================================================
     # Wrench CSV recording
     # =========================================================
@@ -4180,7 +4031,7 @@ class WorkcellUI(QMainWindow):
         if self.wrench_listener.is_recording(key):
             return
 
-        if panel["status"].text() != "LIVE":
+        if panel.get("status_state") != "live":
             QMessageBox.warning(
                 self,
                 "Sensor not live",
@@ -4224,7 +4075,7 @@ class WorkcellUI(QMainWindow):
         )
 
         record_rate_hz = int(
-            panel["rate_combo"].currentData()
+            panel["record_rate_combo"].currentData()
         )
 
         filename = (
@@ -4233,7 +4084,7 @@ class WorkcellUI(QMainWindow):
         path = os.path.join(folder, filename)
 
         include_torque = bool(
-            panel["view_button"].isChecked()
+            self.ft_torque_toggle_button.isChecked()
         )
 
         try:
@@ -4250,10 +4101,6 @@ class WorkcellUI(QMainWindow):
                 f"Could not start CSV recording:\n{exc}",
             )
             return
-
-        panel["recording_label"].setVisible(True)
-        panel["view_button"].setEnabled(False)
-        panel["rate_combo"].setEnabled(False)
 
         channels = (
             "Fx, Fy, Fz, Mx, My, Mz"
@@ -4273,12 +4120,6 @@ class WorkcellUI(QMainWindow):
             return
 
         path = self.wrench_listener.stop_recording(key)
-
-        panel = self.wrench_panels.get(key)
-        if panel is not None:
-            panel["recording_label"].setVisible(False)
-            panel["view_button"].setEnabled(True)
-            panel["rate_combo"].setEnabled(True)
 
         if path and not silent:
             self.log_output.appendPlainText(
@@ -4304,9 +4145,14 @@ class WorkcellUI(QMainWindow):
             and self.mode_combo.currentText() == "Real Robot(s)"
         )
 
+        any_recording = any(
+            self.wrench_listener.is_recording(key)
+            for key in self.wrench_panels
+        )
+
         for key, panel in self.wrench_panels.items():
             recording = self.wrench_listener.is_recording(key)
-            live = panel["status"].text() == "LIVE"
+            live = panel.get("status_state") == "live"
 
             panel["start_record_button"].setEnabled(
                 dual_real
@@ -4316,14 +4162,13 @@ class WorkcellUI(QMainWindow):
             panel["stop_record_button"].setEnabled(
                 recording
             )
-            panel["recording_label"].setVisible(
-                recording
-            )
-            panel["view_button"].setEnabled(
-                not recording
-            )
-            panel["rate_combo"].setEnabled(
+            panel["record_rate_combo"].setEnabled(
                 dual_real and not recording
+            )
+
+        if hasattr(self, "ft_torque_toggle_button"):
+            self.ft_torque_toggle_button.setEnabled(
+                not any_recording
             )
 
     # =========================================================
@@ -4355,39 +4200,21 @@ class WorkcellUI(QMainWindow):
             "robot2",
         ):
 
-            panel = self.wrench_panels.get(
-                key
-            )
-
-            if (
-                panel is None
-                or "zero_button" not in panel
-            ):
+            panel = self.wrench_panels.get(key)
+            if panel is None:
                 continue
 
-            process = (
-                self.internal_ft_zero_processes[
-                    key
-                ]
-            )
+            process = self.internal_ft_zero_processes[key]
+            busy = process.state() != QProcess.NotRunning
+            live = panel.get("status_state") == "live"
+            zero_button = panel["zero_button"]
 
-            busy = (
-                process.state()
-                != QProcess.NotRunning
-            )
-
-            live = (
-                panel["status"].text()
-                == "LIVE"
-            )
-
-            panel["zero_button"].setText(
-                "ZEROING..."
+            zero_button.setToolTip(
+                "Zeroing internal F/T sensor..."
                 if busy
-                else "ZERO"
+                else f"Zero the {key} internal UR F/T sensor."
             )
-
-            panel["zero_button"].setEnabled(
+            zero_button.setEnabled(
                 dual_real
                 and system_running
                 and live
@@ -4421,8 +4248,8 @@ class WorkcellUI(QMainWindow):
 
         if (
             panel is None
-            or panel["status"].text()
-            != "LIVE"
+            or panel.get("status_state")
+            != "live"
         ):
             return
 
@@ -4532,45 +4359,56 @@ class WorkcellUI(QMainWindow):
     # External Robotiq FT300-S
     # =========================================================
 
-    def update_external_ft_controls(self):
-
-        if not hasattr(
-            self,
-            "external_ft_start_button",
+    def toggle_external_ft(self):
+        """Toggle the UI-owned external FT300 stream from its status square."""
+        if (
+            self.setup_combo.currentText() != "Dual UR7e"
+            or self.mode_combo.currentText() != "Real Robot(s)"
         ):
             return
 
+        if self.ft_process.state() != QProcess.NotRunning:
+            self.stop_external_ft()
+            return
+
+        # A live stream not owned by this UI must not be killed implicitly.
+        if self.external_ft_live:
+            return
+
+        self.start_external_ft()
+
+    def update_external_ft_controls(self):
+
+        if not hasattr(self, "external_ft_toggle_button"):
+            return
+
         dual_real = (
-            self.setup_combo.currentText()
-            == "Dual UR7e"
-            and self.mode_combo.currentText()
-            == "Real Robot(s)"
+            self.setup_combo.currentText() == "Dual UR7e"
+            and self.mode_combo.currentText() == "Real Robot(s)"
         )
-
         process_running = (
-            self.ft_process.state()
-            != QProcess.NotRunning
+            self.ft_process.state() != QProcess.NotRunning
         )
-
         zero_idle = (
-            self.ft_zero_process.state()
-            == QProcess.NotRunning
+            self.ft_zero_process.state() == QProcess.NotRunning
         )
 
-        # If /external_ft is already live from a manually started
-        # node, do not start a second process that would compete for
-        # /dev/ttyUSB0.
-        self.external_ft_start_button.setEnabled(
-            dual_real
-            and not process_running
-            and not self.external_ft_live
-        )
+        toggle = self.external_ft_toggle_button
+        toggle.setEnabled(dual_real)
 
-        # STOP only controls the F/T process started by this UI.
-        self.external_ft_stop_button.setEnabled(
-            dual_real
-            and process_running
-        )
+        if process_running:
+            toggle.setToolTip(
+                "Stop the external Robotiq FT300-S stream."
+            )
+        elif self.external_ft_live:
+            toggle.setToolTip(
+                "External FT300-S is LIVE from another process; "
+                "stop that process externally."
+            )
+        else:
+            toggle.setToolTip(
+                "Start the external Robotiq FT300-S stream."
+            )
 
         self.external_ft_zero_button.setEnabled(
             dual_real
@@ -5083,14 +4921,11 @@ class WorkcellUI(QMainWindow):
             == "Real Robot(s)"
         )
 
-        if hasattr(self, "recording_settings_section"):
-            self.recording_settings_section.setVisible(dual_real)
+        if hasattr(self, "recording_folder_frame"):
+            self.recording_folder_frame.setVisible(dual_real)
 
         if hasattr(self, "internal_wrench_section"):
             self.internal_wrench_section.setVisible(dual_real)
-
-        if hasattr(self, "external_wrench_section"):
-            self.external_wrench_section.setVisible(dual_real)
 
         if not dual_real and hasattr(self, "wrench_listener"):
             self.stop_all_wrench_recordings(silent=True)
@@ -5101,7 +4936,7 @@ class WorkcellUI(QMainWindow):
         if hasattr(self, "internal_ft_zero_processes"):
             self.update_internal_ft_controls()
 
-        if hasattr(self, "external_ft_start_button"):
+        if hasattr(self, "external_ft_toggle_button"):
             self.update_external_ft_controls()
 
         if hasattr(self, "wrench_panels"):
@@ -5134,41 +4969,40 @@ class WorkcellUI(QMainWindow):
         status
     ):
 
-        label.setText(
-            status
+        label.setProperty("connectionState", status)
+        compact_indicator = bool(
+            label.property("compactIndicator")
         )
+
+        if compact_indicator:
+            label.setText("")
+            tooltips = {
+                "REACHABLE": "Connection reachable. Click to test again.",
+                "OFFLINE": "Connection offline. Click to test again.",
+                "TESTING...": "Testing network connection...",
+            }
+            label.setToolTip(
+                tooltips.get(status, "Click to test the network connection.")
+            )
+        else:
+            label.setText(status)
 
         if status == "REACHABLE":
-
-            label.setObjectName(
-                "connectionReachable"
-            )
-
-        elif status == "OFFLINE":
-
-            label.setObjectName(
-                "connectionOffline"
-            )
-
+            label.setObjectName("connectionReachable")
         elif status == "TESTING...":
-
-            label.setObjectName(
-                "connectionTesting"
-            )
-
+            label.setObjectName("connectionTesting")
+        elif status == "OFFLINE" or compact_indicator:
+            # Compact dual-robot indicators are deliberately red until a
+            # successful ping turns them green.
+            label.setObjectName("connectionOffline")
         else:
+            label.setObjectName("connectionUnknown")
 
-            label.setObjectName(
-                "connectionUnknown"
-            )
+        label.style().unpolish(label)
+        label.style().polish(label)
 
-        label.style().unpolish(
-            label
-        )
-
-        label.style().polish(
-            label
-        )
+    def connection_status_state(self, widget):
+        return str(widget.property("connectionState") or widget.text())
 
     # =========================================================
     # Ping helper
@@ -5302,7 +5136,7 @@ class WorkcellUI(QMainWindow):
         ):
             self.set_connection_status(
                 self.robot1_connection_status,
-                "NOT TESTED"
+                "TEST"
             )
             return
 
@@ -5349,7 +5183,7 @@ class WorkcellUI(QMainWindow):
         ):
             self.set_connection_status(
                 self.robot2_connection_status,
-                "NOT TESTED"
+                "TEST"
             )
             return
 
@@ -5371,8 +5205,10 @@ class WorkcellUI(QMainWindow):
     def clear_connection_test_warning_if_ready(self):
 
         both_reachable = (
-            self.robot1_connection_status.text() == "REACHABLE"
-            and self.robot2_connection_status.text() == "REACHABLE"
+            self.connection_status_state(self.robot1_connection_status)
+            == "REACHABLE"
+            and self.connection_status_state(self.robot2_connection_status)
+            == "REACHABLE"
         )
 
         if (
@@ -6445,8 +6281,8 @@ class WorkcellUI(QMainWindow):
 
         self.robot1_gripper_move_button.setEnabled(False)
         self.robot2_gripper_move_button.setEnabled(False)
-        self.robot1_gripper_slider.setEnabled(False)
-        self.robot2_gripper_slider.setEnabled(False)
+        self.robot1_gripper_position_spin.setEnabled(False)
+        self.robot2_gripper_position_spin.setEnabled(False)
 
         self.home_process.start(
             "/bin/bash",
@@ -7014,8 +6850,8 @@ class WorkcellUI(QMainWindow):
         self.robot2_home_button.setEnabled(False)
         self.robot1_gripper_move_button.setEnabled(False)
         self.robot2_gripper_move_button.setEnabled(False)
-        self.robot1_gripper_slider.setEnabled(False)
-        self.robot2_gripper_slider.setEnabled(False)
+        self.robot1_gripper_position_spin.setEnabled(False)
+        self.robot2_gripper_position_spin.setEnabled(False)
 
         self.experiment_status_label.setText("RUNNING")
         self.experiment_status_label.setObjectName(
@@ -7505,9 +7341,23 @@ class WorkcellUI(QMainWindow):
 
         return (
             "onrobot"
-            if combo.currentText() == "OnRobot 2FG7"
+            if combo.currentText() == "OnRobot"
             else "robotiq"
         )
+
+    def update_gripper_percent_style(self, spinbox, percent):
+        """Color the gripper percentage by opening range."""
+        if percent >= 20:
+            state = "open"
+        elif percent > 10:
+            state = "partial"
+        else:
+            state = "closed"
+
+        spinbox.setProperty("gripperState", state)
+        spinbox.style().unpolish(spinbox)
+        spinbox.style().polish(spinbox)
+        spinbox.update()
 
     def update_gripper_buttons(self):
 
@@ -7579,11 +7429,11 @@ class WorkcellUI(QMainWindow):
             and setup_motion_idle
             and experiment_idle
         )
-        self.robot1_gripper_slider.setEnabled(
+        self.robot1_gripper_position_spin.setEnabled(
             slider_base_enabled
             and robot1_real_backend_ready
         )
-        self.robot2_gripper_slider.setEnabled(
+        self.robot2_gripper_position_spin.setEnabled(
             slider_base_enabled
             and robot2_real_backend_ready
         )
@@ -7709,8 +7559,8 @@ class WorkcellUI(QMainWindow):
         self.update_gripper_buttons()
         self.robot1_gripper_move_button.setEnabled(False)
         self.robot2_gripper_move_button.setEnabled(False)
-        self.robot1_gripper_slider.setEnabled(False)
-        self.robot2_gripper_slider.setEnabled(False)
+        self.robot1_gripper_position_spin.setEnabled(False)
+        self.robot2_gripper_position_spin.setEnabled(False)
 
         self.gripper_process.start(
             "/bin/bash",
@@ -7922,11 +7772,11 @@ class WorkcellUI(QMainWindow):
 
         if setup == "Dual UR7e" and real_mode:
             robot1_ready = (
-                self.robot1_connection_status.text()
+                self.connection_status_state(self.robot1_connection_status)
                 == "REACHABLE"
             )
             robot2_ready = (
-                self.robot2_connection_status.text()
+                self.connection_status_state(self.robot2_connection_status)
                 == "REACHABLE"
             )
 
@@ -8433,7 +8283,6 @@ class WorkcellUI(QMainWindow):
 
         if _process_group_exists(self.ros_process_group_id):
             self._signal_ros_process_group(signal.SIGKILL)
-            time.sleep(0.2)
 
         if not _process_group_exists(self.ros_process_group_id):
             self.ros_process_group_id = None
@@ -8586,11 +8435,6 @@ class WorkcellUI(QMainWindow):
                 font-weight: 600;
             }
 
-            QLabel#subtitle {
-                color: #9aa0a6;
-                margin-bottom: 2px;
-            }
-
             QLabel#robotSectionTitle {
                 font-size: 14px;
                 font-weight: 700;
@@ -8635,13 +8479,6 @@ class WorkcellUI(QMainWindow):
                 color: #80868b;
                 font-size: 14px;
                 font-weight: 600;
-            }
-
-            QLabel#cameraWorkspaceTitle {
-                font-size: 12px;
-                font-weight: 800;
-                color: #bdc1c6;
-                letter-spacing: 1px;
             }
 
             QFrame#cameraPanel {
@@ -8695,30 +8532,155 @@ class WorkcellUI(QMainWindow):
 
             QFrame#sensorPanel {
                 background: #202124;
+                border: 1px solid #3c4043;
+                border-radius: 7px;
+            }
+
+            QLabel#sensorPanelTitle {
+                font-weight: 700;
+                color: #e8eaed;
+            }
+
+            QFrame#wrenchSectionDivider {
+                background: #3c4043;
                 border: 0px;
+                min-height: 1px;
+                max-height: 1px;
+                margin: 3px 0px;
+            }
+
+            QFrame#collapsibleHeader {
+                background: #292a2d;
+                border: 1px solid #3c4043;
+                border-radius: 7px;
             }
 
             QPushButton#collapseButton {
                 min-height: 30px;
                 text-align: left;
                 padding-left: 10px;
-                background: #292a2d;
-                border: 1px solid #3c4043;
-                border-radius: 7px;
+                background: transparent;
+                border: 0px;
+                border-radius: 0px;
                 font-weight: 700;
             }
 
-            QPushButton#collapseButton:checked {
-                border-bottom-left-radius: 0px;
-                border-bottom-right-radius: 0px;
+            QPushButton#collapseButton[compactHeader="true"] {
+                min-width: 28px;
+                max-width: 28px;
+                padding-left: 5px;
+                padding-right: 0px;
             }
 
-            QPushButton#recordStartButton:enabled {
-                background: #245c34;
+            QPushButton#wrenchHeaderToggleButton {
+                min-height: 26px;
+                max-height: 26px;
+                padding: 0px 7px;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                background: transparent;
+                color: #e8eaed;
+                font-weight: 700;
             }
 
-            QPushButton#recordStopButton:enabled {
-                background: #7a2e2a;
+            QPushButton#wrenchHeaderToggleButton:checked {
+                background: #315f78;
+                border-color: #8ab4f8;
+                color: #ffffff;
+            }
+
+            QPushButton#wrenchHeaderToggleButton:hover {
+                border-color: #8a9096;
+                background: #303134;
+            }
+
+            QLabel#wrenchHeaderText {
+                color: #e8eaed;
+                font-weight: 700;
+                padding: 0px;
+            }
+
+            QPushButton[ftIndicator="true"] {
+                min-width: 16px;
+                max-width: 16px;
+                min-height: 16px;
+                max-height: 16px;
+                padding: 0px;
+                border-radius: 3px;
+                border: 1px solid #6b7075;
+            }
+
+            QPushButton#connectionReachable[ftIndicator="true"] {
+                background: #00c853;
+                border-color: #39e57a;
+            }
+
+            QPushButton#connectionTesting[ftIndicator="true"] {
+                background: #ffab00;
+                border-color: #ffc43d;
+            }
+
+            QPushButton#connectionOffline[ftIndicator="true"] {
+                background: #e53935;
+                border-color: #ff6f60;
+            }
+
+            /* Internal F/T stream state: compact round traffic-light dot. */
+            QPushButton[ftDot="true"] {
+                min-width: 16px;
+                max-width: 16px;
+                min-height: 16px;
+                max-height: 16px;
+                padding: 0px;
+                border-radius: 8px;
+                border: 1px solid #6b7075;
+            }
+
+            QPushButton#connectionReachable[ftDot="true"] {
+                background: #00c853;
+                border-color: #39e57a;
+            }
+
+            QPushButton#connectionTesting[ftDot="true"] {
+                background: #ffab00;
+                border-color: #ffc43d;
+            }
+
+            QPushButton#connectionOffline[ftDot="true"] {
+                background: #e53935;
+                border-color: #ff6f60;
+            }
+
+            QPushButton#recordStartButton,
+            QPushButton#recordStopButton,
+            QPushButton#zeroIconButton {
+                min-width: 26px;
+                max-width: 26px;
+                min-height: 26px;
+                max-height: 26px;
+                padding: 0px;
+                background: #2b2d30;
+                border: 1px solid #4f5358;
+                border-radius: 5px;
+            }
+
+            QPushButton#recordStartButton {
+                color: #ff5a5f;
+                font-size: 15px;
+                font-weight: 900;
+            }
+
+            QPushButton#recordStopButton {
+                color: #e8eaed;
+                font-size: 13px;
+                font-weight: 900;
+            }
+
+            QPushButton#recordStartButton:enabled:hover,
+            QPushButton#recordStopButton:enabled:hover,
+            QPushButton#zeroIconButton:enabled:hover {
+                background: #4a4d51;
+                border-color: #8a9096;
             }
 
             QLabel#recordingActive {
@@ -8750,7 +8712,8 @@ class WorkcellUI(QMainWindow):
             }
 
             QComboBox,
-            QDoubleSpinBox {
+            QDoubleSpinBox,
+            QSpinBox {
                 background: #303134;
                 color: #ffffff;
                 border: 1px solid #7a7f85;
@@ -8761,9 +8724,76 @@ class WorkcellUI(QMainWindow):
             }
 
             QComboBox:hover,
-            QDoubleSpinBox:hover {
+            QDoubleSpinBox:hover,
+            QSpinBox:hover {
                 border: 1px solid #aeb4ba;
                 background: #35373a;
+            }
+
+            QSpinBox#gripperPercentSpin {
+                padding: 5px 22px 5px 8px;
+                font-weight: 700;
+            }
+
+            QSpinBox#gripperPercentSpin[gripperState="open"] {
+                color: #34d058;
+            }
+
+            QSpinBox#gripperPercentSpin[gripperState="partial"] {
+                color: #f9ab00;
+            }
+
+            QSpinBox#gripperPercentSpin[gripperState="closed"] {
+                color: #ff4d4f;
+            }
+
+            QSpinBox#gripperPercentSpin::up-button,
+            QSpinBox#gripperPercentSpin::down-button {
+                subcontrol-origin: border;
+                width: 18px;
+                background: #3c4043;
+                border-left: 1px solid #5f6368;
+            }
+
+            QSpinBox#gripperPercentSpin::up-button {
+                subcontrol-position: top right;
+                border-top-right-radius: 4px;
+            }
+
+            QSpinBox#gripperPercentSpin::down-button {
+                subcontrol-position: bottom right;
+                border-bottom-right-radius: 4px;
+            }
+
+            QSpinBox#gripperPercentSpin::up-arrow,
+            QSpinBox#gripperPercentSpin::down-arrow {
+                width: 8px;
+                height: 8px;
+            }
+
+            QComboBox#robotGripperCombo {
+                padding: 5px 8px;
+                font-weight: 700;
+            }
+
+            QComboBox#robotGripperCombo::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 26px;
+                border-left: 1px solid #5f6368;
+            }
+
+            QComboBox#wrenchRateCombo {
+                padding: 3px 20px 3px 7px;
+                font-weight: 700;
+                min-width: 86px;
+            }
+
+            QComboBox#wrenchRateCombo::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 18px;
+                border-left: 1px solid #5f6368;
             }
 
             QComboBox::drop-down {
@@ -8857,7 +8887,8 @@ class WorkcellUI(QMainWindow):
                 font-weight: 700;
             }
 
-            QLabel#connectionReachable {
+            QLabel#connectionReachable,
+            QPushButton#connectionReachable {
                 background: #254c32;
                 border-radius: 5px;
                 padding: 2px 6px;
@@ -8865,7 +8896,8 @@ class WorkcellUI(QMainWindow):
                 font-weight: 700;
             }
 
-            QLabel#connectionOffline {
+            QLabel#connectionOffline,
+            QPushButton#connectionOffline {
                 background: #542b29;
                 border-radius: 5px;
                 padding: 2px 6px;
@@ -8873,7 +8905,8 @@ class WorkcellUI(QMainWindow):
                 font-weight: 700;
             }
 
-            QLabel#connectionTesting {
+            QLabel#connectionTesting,
+            QPushButton#connectionTesting {
                 background: #55491f;
                 border-radius: 5px;
                 padding: 2px 6px;
@@ -8881,12 +8914,52 @@ class WorkcellUI(QMainWindow):
                 font-weight: 700;
             }
 
-            QLabel#connectionUnknown {
+            QLabel#connectionUnknown,
+            QPushButton#connectionUnknown {
                 background: #303134;
                 border-radius: 5px;
                 padding: 2px 6px;
                 color: #9aa0a6;
                 font-weight: 700;
+            }
+
+            /* Compact dual-robot ping indicators: true square controls with
+               strong traffic-light colors and no text/padding distortion. */
+            QPushButton[compactIndicator="true"] {
+                min-width: 30px;
+                max-width: 30px;
+                min-height: 30px;
+                max-height: 30px;
+                padding: 0px;
+                border-radius: 5px;
+                border: 1px solid #6b7075;
+            }
+
+            QPushButton#connectionReachable[compactIndicator="true"] {
+                background: #00c853;
+                border-color: #39e57a;
+            }
+
+            QPushButton#connectionTesting[compactIndicator="true"] {
+                background: #ffab00;
+                border-color: #ffc43d;
+            }
+
+            QPushButton#connectionOffline[compactIndicator="true"] {
+                background: #e53935;
+                border-color: #ff6f60;
+            }
+
+            QPushButton#connectionReachable[compactIndicator="true"]:hover {
+                background: #18d766;
+            }
+
+            QPushButton#connectionTesting[compactIndicator="true"]:hover {
+                background: #ffb81c;
+            }
+
+            QPushButton#connectionOffline[compactIndicator="true"]:hover {
+                background: #f04a45;
             }
 
             QLabel#systemWarning {
