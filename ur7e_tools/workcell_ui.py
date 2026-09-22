@@ -146,6 +146,83 @@ MOTION_CONTROLLERS = (
 PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 
 
+DIRECT_EXPERIMENT_BACKENDS = {
+    "Right": {
+        "Full Direct - One Rep": {
+            "filename": "right_hand_direct_single.py",
+            "module": "experiment_backend.right_hand_direct_single",
+        },
+        "Full Direct - Demo": {
+            "filename": "right_hand_direct_demo.py",
+            "module": "experiment_backend.right_hand_direct_demo",
+        },
+    },
+    "Left": {
+        # Left is a static-hold interaction experiment.  Both UI task labels
+        # intentionally execute the same backend; protocol is metadata only.
+        "Full Direct - One Rep": {
+            "filename": "left_hand_direct.py",
+            "module": "experiment_backend.left_hand_direct",
+            "protocol": "single",
+        },
+        "Full Direct - Demo": {
+            "filename": "left_hand_direct.py",
+            "module": "experiment_backend.left_hand_direct",
+            "protocol": "demo",
+        },
+    },
+}
+
+
+def direct_experiment_launch_spec(selection, real_mode):
+    """Return the Direct backend selected by the Experiment row, if valid."""
+    selection = tuple(selection)
+    if len(selection) != 4:
+        return None
+
+    task, hand, control, motion = selection
+    if (control, motion) != ("Open-loop", "Task Space"):
+        return None
+
+    by_hand = DIRECT_EXPERIMENT_BACKENDS.get(hand)
+    if by_hand is None:
+        return None
+    backend = by_hand.get(task)
+    if backend is None:
+        return None
+
+    return {
+        "filename": backend["filename"],
+        "module": backend["module"],
+        "mode": "real" if real_mode else "simulation",
+        "protocol": backend.get("protocol"),
+    }
+
+
+def experiment_task_uses_ui_speed(task_name):
+    """Only the standalone Compound/Polishing runs use the UI speed spinbox."""
+    return task_name in {"Compound", "Polishing"}
+
+
+def analysis_trial_sort_timestamp(trial_dir, metadata):
+    """Return a stable chronological timestamp for the analysis selector."""
+    for key in ("created_utc", "completed_utc"):
+        value = metadata.get(key)
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+    try:
+        return Path(trial_dir).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 # -------------------------------------------------------------------------
 # Workcell supervisor preflight
 # -------------------------------------------------------------------------
@@ -2334,6 +2411,8 @@ class WorkcellUI(QMainWindow):
             "Compound",
             "Polishing",
             "Full Protocol",
+            "Full Direct - One Rep",
+            "Full Direct - Demo",
         ])
         experiment_controls_layout.addWidget(
             self.experiment_task_combo
@@ -2414,8 +2493,8 @@ class WorkcellUI(QMainWindow):
         self.analysis_trial_combo.setObjectName(
             "analysisTrialCombo"
         )
-        self.analysis_trial_combo.setMinimumWidth(150)
-        self.analysis_trial_combo.setMaximumWidth(220)
+        self.analysis_trial_combo.setMinimumWidth(360)
+        self.analysis_trial_combo.setMaximumWidth(560)
         self.analysis_trial_combo.setToolTip(
             "Choose a completed experiment trial to analyze."
         )
@@ -2436,6 +2515,10 @@ class WorkcellUI(QMainWindow):
             self.refresh_analysis_button
         )
 
+        # Keep trial browsing together on the left, while reserving the far
+        # right edge for the analysis action and its status indicator.
+        experiment_controls_layout.addStretch(1)
+
         self.analyze_trial_button = QPushButton("ANALYZE")
         self.analyze_trial_button.setEnabled(False)
         self.analyze_trial_button.clicked.connect(
@@ -2454,7 +2537,6 @@ class WorkcellUI(QMainWindow):
             self.analysis_status_label
         )
 
-        experiment_controls_layout.addStretch(1)
         experiment_layout.addLayout(
             experiment_controls_layout
         )
@@ -6510,39 +6592,42 @@ class WorkcellUI(QMainWindow):
         else:
             selection = self._selected_experiment()
 
-            # Full Protocol uses independently validated Compound/Polishing
-            # speeds from right_hand_mvp.json, so the single-speed UI control
-            # must not imply that it overrides the protocol.
+            # The UI speed spinbox applies only to the standalone
+            # Compound/Polishing runs. Full Protocol and both Direct runs keep
+            # their validated backend timing and must not imply an override.
             if hasattr(self, "experiment_speed_spin"):
                 self.experiment_speed_spin.setEnabled(
-                    selection != (
+                    experiment_task_uses_ui_speed(selection[0])
+                )
+
+            direct_launch = direct_experiment_launch_spec(
+                selection,
+                real_mode=real_mode,
+            )
+
+            implemented = (
+                selection in {
+                    (
+                        "Compound",
+                        "Right",
+                        "Open-loop",
+                        "Task Space",
+                    ),
+                    (
+                        "Polishing",
+                        "Right",
+                        "Open-loop",
+                        "Task Space",
+                    ),
+                    (
                         "Full Protocol",
                         "Right",
                         "Open-loop",
                         "Task Space",
-                    )
-                )
-
-            implemented = selection in {
-                (
-                    "Compound",
-                    "Right",
-                    "Open-loop",
-                    "Task Space",
-                ),
-                (
-                    "Polishing",
-                    "Right",
-                    "Open-loop",
-                    "Task Space",
-                ),
-                (
-                    "Full Protocol",
-                    "Right",
-                    "Open-loop",
-                    "Task Space",
-                ),
-            }
+                    ),
+                }
+                or direct_launch is not None
+            )
 
             self.experiment_status_label.setText(
                 "READY" if implemented else "NOT READY"
@@ -6605,10 +6690,42 @@ class WorkcellUI(QMainWindow):
             "Task Space",
         )
 
+        direct_one_rep_selection = (
+            "Full Direct - One Rep",
+            "Right",
+            "Open-loop",
+            "Task Space",
+        )
+
+        direct_demo_selection = (
+            "Full Direct - Demo",
+            "Right",
+            "Open-loop",
+            "Task Space",
+        )
+
+        left_direct_one_rep_selection = (
+            "Full Direct - One Rep",
+            "Left",
+            "Open-loop",
+            "Task Space",
+        )
+
+        left_direct_demo_selection = (
+            "Full Direct - Demo",
+            "Left",
+            "Open-loop",
+            "Task Space",
+        )
+
         if selection not in {
             compound_selection,
             polishing_selection,
             full_protocol_selection,
+            direct_one_rep_selection,
+            direct_demo_selection,
+            left_direct_one_rep_selection,
+            left_direct_demo_selection,
         }:
             QMessageBox.information(
                 self,
@@ -6672,6 +6789,11 @@ class WorkcellUI(QMainWindow):
             self.mode_combo.currentText() == "Real Robot(s)"
         )
 
+        direct_launch = direct_experiment_launch_spec(
+            selection,
+            real_mode=real_mode,
+        )
+
         if (
             real_mode
             and (
@@ -6725,7 +6847,11 @@ class WorkcellUI(QMainWindow):
                         "Full Protocol uses its validated per-task speeds "
                         "from config (Compound / Polishing).\n\n"
                         if selection == full_protocol_selection
-                        else f"Speed scale: {speed_scale:.2f} ×\n\n"
+                        else (
+                            "Direct run uses its validated backend timing.\n\n"
+                            if direct_launch is not None
+                            else f"Speed scale: {speed_scale:.2f} ×\n\n"
+                        )
                     )
                     + (
                         "The Full Protocol backend controls Robot 2 string "
@@ -6733,10 +6859,16 @@ class WorkcellUI(QMainWindow):
                         "warm restart trials."
                         if selection == full_protocol_selection
                         else (
-                            "The experiment backend will first verify "
-                            "that Robot 1 is already at the selected "
-                            "trajectory q0, start data acquisition, "
-                            "and then command Robot 1."
+                            "The Direct backend will run the selected protocol "
+                            f"in {'real' if real_mode else 'simulation'} mode "
+                            "using its own validated timing."
+                            if direct_launch is not None
+                            else (
+                                "The experiment backend will first verify "
+                                "that Robot 1 is already at the selected "
+                                "trajectory q0, start data acquisition, "
+                                "and then command Robot 1."
+                            )
                         )
                     )
                 ),
@@ -6779,6 +6911,24 @@ class WorkcellUI(QMainWindow):
                 + shlex.quote(polishing_setup)
             )
             backend_speed_arg = f" --speed-scale {speed_scale:.2f}"
+
+        elif direct_launch is not None:
+            backend = (
+                project_root
+                / "experiment_backend"
+                / direct_launch["filename"]
+            )
+            backend_module = direct_launch["module"]
+            backend_extra_args = (
+                " --mode " + shlex.quote(direct_launch["mode"])
+            )
+            if direct_launch.get("protocol"):
+                backend_extra_args += (
+                    " --protocol "
+                    + shlex.quote(direct_launch["protocol"])
+                )
+            # Direct uses its own validated timing; never pass the UI speed.
+            backend_speed_arg = ""
 
         else:
             backend = (
@@ -6828,7 +6978,11 @@ class WorkcellUI(QMainWindow):
         speed_log = (
             "Config speeds: Compound / Polishing (right_hand_mvp.json)\n"
             if selection == full_protocol_selection
-            else f"Speed scale: {speed_scale:.2f} ×\n"
+            else (
+                "Timing: Direct backend validated timing\n"
+                if direct_launch is not None
+                else f"Speed scale: {speed_scale:.2f} ×\n"
+            )
         )
 
         self.log_output.appendPlainText(
@@ -6910,6 +7064,55 @@ class WorkcellUI(QMainWindow):
         )
         self.update_experiment_controls()
 
+    def _analysis_trial_is_complete(
+        self,
+        trial_dir,
+        metadata,
+    ):
+        timebase = metadata.get("timebase", {})
+
+        if (
+            timebase.get("trial_end_ros_time_ns") is not None
+            or metadata.get("experiment_end_time_utc") is not None
+            or metadata.get("completed_utc") is not None
+            or bool(metadata.get("trial_complete", False))
+        ):
+            return True
+
+        if metadata.get("trial_kind") != "full_direct_protocol":
+            return False
+
+        events_path = trial_dir / "events.jsonl"
+
+        if not events_path.is_file():
+            return False
+
+        try:
+            with events_path.open(
+                "r",
+                encoding="utf-8",
+            ) as f:
+                for line in f:
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if (
+                        event.get("event")
+                        == "DIRECT_PROTOCOL_COMPLETE"
+                    ):
+                        return True
+        except OSError:
+            return False
+
+        return False
+
     def _analysis_trial_label(
         self,
         trial_dir,
@@ -6923,43 +7126,75 @@ class WorkcellUI(QMainWindow):
         timestamp_text = trial_id
         parts = trial_id.split("_")
 
-        if len(parts) >= 3:
+        # Works for both:
+        #   trial_YYYYMMDD_HHMMSS_...
+        #   trial_single_YYYYMMDD_HHMMSS_...
+        #   trial_demo_YYYYMMDD_HHMMSS_...
+        for index in range(len(parts) - 1):
             try:
                 stamp = datetime.strptime(
-                    f"{parts[1]}_{parts[2]}",
+                    f"{parts[index]}_{parts[index + 1]}",
                     "%Y%m%d_%H%M%S",
                 )
                 timestamp_text = stamp.strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
+                break
             except ValueError:
-                pass
+                continue
 
-        if metadata.get("mvp") == "right_hand_compound_then_polishing" or metadata.get("trial_kind") == "full_protocol":
+        trial_kind = metadata.get("trial_kind")
+
+        if trial_kind == "full_direct_protocol":
+            direct_protocol = metadata.get(
+                "direct_protocol",
+                "",
+            )
+
+            if direct_protocol == "single":
+                task = "Full Direct - One Rep"
+            elif direct_protocol == "demo":
+                task = "Full Direct - Demo"
+            else:
+                task = "Full Direct"
+
+        elif (
+            metadata.get("mvp")
+            == "right_hand_compound_then_polishing"
+            or trial_kind == "full_protocol"
+        ):
             task = "Full Protocol"
+
         else:
             task = str(
                 metadata.get("task", "unknown")
             ).replace("_", " ").title()
 
+        full_protocol_like = task in {
+            "Full Protocol",
+            "Full Direct - One Rep",
+            "Full Direct - Demo",
+            "Full Direct",
+        }
+
         hand = str(
             metadata.get(
                 "substituted_human_hand",
-                "right" if task == "Full Protocol" else "unknown",
+                "right" if full_protocol_like else "unknown",
             )
         ).replace("_", " ").title()
 
         control = str(
             metadata.get(
                 "control_mode",
-                "open_loop" if task == "Full Protocol" else "unknown",
+                "open_loop" if full_protocol_like else "unknown",
             )
         ).replace("_", " ").title()
 
         motion = str(
             metadata.get(
                 "motion_method",
-                "task_space" if task == "Full Protocol" else "unknown",
+                "task_space" if full_protocol_like else "unknown",
             )
         ).replace("_", " ").title()
 
@@ -6990,6 +7225,8 @@ class WorkcellUI(QMainWindow):
         trial_roots = [
             project_root / "results" / "experiments",
             project_root / "results" / "mvp_right",
+            project_root / "results" / "direct_right",
+            project_root / "results" / "direct_left",
         ]
 
         completed_trials = []
@@ -7015,15 +7252,10 @@ class WorkcellUI(QMainWindow):
                 except Exception:
                     continue
 
-                timebase = metadata.get("timebase", {})
-                completed = (
-                    timebase.get("trial_end_ros_time_ns") is not None
-                    or metadata.get("experiment_end_time_utc") is not None
-                    or metadata.get("completed_utc") is not None
-                    or bool(metadata.get("trial_complete", False))
-                )
-
-                if not completed:
+                if not self._analysis_trial_is_complete(
+                    trial_dir,
+                    metadata,
+                ):
                     continue
 
                 # A full-protocol registered trial must contain its own bag.
@@ -7033,7 +7265,10 @@ class WorkcellUI(QMainWindow):
                 completed_trials.append((trial_dir, metadata))
 
         completed_trials.sort(
-            key=lambda item: item[0].name,
+            key=lambda item: analysis_trial_sort_timestamp(
+                item[0],
+                item[1],
+            ),
             reverse=True,
         )
 
@@ -7061,6 +7296,7 @@ class WorkcellUI(QMainWindow):
                 self.analysis_trial_combo.setItemData(
                     index,
                     (
+                        f"{label}\n"
                         f"{trial_dir.name}\n"
                         f"{trial_dir}"
                     ),
