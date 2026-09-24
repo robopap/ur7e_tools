@@ -128,6 +128,7 @@ class LatestFrameReceiver:
         self.running = False
         self.lock = threading.Lock()
         self.latest_frame = None
+        self.last_frame_monotonic = None
         self.rate = 0.0
         self.rate_count = 0
         self.rate_t0 = time.monotonic()
@@ -144,6 +145,9 @@ class LatestFrameReceiver:
         self.rate = 0.0
         self.rate_count = 0
         self.rate_t0 = time.monotonic()
+        with self.lock:
+            self.latest_frame = None
+            self.last_frame_monotonic = None
 
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -161,14 +165,15 @@ class LatestFrameReceiver:
             if "Hips" not in frame["joints"]:
                 continue
 
+            now = time.monotonic()
             with self.lock:
                 self.latest_frame = frame
+                self.last_frame_monotonic = now
 
             if self.packet_callback is not None:
                 self.packet_callback(frame)
 
             self.rate_count += 1
-            now = time.monotonic()
             dt = now - self.rate_t0
             if dt >= 1.0:
                 self.rate = self.rate_count / dt
@@ -178,6 +183,29 @@ class LatestFrameReceiver:
     def get_latest(self):
         with self.lock:
             return self.latest_frame
+
+    def stream_health(self, max_age_s=0.5):
+        """Return native UDP freshness without depending on render FPS."""
+        now = time.monotonic()
+        with self.lock:
+            frame = self.latest_frame
+            last = self.last_frame_monotonic
+        age_s = None if last is None else max(0.0, now - last)
+        ready = bool(
+            self.running
+            and frame is not None
+            and age_s is not None
+            and age_s <= float(max_age_s)
+        )
+        return {
+            "ready": ready,
+            "running": bool(self.running),
+            "age_s": age_s,
+            "rate_hz": float(self.rate),
+        }
+
+    def is_streaming(self, max_age_s=0.5):
+        return bool(self.stream_health(max_age_s)["ready"])
 
     def stop(self):
         self.running = False
@@ -194,6 +222,7 @@ class LatestFrameReceiver:
 
         with self.lock:
             self.latest_frame = None
+            self.last_frame_monotonic = None
         self.rate = 0.0
 
 def display_position(frame, joint_name, mirror_lateral=False):
@@ -663,6 +692,12 @@ class NansenseLiveWidget(QWidget):
     def current_frame(self):
         return self.receiver.get_latest()
 
+    def stream_health(self, max_age_s=0.5):
+        return self.receiver.stream_health(max_age_s)
+
+    def is_streaming(self, max_age_s=0.5):
+        return self.receiver.is_streaming(max_age_s)
+
     def toggle_connection(self):
         if self.receiver.running:
             self.disconnect_nansense()
@@ -756,6 +791,11 @@ class NansenseLiveWidget(QWidget):
         if frame is None:
             self.connection_badge.setText(f"WAITING UDP :{UDP_PORT}")
             return
+
+        self.connection_badge.setText("LIVE")
+        self.connection_badge.setObjectName("nansenseOnline")
+        self.connection_badge.style().unpolish(self.connection_badge)
+        self.connection_badge.style().polish(self.connection_badge)
 
         if self.frame_callback is not None:
             self.frame_callback(frame)
