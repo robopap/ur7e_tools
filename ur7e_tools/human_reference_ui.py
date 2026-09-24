@@ -677,7 +677,7 @@ class HumanReferencePanel(QFrame):
             "--pre",
             8,
             "--motion",
-            15,
+            20,
         ]
         self.record_process.start(
             "/bin/bash",
