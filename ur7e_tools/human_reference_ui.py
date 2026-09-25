@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QComboBox,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -147,7 +148,7 @@ def participant_id_from_directory(participant_dir: Path):
     participant_dir = Path(participant_dir).expanduser()
     ids = []
     for gesture in sorted(GESTURES):
-        for rep in (1, 2, 3):
+        for rep in (1,):
             metadata = _read_rep_metadata(participant_dir / gesture / f"rep_{rep:02d}")
             participant = str(metadata.get("participant", "")).strip()
             if participant:
@@ -181,7 +182,7 @@ def scan_gesture_dataset(gesture_dir: Path):
     metadata_gestures = []
     replay_dirs = []
 
-    for rep in (1, 2, 3):
+    for rep in (1,):
         rep_dir = gesture_dir / f"rep_{rep:02d}"
         if not rep_dir.exists():
             continue
@@ -216,19 +217,16 @@ def scan_gesture_dataset(gesture_dir: Path):
     if len(unique_gestures) == 1:
         gesture = unique_gestures[0]
 
-    recordings_complete = valid_reps == [1, 2, 3]
+    recordings_complete = valid_reps == [1]
 
     if recordings_complete:
-        current_rep = 3
+        current_rep = 1
     elif blocked_incomplete_reps:
         # Preserve occupied/incomplete data: point at it and block START TRIAL
         # instead of silently skipping to a later repetition.
         current_rep = blocked_incomplete_reps[0]
     else:
-        current_rep = next(
-            (rep for rep in (1, 2, 3) if rep not in occupied_reps),
-            3,
-        )
+        current_rep = 1
 
     reference_dir = gesture_dir / "reference"
     reference_ready = (
@@ -256,6 +254,8 @@ class HumanReferencePanel(QFrame):
         self,
         mode_provider,
         nansense_ready_provider=None,
+        nansense_alignment_ready_provider=None,
+        nansense_alignment_provider=None,
         robot2_ft_ready_provider=None,
         parent=None,
         project_root=None,
@@ -263,6 +263,8 @@ class HumanReferencePanel(QFrame):
         super().__init__(parent)
         self.mode_provider = mode_provider
         self.nansense_ready_provider = nansense_ready_provider
+        self.nansense_alignment_ready_provider = nansense_alignment_ready_provider
+        self.nansense_alignment_provider = nansense_alignment_provider
         self.robot2_ft_ready_provider = robot2_ft_ready_provider
         self.project_root = Path(
             project_root or "~/phd_polishing_experiments"
@@ -363,8 +365,14 @@ class HumanReferencePanel(QFrame):
         lay.addLayout(row2)
 
         row3 = QHBoxLayout()
-        self.rep_label = QLabel("Rep 1 / 3")
+        self.rep_label = QLabel("1 RECORDING")
         row3.addWidget(self.rep_label)
+        self.zero_world_x = QCheckBox("ZERO WORLD X (Robot1 Z)")
+        self.zero_world_x.setToolTip(
+            "Build-time option only: set RightHand World X displacement to zero. "
+            "Raw NANSENSE, synchronized data, and LeftHand motion remain unchanged."
+        )
+        row3.addWidget(self.zero_world_x)
         row3.addStretch(1)
         self.start_btn = QPushButton("START TRIAL")
         self.start_btn.setEnabled(False)
@@ -419,6 +427,9 @@ class HumanReferencePanel(QFrame):
 
     def input_health(self):
         nansense_ready = self._provider_ready(self.nansense_ready_provider)
+        alignment_ready = self._provider_ready(
+            self.nansense_alignment_ready_provider
+        )
         real_mode = self._mode() == "real"
         robot2_ft_ready = (
             self._provider_ready(self.robot2_ft_ready_provider)
@@ -427,8 +438,9 @@ class HumanReferencePanel(QFrame):
         )
         return {
             "nansense_ready": nansense_ready,
+            "nansense_alignment_ready": alignment_ready,
             "robot2_ft_ready": robot2_ft_ready,
-            "ready": nansense_ready and robot2_ft_ready,
+            "ready": nansense_ready and alignment_ready and robot2_ft_ready,
         }
 
     def _selected_gesture_dir(self):
@@ -457,9 +469,9 @@ class HumanReferencePanel(QFrame):
         self.last_trial_dir = state["replay_dir"]
 
         if self._recordings_complete:
-            self.rep_label.setText("3 / 3 COMPLETE")
+            self.rep_label.setText("RECORDING COMPLETE")
         else:
-            self.rep_label.setText(f"Rep {self.current_rep} / 3")
+            self.rep_label.setText("1 RECORDING")
 
         self.replay_btn.setEnabled(bool(self.last_trial_dir))
         self.build_btn.setEnabled(
@@ -509,7 +521,7 @@ class HumanReferencePanel(QFrame):
         if self._recordings_complete:
             self.start_btn.setEnabled(False)
             self.build_btn.setEnabled(True)
-            self.status.setText("3 REPS READY")
+            self.status.setText("RECORDING READY")
             return
 
         self.build_btn.setEnabled(False)
@@ -518,6 +530,8 @@ class HumanReferencePanel(QFrame):
 
         if not health["nansense_ready"]:
             self.status.setText("WAIT NANSENSE")
+        elif not health["nansense_alignment_ready"]:
+            self.status.setText("LOCK NANSENSE")
         elif not health["robot2_ft_ready"]:
             self.status.setText("WAIT ROBOT2 F/T")
         else:
@@ -609,8 +623,26 @@ class HumanReferencePanel(QFrame):
             QMessageBox.warning(
                 self,
                 "Human Reference inputs",
-                "NANSENSE must be streaming. In Real Robot(s) mode, "
-                "Robot2 internal F/T must also be LIVE.",
+                "NANSENSE must be streaming and ALIGNMENT LOCKED. "
+                "In Real Robot(s) mode, Robot2 internal F/T must also be LIVE.",
+            )
+            return
+
+        try:
+            alignment = (
+                self.nansense_alignment_provider()
+                if self.nansense_alignment_provider is not None
+                else None
+            )
+        except Exception:
+            alignment = None
+        if not isinstance(alignment, dict) or alignment.get("locked") is not True:
+            self.refresh_input_health()
+            QMessageBox.warning(
+                self,
+                "NANSENSE alignment",
+                "The scientific NANSENSE alignment is not locked. "
+                "Set Yaw/Mirror in the NANSENSE widget and press LOCK ALIGNMENT.",
             )
             return
 
@@ -644,7 +676,9 @@ class HumanReferencePanel(QFrame):
             "Start Human Reference Trial",
             f"Participant: {participant}\n"
             f"Gesture: {self.gesture.currentText()}\n"
-            f"Repetition: {self.current_rep} / 3\n\n"
+            "Recording: single 20 s reference\n"
+            f"NANSENSE alignment: Yaw {float(alignment['yaw_deg']):.1f}° | "
+            f"Mirror {'ON' if alignment['mirror_lateral'] else 'OFF'}\n\n"
             f"Target folder:\n{target_dir}\n\n"
             "This will create a new repetition folder. Existing repetition "
             "folders are protected and will never be overwritten or deleted.\n\n"
@@ -653,6 +687,25 @@ class HumanReferencePanel(QFrame):
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        # Re-read immediately before launching so a modified Yaw/Mirror cannot
+        # slip through after the confirmation dialog.
+        try:
+            alignment = (
+                self.nansense_alignment_provider()
+                if self.nansense_alignment_provider is not None
+                else None
+            )
+        except Exception:
+            alignment = None
+        if not isinstance(alignment, dict) or alignment.get("locked") is not True:
+            self.refresh_input_health()
+            QMessageBox.warning(
+                self,
+                "NANSENSE alignment",
+                "Alignment changed or was unlocked before recording. LOCK ALIGNMENT again.",
+            )
             return
 
         self._trial_active = True
@@ -678,6 +731,8 @@ class HumanReferencePanel(QFrame):
             8,
             "--motion",
             20,
+            "--nansense-alignment-json",
+            json.dumps(alignment, separators=(",", ":")),
         ]
         self.record_process.start(
             "/bin/bash",
@@ -737,8 +792,11 @@ class HumanReferencePanel(QFrame):
             self.participant.text().strip(),
             "--gesture",
             self.gesture.currentText().lower(),
-            "--simulation",
         ]
+        if self._mode() == "simulation":
+            args.append("--simulation")
+        if self.zero_world_x.isChecked():
+            args.append("--zero-world-x")
         args.append("--run-ik")
 
         data_python = (
@@ -779,6 +837,19 @@ class HumanReferencePanel(QFrame):
             self.build_btn.setEnabled(self._recordings_complete)
 
     def open_replay(self):
+        reference_replay = (
+            self._selected_gesture_dir()
+            / "reference"
+            / "replay.html"
+        )
+
+        if reference_replay.exists():
+            QProcess.startDetached(
+                "xdg-open",
+                [str(reference_replay)],
+            )
+            return
+
         if self.last_trial_dir and (
             self.last_trial_dir / "replay.html"
         ).exists():
@@ -786,12 +857,13 @@ class HumanReferencePanel(QFrame):
                 "xdg-open",
                 [str(self.last_trial_dir / "replay.html")],
             )
-        else:
-            QMessageBox.information(
-                self,
-                "Replay",
-                "Build/process the trial first to generate replay.html",
-            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Replay",
+            "Build the final reference first to generate reference/replay.html",
+        )
 
     def run_selected_gesture(self):
         if self.sim_process and self.sim_process.state() != QProcess.NotRunning:

@@ -24,8 +24,8 @@ UDP_PORT = 33333
 
 CALIBRATION_DEFAULTS = {
     "x_m": 0.0,
-    "y_m": -0.75,
-    "z_m": 0.45,
+    "y_m": -0.50,
+    "z_m": 0.55,
     "yaw_deg": 0.0,
 }
 
@@ -33,7 +33,7 @@ CALIBRATION_DEFAULTS = {
 # NANSENSE Studio Hips origin is intentionally kept at (0, 0, 0), so these
 # values are a visual placement convenience only.  Relative hand motion is
 # unaffected by this translation.
-SEAT_PLACEMENT_M = (0.0, -0.75, 0.45)
+SEAT_PLACEMENT_M = (0.0, -0.50, 0.55)
 
 # Fixed axis convention used by the ROS/RViz representation before session
 # yaw is applied.  mirror_lateral controls the sign of PX.
@@ -525,7 +525,7 @@ class NansenseLiveWidget(QWidget):
         calibration_grid.setHorizontalSpacing(7)
         calibration_grid.addWidget(QLabel("NANSENSE / Workcell Alignment"), 0, 0, 1, 2)
         target_label = QLabel(
-            "Seat: X 0.00  Y -0.75  Z +0.45 m | XYZ visual; Yaw/Mirror lock"
+            "Seat: X 0.00  Y -0.50  Z +0.55 m | XYZ visual; Yaw/Mirror lock"
         )
         target_label.setObjectName("calibrationHint")
         calibration_grid.addWidget(target_label, 0, 2, 1, 4)
@@ -565,7 +565,7 @@ class NansenseLiveWidget(QWidget):
         self.place_at_seat_button = QPushButton("PLACE AT SEAT")
         self.place_at_seat_button.setObjectName("placementButton")
         self.place_at_seat_button.setToolTip(
-            "Set visual placement to world X=0.00 m, Y=-0.75 m, Z=+0.45 m. "
+            "Set visual placement to world X=0.00 m, Y=-0.50 m, Z=+0.55 m. "
             "Current yaw and mirror setting are preserved."
         )
         self.place_at_seat_button.clicked.connect(self.place_at_seat)

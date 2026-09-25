@@ -3412,6 +3412,12 @@ class WorkcellUI(QMainWindow):
         self.human_reference_panel = HumanReferencePanel(
             mode_provider=lambda: self.mode_combo.currentText(),
             nansense_ready_provider=lambda: self.nansense_widget.is_streaming(),
+            nansense_alignment_ready_provider=(
+                lambda: self.nansense_widget.is_alignment_locked()
+            ),
+            nansense_alignment_provider=(
+                lambda: self.nansense_widget.locked_alignment()
+            ),
             robot2_ft_ready_provider=self._human_reference_robot2_ft_ready,
             parent=self.nansense_center_column,
         )
