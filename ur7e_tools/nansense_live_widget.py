@@ -24,11 +24,26 @@ UDP_PORT = 33333
 
 CALIBRATION_DEFAULTS = {
     "x_m": 0.0,
-    "y_m": 0.0,
-    "z_m": 0.0,
+    "y_m": -0.75,
+    "z_m": 0.45,
     "yaw_deg": 0.0,
 }
 
+# Fixed physical seat location in the ROS workcell world.  The participant's
+# NANSENSE Studio Hips origin is intentionally kept at (0, 0, 0), so these
+# values are a visual placement convenience only.  Relative hand motion is
+# unaffected by this translation.
+SEAT_PLACEMENT_M = (0.0, -0.75, 0.45)
+
+# Fixed axis convention used by the ROS/RViz representation before session
+# yaw is applied.  mirror_lateral controls the sign of PX.
+NANSENSE_TO_ROS_AXIS_CONVENTION = (
+    "ROS X = s*PX, ROS Y = PZ, ROS Z = PY; "
+    "s = -1 when mirror_lateral=true, else +1"
+)
+
+# Kept for backward compatibility with older helper code; the UI no longer
+# exposes the old feet-target placement workflow.
 ZERO_TARGET_M = (0.60, -0.60, 0.0)
 LEFT_FOOT_JOINTS = (
     "LeftFoot", "LeftToeBase", "LeftFootToe", "LeftFootToeTip",
@@ -252,6 +267,47 @@ def opengl_scene_positions(xyz):
         scene_xyz[:, 2] *= -1.0
     return scene_xyz
 
+
+def seat_calibration_values(yaw_deg):
+    """Return the fixed visual seat placement while preserving session yaw."""
+    return {
+        "x_m": float(SEAT_PLACEMENT_M[0]),
+        "y_m": float(SEAT_PLACEMENT_M[1]),
+        "z_m": float(SEAT_PLACEMENT_M[2]),
+        "yaw_deg": float(yaw_deg),
+    }
+
+
+def scientific_alignment_snapshot(values):
+    """Freeze the orientation fields that affect relative hand displacement."""
+    return {
+        "locked": True,
+        "x_m": float(values["x_m"]),
+        "y_m": float(values["y_m"]),
+        "z_m": float(values["z_m"]),
+        "yaw_deg": float(values["yaw_deg"]),
+        "mirror_lateral": bool(values["mirror_lateral"]),
+        "axis_convention": NANSENSE_TO_ROS_AXIS_CONVENTION,
+    }
+
+
+def scientific_alignment_matches(locked, current, yaw_tol_deg=1e-9):
+    """Return whether current scientific orientation still matches the lock.
+
+    XYZ translation is intentionally ignored: it only places the skeleton in
+    RViz and cancels when hand motion is expressed relative to its first
+    sample.  Yaw and mirror affect the displacement direction and therefore
+    invalidate the scientific lock when changed.
+    """
+    if not locked:
+        return False
+    return (
+        abs(float(locked["yaw_deg"]) - float(current["yaw_deg"]))
+        <= float(yaw_tol_deg)
+        and bool(locked["mirror_lateral"])
+        == bool(current["mirror_lateral"])
+    )
+
 def zero_calibration_from_feet(
     frame, target_m, yaw_deg, mirror_lateral=False
 ):
@@ -326,6 +382,7 @@ class NansenseLiveWidget(QWidget):
         )
         self.frame_callback = frame_callback
         self.calibration_callback = calibration_callback
+        self._locked_alignment = None
         config_home = Path(
             os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
         )
@@ -385,6 +442,12 @@ class NansenseLiveWidget(QWidget):
                 border: 1px solid #3f8051;
             }
             QPushButton#saveCalibrationButton:hover { background: #2f7543; }
+            QPushButton#lockAlignmentButton {
+                background: #34506f;
+                border: 1px solid #5f83aa;
+                font-weight: 700;
+            }
+            QPushButton#lockAlignmentButton:hover { background: #41658c; }
             """
         )
 
@@ -448,7 +511,9 @@ class NansenseLiveWidget(QWidget):
             "Reverse the NANSENSE lateral coordinate while preserving the "
             "true Left*/Right* joint identities."
         )
-        self.swap_sides_checkbox.toggled.connect(self.mark_calibration_modified)
+        self.swap_sides_checkbox.toggled.connect(
+            lambda _checked: self.mark_calibration_modified("mirror_lateral")
+        )
         controls_row.addWidget(self.swap_sides_checkbox)
         controls_row.addStretch(1)
         self.main_layout.addLayout(controls_row)
@@ -458,8 +523,10 @@ class NansenseLiveWidget(QWidget):
         calibration_grid = QGridLayout(calibration_card)
         calibration_grid.setContentsMargins(9, 7, 9, 7)
         calibration_grid.setHorizontalSpacing(7)
-        calibration_grid.addWidget(QLabel("RViz Skeleton Placement"), 0, 0, 1, 2)
-        target_label = QLabel("Feet target: X 0.60  Y -0.60  Z 0.00 m")
+        calibration_grid.addWidget(QLabel("NANSENSE / Workcell Alignment"), 0, 0, 1, 2)
+        target_label = QLabel(
+            "Seat: X 0.00  Y -0.75  Z +0.45 m | XYZ visual; Yaw/Mirror lock"
+        )
         target_label.setObjectName("calibrationHint")
         calibration_grid.addWidget(target_label, 0, 2, 1, 4)
         self.calibration_spins = {}
@@ -476,7 +543,9 @@ class NansenseLiveWidget(QWidget):
             spin.setSingleStep(0.05 if key != "yaw_deg" else 5.0)
             spin.setValue(CALIBRATION_DEFAULTS[key])
             spin.setMinimumWidth(88 if key != "yaw_deg" else 96)
-            spin.valueChanged.connect(self.mark_calibration_modified)
+            spin.valueChanged.connect(
+                lambda _value, key=key: self.mark_calibration_modified(key)
+            )
             self.calibration_spins[key] = spin
             calibration_grid.addWidget(spin, 2, column)
 
@@ -487,24 +556,33 @@ class NansenseLiveWidget(QWidget):
         self.save_calibration_button = QPushButton("SAVE")
         self.save_calibration_button.setObjectName("saveCalibrationButton")
         self.save_calibration_button.setToolTip(
-            "Save the active placement and lateral-axis setting for the "
-            "next UI launch."
+            "Save the current UI/RViz defaults for the next launch. "
+            "SAVE does not lock the scientific session alignment."
         )
         self.save_calibration_button.clicked.connect(self.save_calibration)
         calibration_grid.addWidget(self.save_calibration_button, 2, 5)
 
-        self.zero_here_button = QPushButton("PLACE FEET AT TARGET")
-        self.zero_here_button.setObjectName("placementButton")
-        self.zero_here_button.setToolTip(
-            "Place the feet at world X=0.60 m, Y=-0.60 m, Z=0.00 m; "
-            "the current yaw is preserved."
+        self.place_at_seat_button = QPushButton("PLACE AT SEAT")
+        self.place_at_seat_button.setObjectName("placementButton")
+        self.place_at_seat_button.setToolTip(
+            "Set visual placement to world X=0.00 m, Y=-0.75 m, Z=+0.45 m. "
+            "Current yaw and mirror setting are preserved."
         )
-        self.zero_here_button.clicked.connect(self.zero_here)
-        calibration_grid.addWidget(self.zero_here_button, 1, 4, 1, 2)
+        self.place_at_seat_button.clicked.connect(self.place_at_seat)
+        calibration_grid.addWidget(self.place_at_seat_button, 3, 0, 1, 3)
+
+        self.lock_alignment_button = QPushButton("LOCK ALIGNMENT")
+        self.lock_alignment_button.setObjectName("lockAlignmentButton")
+        self.lock_alignment_button.setToolTip(
+            "Freeze the current Yaw + Mirror convention as the scientific "
+            "alignment for the upcoming experiment session. XYZ remain visual."
+        )
+        self.lock_alignment_button.clicked.connect(self.lock_alignment)
+        calibration_grid.addWidget(self.lock_alignment_button, 3, 3, 1, 3)
 
         self.calibration_status_label = QLabel("")
         self.calibration_status_label.setToolTip(str(self.calibration_path))
-        calibration_grid.addWidget(self.calibration_status_label, 3, 0, 1, 6)
+        calibration_grid.addWidget(self.calibration_status_label, 4, 0, 1, 6)
         self.main_layout.addWidget(calibration_card)
 
         side_key = QLabel("Identity markers:  L = red   |   R = green")
@@ -607,20 +685,57 @@ class NansenseLiveWidget(QWidget):
             self.calibration_status_label
         )
 
-    def mark_calibration_modified(self, *_args):
+    def mark_calibration_modified(self, key=None):
         if getattr(self, "_loading_calibration", False):
             return
+
+        if key in ("yaw_deg", "mirror_lateral") and self._locked_alignment:
+            if not scientific_alignment_matches(
+                self._locked_alignment, self.calibration_values()
+            ):
+                self._locked_alignment = None
+                self.lock_alignment_button.setText("LOCK ALIGNMENT")
+                self.set_calibration_status(
+                    "Orientation modified — LOCK AGAIN",
+                    "error",
+                )
+                return
+
+        if key in ("x_m", "y_m", "z_m"):
+            suffix = " | alignment LOCKED" if self.is_alignment_locked() else ""
+            self.set_calibration_status(
+                f"Placement modified — press APPLY{suffix}",
+                "pending",
+            )
+            return
+
         self.set_calibration_status("Modified — press APPLY", "pending")
 
     def apply_calibration(self, _checked=False, show_status=True):
         if self.calibration_callback is not None:
             self.calibration_callback(self.calibration_values())
         if show_status:
-            self.set_calibration_status("Applied — press SAVE to keep", "pending")
+            if self.is_alignment_locked():
+                self.set_calibration_status(
+                    "Applied — scientific alignment LOCKED",
+                    "saved",
+                )
+            else:
+                self.set_calibration_status(
+                    "Applied — press LOCK ALIGNMENT before experiment",
+                    "pending",
+                )
 
     def load_calibration(self):
+        self._locked_alignment = None
+        if hasattr(self, "lock_alignment_button"):
+            self.lock_alignment_button.setText("LOCK ALIGNMENT")
+
         if not self.calibration_path.exists():
-            self.set_calibration_status("Using defaults — not saved", "pending")
+            self.set_calibration_status(
+                "Using seat defaults — alignment NOT LOCKED",
+                "pending",
+            )
             return
 
         values = dict(CALIBRATION_DEFAULTS)
@@ -644,13 +759,17 @@ class NansenseLiveWidget(QWidget):
 
         for key, value in values.items():
             self.calibration_spins[key].setValue(value)
-        self.set_calibration_status("Saved and active", "saved")
+        self.set_calibration_status(
+            "UI defaults loaded — alignment NOT LOCKED",
+            "pending",
+        )
 
     def save_calibration(self):
         self.apply_calibration(show_status=False)
         values = self.calibration_values()
         text = (
-            "# NANSENSE origin pose in the ROS world frame\n"
+            "# NANSENSE UI/RViz defaults in the ROS world frame\n"
+            "# SAVE is persistent UI state; it does not lock a scientific session.\n"
             f"x_m: {values['x_m']:.6f}\n"
             f"y_m: {values['y_m']:.6f}\n"
             f"z_m: {values['z_m']:.6f}\n"
@@ -665,29 +784,63 @@ class NansenseLiveWidget(QWidget):
         except OSError as exc:
             self.set_calibration_status(f"Save error: {exc}", "error")
             return
-        self.set_calibration_status("Saved and active", "saved")
 
-    def zero_here(self):
-        frame = self.current_frame()
-        if frame is None:
-            self.set_calibration_status("No NANSENSE frame", "error")
-            return
-
-        try:
-            values = zero_calibration_from_feet(
-                frame,
-                ZERO_TARGET_M,
-                self.calibration_spins["yaw_deg"].value(),
-                self.swap_sides_checkbox.isChecked(),
+        if self.is_alignment_locked():
+            self.set_calibration_status(
+                "UI defaults saved — scientific alignment LOCKED",
+                "saved",
             )
-        except ValueError:
-            self.set_calibration_status("Both feet required", "error")
-            return
+        else:
+            self.set_calibration_status(
+                "UI defaults saved — alignment NOT LOCKED",
+                "pending",
+            )
 
-        for key, value in values.items():
-            self.calibration_spins[key].setValue(value)
+    def place_at_seat(self):
+        values = seat_calibration_values(
+            self.calibration_spins["yaw_deg"].value()
+        )
+        self._loading_calibration = True
+        try:
+            for key, value in values.items():
+                self.calibration_spins[key].setValue(value)
+        finally:
+            self._loading_calibration = False
+
         self.apply_calibration(show_status=False)
-        self.set_calibration_status("Applied — press SAVE to keep", "pending")
+        if self.is_alignment_locked():
+            self.set_calibration_status(
+                "Seat placement applied — scientific alignment LOCKED",
+                "saved",
+            )
+        else:
+            self.set_calibration_status(
+                "Seat placement applied — press LOCK ALIGNMENT when oriented",
+                "pending",
+            )
+
+    def lock_alignment(self):
+        self.apply_calibration(show_status=False)
+        self._locked_alignment = scientific_alignment_snapshot(
+            self.calibration_values()
+        )
+        self.lock_alignment_button.setText("ALIGNMENT LOCKED")
+        mirror = "ON" if self._locked_alignment["mirror_lateral"] else "OFF"
+        self.set_calibration_status(
+            f"ALIGNMENT LOCKED — Yaw {self._locked_alignment['yaw_deg']:.1f}° "
+            f"| Mirror {mirror}",
+            "saved",
+        )
+
+    def is_alignment_locked(self):
+        return scientific_alignment_matches(
+            self._locked_alignment, self.calibration_values()
+        )
+
+    def locked_alignment(self):
+        if not self.is_alignment_locked():
+            return None
+        return dict(self._locked_alignment)
 
     def current_frame(self):
         return self.receiver.get_latest()
