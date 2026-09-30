@@ -12,7 +12,7 @@ def load_routing_symbols():
     for node in tree.body:
         if isinstance(node, ast.Assign):
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            if 'DIRECT_EXPERIMENT_BACKENDS' in names:
+            if any(name in {'RIGHT_OPEN_LOOP_TASKS'} for name in names):
                 selected.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name == 'direct_experiment_launch_spec':
             selected.append(node)
@@ -23,21 +23,23 @@ def load_routing_symbols():
 
 
 class TestLeftDirectUIRouting(unittest.TestCase):
-    def test_right_routing_is_unchanged(self):
+    def test_right_tasks_route_to_canonical_backend(self):
         fn = load_routing_symbols()['direct_experiment_launch_spec']
-        one = fn(('Full Direct - One Rep', 'Right', 'Open-loop', 'Task Space'), False)
-        demo = fn(('Full Direct - Demo', 'Right', 'Open-loop', 'Task Space'), True)
-        self.assertEqual(one['module'], 'experiment_backend.right_hand_direct_single')
-        self.assertEqual(demo['module'], 'experiment_backend.right_hand_direct_demo')
+        for label, task in [('Compound', 'compound'), ('Polishing', 'polishing'), ('Full', 'full')]:
+            with self.subTest(label=label):
+                spec = fn((label, 'Right', 'Open-loop', 'Task Space'), False)
+                self.assertEqual(spec['module'], 'experiment_backend.right_hand')
+                self.assertEqual(spec['task'], task)
+                self.assertEqual(spec['mode'], 'simulation')
 
-    def test_both_left_task_labels_route_to_same_backend(self):
+    def test_left_only_full_routes_to_single_protocol(self):
         fn = load_routing_symbols()['direct_experiment_launch_spec']
-        one = fn(('Full Direct - One Rep', 'Left', 'Open-loop', 'Task Space'), False)
-        demo = fn(('Full Direct - Demo', 'Left', 'Open-loop', 'Task Space'), True)
-        self.assertEqual(one['module'], 'experiment_backend.left_hand_direct')
-        self.assertEqual(demo['module'], 'experiment_backend.left_hand_direct')
-        self.assertEqual(one['protocol'], 'single')
-        self.assertEqual(demo['protocol'], 'demo')
+        full = fn(('Full', 'Left', 'Open-loop', 'Task Space'), True)
+        self.assertEqual(full['module'], 'experiment_backend.left_hand_direct')
+        self.assertEqual(full['protocol'], 'single')
+        self.assertEqual(full['mode'], 'real')
+        self.assertIsNone(fn(('Compound', 'Left', 'Open-loop', 'Task Space'), True))
+        self.assertIsNone(fn(('Polishing', 'Left', 'Open-loop', 'Task Space'), True))
 
     def test_analysis_browser_includes_direct_left_trials(self):
         text = UI.read_text(encoding='utf-8')

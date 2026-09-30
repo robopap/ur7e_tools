@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
 )
 
 from ur7e_tools.human_reference_ui import HumanReferencePanel
+from ur7e_tools.participant_reference_helpers import reference_helpers
 
 from ur7e_tools.nansense_live_widget import (
     BODY_JOINTS,
@@ -153,53 +155,32 @@ PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 
 DIRECT_EXPERIMENT_BACKENDS = {
     "Right": {
-        "Full Direct - One Rep": {
-            "filename": "right_hand_direct_single.py",
-            "module": "experiment_backend.right_hand_direct_single",
-        },
-        "Full Direct - Demo": {
-            "filename": "right_hand_direct_demo.py",
-            "module": "experiment_backend.right_hand_direct_demo",
-        },
+        "Compound": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "compound"},
+        "Polishing": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "polishing"},
+        "Full": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "full"},
     },
     "Left": {
-        # Left is a static-hold interaction experiment.  Both UI task labels
-        # intentionally execute the same backend; protocol is metadata only.
-        "Full Direct - One Rep": {
-            "filename": "left_hand_direct.py",
-            "module": "experiment_backend.left_hand_direct",
-            "protocol": "single",
-        },
-        "Full Direct - Demo": {
-            "filename": "left_hand_direct.py",
-            "module": "experiment_backend.left_hand_direct",
-            "protocol": "demo",
-        },
+        "Full": {"filename": "left_hand_direct.py", "module": "experiment_backend.left_hand_direct", "protocol": "single"},
     },
 }
 
 
 def direct_experiment_launch_spec(selection, real_mode):
-    """Return the Direct backend selected by the Experiment row, if valid."""
+    """Return the canonical Open Loop backend for the current selection."""
     selection = tuple(selection)
     if len(selection) != 4:
         return None
-
     task, hand, control, motion = selection
     if (control, motion) != ("Open-loop", "Task Space"):
         return None
-
-    by_hand = DIRECT_EXPERIMENT_BACKENDS.get(hand)
-    if by_hand is None:
-        return None
-    backend = by_hand.get(task)
+    backend = DIRECT_EXPERIMENT_BACKENDS.get(hand, {}).get(task)
     if backend is None:
         return None
-
     return {
         "filename": backend["filename"],
         "module": backend["module"],
         "mode": "real" if real_mode else "simulation",
+        "task": backend.get("task"),
         "protocol": backend.get("protocol"),
     }
 
@@ -1728,6 +1709,9 @@ class WorkcellUI(QMainWindow):
         self.experiment_process.finished.connect(
             self.experiment_finished
         )
+        self.experiment_process.errorOccurred.connect(
+            self.experiment_process_error
+        )
         self.active_experiment = None
 
         # -----------------------------------------------------
@@ -1745,6 +1729,12 @@ class WorkcellUI(QMainWindow):
         self.analysis_output_buffer = ""
         self.analysis_report_path = None
         self.analysis_report_paths = []
+
+        # QProcess enters Starting synchronously. Refresh Play on every
+        # transition, including failed starts which do not emit finished.
+        for process in (self.experiment_process, self.analysis_process,
+                        self.home_process, self.gripper_process):
+            process.stateChanged.connect(self.update_experiment_controls)
 
         # -----------------------------------------------------
         # Wrist RealSense camera processes
@@ -2738,9 +2728,7 @@ class WorkcellUI(QMainWindow):
         self.experiment_task_combo.addItems([
             "Compound",
             "Polishing",
-            "Full Protocol",
-            "Full Direct - One Rep",
-            "Full Direct - Demo",
+            "Full",
         ])
         gesture_layout.addWidget(self.experiment_task_combo)
         experiment_controls_layout.addWidget(gesture_group)
@@ -2815,6 +2803,12 @@ class WorkcellUI(QMainWindow):
                     value == "Left"
                 ),
             )
+        )
+        self.experiment_hand_combo.currentTextChanged.connect(
+            lambda _value: self._normalize_experiment_selection()
+        )
+        self.experiment_task_combo.currentTextChanged.connect(
+            lambda _value: self._normalize_experiment_selection()
         )
         experiment_controls_layout.addWidget(hands_group)
 
@@ -2924,6 +2918,7 @@ class WorkcellUI(QMainWindow):
             self.style().standardIcon(QStyle.SP_MediaPlay)
         )
         self.run_experiment_button.setObjectName("startButton")
+        self.run_experiment_button.setProperty("experimentPlay", True)
         self.run_experiment_button.setFixedSize(40, 32)
         self.run_experiment_button.setToolTip("Run experiment")
         self.run_experiment_button.setEnabled(False)
@@ -6097,6 +6092,8 @@ class WorkcellUI(QMainWindow):
             self.robots_ready_label
         )
 
+        self.update_experiment_controls()
+
     def reset_robot_readiness(self, status="NOT STARTED"):
 
         for robot in ("robot1", "robot2"):
@@ -7199,6 +7196,66 @@ class WorkcellUI(QMainWindow):
             self.experiment_motion_combo.currentText(),
         )
 
+    def _normalize_experiment_selection(self):
+        """Left Open Loop currently supports only the complete Full protocol."""
+        if self.experiment_hand_combo.currentText() == "Left":
+            if self.experiment_task_combo.currentText() != "Full":
+                self.experiment_task_combo.setCurrentText("Full")
+
+    def participant_reference_root(self):
+        return Path("~/phd_polishing_experiments/results/human_reference").expanduser()
+
+    def participant_reference_helpers(self):
+        return reference_helpers(Path("~/phd_polishing_experiments").expanduser())
+
+    def participant_reference_config(self, participant, hand):
+        project = Path("~/phd_polishing_experiments").expanduser()
+        cfg = json.loads((project / "config" / f"{hand.lower()}_hand_direct.json").read_text())
+        return self.participant_reference_helpers().configure_participant_reference(
+            cfg, self.participant_reference_root(), participant, hand,
+        )
+
+    def experiment_runtime_blockers(self):
+        """Use the same live safety/process gates for display and launch."""
+        blockers = []
+        system_state = self.system_state()
+        setup = self.setup_combo.currentText()
+        if system_state != "RUNNING":
+            blockers.append(f"system_state={system_state}")
+        if setup != "Dual UR7e":
+            blockers.append(f"setup={setup}")
+        for name in ("experiment_process", "analysis_process",
+                     "home_process", "gripper_process"):
+            state = getattr(self, name).state()
+            if state != QProcess.NotRunning:
+                blockers.append(f"{name}={state}")
+        if self.mode_combo.currentText() == "Real Robot(s)":
+            if not all(self.robot_ready[robot] for robot in ("robot1", "robot2")):
+                blockers.append(f"robot_ready={self.robot_ready}")
+            grippers = {robot: self._dual_gripper_type(robot)
+                        for robot in ("robot1", "robot2")}
+            if any(kind != "onrobot" for kind in grippers.values()):
+                blockers.append(f"real_gripper_backend={grippers}")
+        selection = self._selected_experiment()
+        direct_launch = direct_experiment_launch_spec(
+            selection, real_mode=(self.mode_combo.currentText() == "Real Robot(s)")
+        )
+        if direct_launch is not None:
+            try:
+                participants = self.participant_reference_helpers().discover_reference_participants(
+                    self.participant_reference_root(), selection[1],
+                )
+                if not participants:
+                    blockers.append("participant references: no participant has both required gesture files")
+            except (OSError, ImportError, ValueError) as exc:
+                blockers.append(f"participant references: {exc}")
+        return blockers
+
+    def log_experiment_play_blockers(self, blockers):
+        for reason in blockers:
+            self.log_output.appendPlainText(f"[PLAY BLOCKED] {reason}")
+        self.update_experiment_controls()
+
     def update_experiment_controls(self):
         if not hasattr(self, "run_experiment_button"):
             return
@@ -7217,47 +7274,29 @@ class WorkcellUI(QMainWindow):
             self.analysis_process.state()
             == QProcess.NotRunning
         )
-        setup_idle = (
-            self.home_process.state()
-            == QProcess.NotRunning
-            and self.gripper_process.state()
-            == QProcess.NotRunning
+        real_mode = self.mode_combo.currentText() == "Real Robot(s)"
+        selection = self._selected_experiment()
+        direct_launch = direct_experiment_launch_spec(selection, real_mode=real_mode)
+        implemented = (
+            selection in {
+                ("Compound", "Right", "Open-loop", "Task Space"),
+                ("Polishing", "Right", "Open-loop", "Task Space"),
+                ("Full Protocol", "Right", "Open-loop", "Task Space"),
+            }
+            or direct_launch is not None
         )
-
-        real_mode = (
-            self.mode_combo.currentText() == "Real Robot(s)"
-        )
-        robots_ready = (
-            self.robot_ready["robot1"]
-            and self.robot_ready["robot2"]
-        )
-        real_gripper_backend_ready = (
-            not real_mode
-            or (
-                self._dual_gripper_type("robot1") == "onrobot"
-                and self._dual_gripper_type("robot2") == "onrobot"
-            )
-        )
-
-        enabled = (
-            dual
-            and system_running
-            and experiment_idle
-            and analysis_idle
-            and setup_idle
-            and (not real_mode or robots_ready)
-            and real_gripper_backend_ready
-        )
-
-        if real_mode and not real_gripper_backend_ready:
-            self.run_experiment_button.setToolTip(
-                "Real experiments are blocked while a Robotiq 2F-140 is "
-                "selected because its physical command backend is not "
-                "configured yet."
-            )
-        else:
-            self.run_experiment_button.setToolTip("")
+        blockers = self.experiment_runtime_blockers()
+        enabled = implemented and not blockers
         self.run_experiment_button.setEnabled(enabled)
+        self.run_experiment_button.setToolTip(
+            "\n".join(blockers) if blockers else (
+                "Run experiment" if implemented else "Experiment combination not implemented"
+            )
+        )
+        if hasattr(self, "experiment_speed_spin"):
+            self.experiment_speed_spin.setEnabled(
+                experiment_task_uses_ui_speed(selection[0])
+            )
 
         analysis_has_trial = (
             hasattr(self, "analysis_trial_combo")
@@ -7297,52 +7336,9 @@ class WorkcellUI(QMainWindow):
                 "connectionUnknown"
             )
         else:
-            selection = self._selected_experiment()
-
-            # The UI speed spinbox applies only to the standalone
-            # Compound/Polishing runs. Full Protocol and both Direct runs keep
-            # their validated backend timing and must not imply an override.
-            if hasattr(self, "experiment_speed_spin"):
-                self.experiment_speed_spin.setEnabled(
-                    experiment_task_uses_ui_speed(selection[0])
-                )
-
-            direct_launch = direct_experiment_launch_spec(
-                selection,
-                real_mode=real_mode,
-            )
-
-            implemented = (
-                selection in {
-                    (
-                        "Compound",
-                        "Right",
-                        "Open-loop",
-                        "Task Space",
-                    ),
-                    (
-                        "Polishing",
-                        "Right",
-                        "Open-loop",
-                        "Task Space",
-                    ),
-                    (
-                        "Full Protocol",
-                        "Right",
-                        "Open-loop",
-                        "Task Space",
-                    ),
-                }
-                or direct_launch is not None
-            )
-
-            self.experiment_status_label.setText(
-                "READY" if implemented else "NOT READY"
-            )
+            self.experiment_status_label.setText("READY" if enabled else "NOT READY")
             self.experiment_status_label.setObjectName(
-                "connectionReachable"
-                if implemented
-                else "connectionUnknown"
+                "connectionReachable" if enabled else "connectionUnknown"
             )
 
         self.experiment_status_label.style().unpolish(
@@ -7353,359 +7349,103 @@ class WorkcellUI(QMainWindow):
         )
 
     def run_selected_experiment(self):
-        if self.system_state() != "RUNNING":
-            return
-
-        if self.setup_combo.currentText() != "Dual UR7e":
-            return
-
-        if (
-            self.experiment_process.state()
-            != QProcess.NotRunning
-            or self.analysis_process.state()
-            != QProcess.NotRunning
-            or self.home_process.state()
-            != QProcess.NotRunning
-            or self.gripper_process.state()
-            != QProcess.NotRunning
-        ):
+        self.log_output.appendPlainText("[PLAY] Experiment Play clicked")
+        self._normalize_experiment_selection()
+        blockers = self.experiment_runtime_blockers()
+        if blockers:
+            self.log_experiment_play_blockers(blockers)
+            if any(reason.startswith("participant references:") for reason in blockers):
+                QMessageBox.critical(self, "Participant references unavailable", "\n".join(blockers))
             return
 
         selection = self._selected_experiment()
-        speed_scale = (
-            float(self.experiment_speed_spin.value()) / 100.0
-        )
-
-        compound_selection = (
-            "Compound",
-            "Right",
-            "Open-loop",
-            "Task Space",
-        )
-
-        polishing_selection = (
-            "Polishing",
-            "Right",
-            "Open-loop",
-            "Task Space",
-        )
-
-        full_protocol_selection = (
-            "Full Protocol",
-            "Right",
-            "Open-loop",
-            "Task Space",
-        )
-
-        direct_one_rep_selection = (
-            "Full Direct - One Rep",
-            "Right",
-            "Open-loop",
-            "Task Space",
-        )
-
-        direct_demo_selection = (
-            "Full Direct - Demo",
-            "Right",
-            "Open-loop",
-            "Task Space",
-        )
-
-        left_direct_one_rep_selection = (
-            "Full Direct - One Rep",
-            "Left",
-            "Open-loop",
-            "Task Space",
-        )
-
-        left_direct_demo_selection = (
-            "Full Direct - Demo",
-            "Left",
-            "Open-loop",
-            "Task Space",
-        )
-
-        if selection not in {
-            compound_selection,
-            polishing_selection,
-            full_protocol_selection,
-            direct_one_rep_selection,
-            direct_demo_selection,
-            left_direct_one_rep_selection,
-            left_direct_demo_selection,
-        }:
-            QMessageBox.information(
-                self,
-                "Experiment not implemented",
-                (
-                    "This experiment combination is not implemented yet:\n\n"
-                    f"Gesture: {selection[0]}\n"
-                    f"Hand: {selection[1]}\n"
-                    f"Control: {selection[2]}\n"
-                    f"Motion: {selection[3]}\n\n"
-                    "No robot command was sent."
-                ),
-            )
+        real_mode = self.mode_combo.currentText() == "Real Robot(s)"
+        direct_launch = direct_experiment_launch_spec(selection, real_mode=real_mode)
+        if direct_launch is None:
+            self.log_output.appendPlainText(f"[PLAY BLOCKED] unsupported selection={selection}")
+            QMessageBox.information(self, "Experiment not implemented", f"This experiment combination is not implemented yet:\n\n{selection}")
             return
 
-        polishing_setup = None
-
-        if selection == polishing_selection:
-            setup_box = QMessageBox(self)
-            setup_box.setIcon(
-                QMessageBox.Icon.Question
+        try:
+            helpers = self.participant_reference_helpers()
+            participants = helpers.discover_reference_participants(
+                self.participant_reference_root(), selection[1],
             )
-            setup_box.setWindowTitle(
-                "Polishing Right setup"
+            reference_participant, accepted = QInputDialog.getItem(
+                self, "Select participant", "Participant", participants, 0, False,
             )
-            setup_box.setText(
-                "Select the Polishing Right setup."
-            )
-            setup_box.setInformativeText(
-                "Direct and Bracket use the same D3 human "
-                "reference but different calibrated task-start q0."
-            )
-
-            direct_button = setup_box.addButton(
-                "Direct",
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            bracket_button = setup_box.addButton(
-                "Bracket",
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            cancel_button = setup_box.addButton(
-                QMessageBox.StandardButton.Cancel
-            )
-            setup_box.setDefaultButton(
-                cancel_button
-            )
-
-            setup_box.exec()
-
-            clicked = setup_box.clickedButton()
-
-            if clicked is direct_button:
-                polishing_setup = "direct"
-            elif clicked is bracket_button:
-                polishing_setup = "bracket"
-            else:
+            if not accepted:
+                self.log_output.appendPlainText("[PLAY BLOCKED] participant selection cancelled")
                 return
-
-        real_mode = (
-            self.mode_combo.currentText() == "Real Robot(s)"
-        )
-
-        direct_launch = direct_experiment_launch_spec(
-            selection,
-            real_mode=real_mode,
-        )
-
-        if (
-            real_mode
-            and (
-                self._dual_gripper_type("robot1") == "robotiq"
-                or self._dual_gripper_type("robot2") == "robotiq"
-            )
-        ):
-            QMessageBox.information(
-                self,
-                "Robotiq real backend not configured",
-                (
-                    "A Robotiq 2F-140 is selected for the real Dual UR7e "
-                    "setup. The robot system may be launched for validation, "
-                    "but experiment execution is blocked until the physical "
-                    "Robotiq command backend is configured."
-                ),
-            )
+            participant_cfg = self.participant_reference_config(reference_participant, selection[1])
+            participant_details = "\n".join(helpers.participant_reference_log_lines(participant_cfg))
+            self.log_output.appendPlainText(participant_details)
+        except (OSError, ImportError, ValueError) as exc:
+            self.log_output.appendPlainText(f"[PLAY BLOCKED] participant references: {exc}")
+            QMessageBox.critical(self, "Participant references unavailable", str(exc))
             return
+
+        speed_scale = float(self.experiment_speed_spin.value()) / 100.0
+        self.log_output.appendPlainText("[PLAY] Runtime gates passed")
+        self.log_output.appendPlainText(f"[PLAY] Selection: {selection}")
+        self.log_output.appendPlainText(f"[PLAY] Direct launch: {direct_launch}")
 
         if real_mode:
-            if not (
-                self.robot_ready["robot1"]
-                and self.robot_ready["robot2"]
-            ):
-                QMessageBox.warning(
-                    self,
-                    "Robots not ready",
-                    "Both robots must be READY before an experiment.",
-                )
-                return
-
-            experiment_text = (
-                f"{selection[0]} / {selection[1]} / "
-                f"{selection[2]} / {selection[3]}"
-            )
-
-            setup_text = ""
-            if polishing_setup is not None:
-                setup_text = (
-                    f"Setup: {polishing_setup.title()}\n"
-                )
-
             answer = QMessageBox.question(
-                self,
-                "Run experiment",
-                (
-                    "Run the following REAL experiment?\n\n"
-                    f"{experiment_text}\n"
-                    f"{setup_text}"
-                    + (
-                        "Full Protocol uses its validated per-task speeds "
-                        "from config (Compound / Polishing).\n\n"
-                        if selection == full_protocol_selection
-                        else (
-                            "Direct run uses its validated backend timing.\n\n"
-                            if direct_launch is not None
-                            else f"Speed scale: {speed_scale:.2f} ×\n\n"
-                        )
-                    )
-                    + (
-                        "The Full Protocol backend controls Robot 2 string "
-                        "setup, Compound, Polishing, data acquisition, and "
-                        "warm restart trials."
-                        if selection == full_protocol_selection
-                        else (
-                            "The Direct backend will run the selected protocol "
-                            f"in {'real' if real_mode else 'simulation'} mode "
-                            "using its own validated timing."
-                            if direct_launch is not None
-                            else (
-                                "The experiment backend will first verify "
-                                "that Robot 1 is already at the selected "
-                                "trajectory q0, start data acquisition, "
-                                "and then command Robot 1."
-                            )
-                        )
-                    )
-                ),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                self, "Run experiment",
+                "Run the following REAL experiment?\n\n"
+                f"{selection[0]} / {selection[1]} / {selection[2]} / {selection[3]}\n"
+                f"Participant: {reference_participant}\n\n"
+                + (f"Speed scale: {speed_scale:.2f} ×" if selection[1] == "Right" and selection[0] in {"Compound", "Polishing"} else "Backend protocol timing"),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
-
             if answer != QMessageBox.Yes:
+                self.log_output.appendPlainText("[PLAY BLOCKED] real confirmation declined")
                 return
 
-        project_root = Path(
-            os.path.expanduser(
-                "~/phd_polishing_experiments"
-            )
-        )
-
-        if selection == compound_selection:
-            backend = (
-                project_root
-                / "experiment_backend"
-                / "compound_right_task_space.py"
-            )
-            backend_module = (
-                "experiment_backend.compound_right_task_space"
-            )
-            backend_extra_args = ""
-            backend_speed_arg = f" --speed-scale {speed_scale:.2f}"
-
-        elif selection == polishing_selection:
-            backend = (
-                project_root
-                / "experiment_backend"
-                / "polishing_right_task_space.py"
-            )
-            backend_module = (
-                "experiment_backend.polishing_right_task_space"
-            )
-            backend_extra_args = (
-                " --setup "
-                + shlex.quote(polishing_setup)
-            )
-            backend_speed_arg = f" --speed-scale {speed_scale:.2f}"
-
-        elif direct_launch is not None:
-            backend = (
-                project_root
-                / "experiment_backend"
-                / direct_launch["filename"]
-            )
-            backend_module = direct_launch["module"]
-            backend_extra_args = (
-                " --mode " + shlex.quote(direct_launch["mode"])
-            )
-            if direct_launch.get("protocol"):
-                backend_extra_args += (
-                    " --protocol "
-                    + shlex.quote(direct_launch["protocol"])
-                )
-            # Direct uses its own validated timing; never pass the UI speed.
-            backend_speed_arg = ""
-
-        else:
-            backend = (
-                project_root
-                / "experiment_backend"
-                / "right_hand_mvp.py"
-            )
-            backend_module = "experiment_backend.right_hand_mvp"
-            protocol_mode = "real" if real_mode else "simulation"
-            backend_extra_args = (
-                " --mode " + shlex.quote(protocol_mode)
-            )
-            # Full Protocol keeps the validated independent speeds from
-            # config/right_hand_mvp.json (Compound and Polishing).
-            backend_speed_arg = ""
-
+        project_root = Path(os.path.expanduser("~/phd_polishing_experiments"))
+        backend = project_root / "experiment_backend" / direct_launch["filename"]
         if not backend.is_file():
-            QMessageBox.critical(
-                self,
-                "Experiment backend missing",
-                f"Backend not found:\n{backend}",
-            )
+            self.log_output.appendPlainText(f"[PLAY BLOCKED] backend missing={backend}")
+            QMessageBox.critical(self, "Experiment backend missing", f"Backend not found:\n{backend}")
             return
 
-        workspace_setup = os.path.expanduser(
-            "~/ros2_ws/install/setup.bash"
-        )
+        backend_extra_args = " --mode " + shlex.quote(direct_launch["mode"])
+        if selection[1] == "Right":
+            backend_extra_args += " --task " + shlex.quote(direct_launch["task"])
+            backend_extra_args += " --participant " + shlex.quote(reference_participant)
+            if selection[0] in {"Compound", "Polishing"}:
+                backend_extra_args += f" --speed-scale {speed_scale:.2f}"
+        else:
+            backend_extra_args += " --protocol single --reference-participant " + shlex.quote(reference_participant)
 
+        workspace_setup = os.path.expanduser("~/ros2_ws/install/setup.bash")
         full_command = (
             "source /opt/ros/humble/setup.bash"
             f" && source {shlex.quote(workspace_setup)}"
             f" && cd {shlex.quote(str(project_root))}"
             " && exec setsid /usr/bin/python3 -u -m "
-            f"{shlex.quote(backend_module)}"
+            f"{shlex.quote(direct_launch['module'])}"
             f"{backend_extra_args}"
-            f"{backend_speed_arg}"
         )
+
+        blockers = self.experiment_runtime_blockers()
+        if selection != self._selected_experiment() or real_mode != (self.mode_combo.currentText() == "Real Robot(s)"):
+            blockers.append("selection or mode changed during confirmation")
+        if blockers:
+            self.log_experiment_play_blockers(blockers)
+            return
 
         self.active_experiment = selection
-
-        setup_log = ""
-        if polishing_setup is not None:
-            setup_log = (
-                f"Setup: {polishing_setup.title()}\n"
-            )
-
-        speed_log = (
-            "Config speeds: Compound / Polishing (right_hand_mvp.json)\n"
-            if selection == full_protocol_selection
-            else (
-                "Timing: Direct backend validated timing\n"
-                if direct_launch is not None
-                else f"Speed scale: {speed_scale:.2f} ×\n"
-            )
-        )
-
+        speed_log = (f"Speed scale: {speed_scale:.2f} ×\n" if selection[1] == "Right" and selection[0] in {"Compound", "Polishing"} else "Speed: backend protocol timing\n")
         self.log_output.appendPlainText(
             "\n============================================================\n"
             "RUN EXPERIMENT\n"
             "============================================================\n"
             f"Mode: {self.mode_combo.currentText()}\n"
-            f"Gesture: {selection[0]}\n"
-            f"Hand: {selection[1]}\n"
-            f"Control: {selection[2]}\n"
-            f"Motion: {selection[3]}\n"
-            f"{setup_log}"
-            f"{speed_log}"
-            f"Backend: {backend}\n"
+            f"Gesture: {selection[0]}\nHand: {selection[1]}\nControl: {selection[2]}\nMotion: {selection[3]}\n"
+            f"Participant: {reference_participant}\n{speed_log}Backend: {backend}\n"
         )
-
         self.run_experiment_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
         self.robot2_home_button.setEnabled(False)
@@ -7713,16 +7453,23 @@ class WorkcellUI(QMainWindow):
         self.robot2_gripper_move_button.setEnabled(False)
         self.robot1_gripper_position_spin.setEnabled(False)
         self.robot2_gripper_position_spin.setEnabled(False)
-
         self.experiment_status_label.setText("RUNNING")
-        self.experiment_status_label.setObjectName(
-            "connectionTesting"
-        )
+        self.experiment_status_label.setObjectName("connectionTesting")
+        self.experiment_status_label.style().unpolish(self.experiment_status_label)
+        self.experiment_status_label.style().polish(self.experiment_status_label)
+        self.log_output.appendPlainText("[PLAY] Launching:\n" + full_command)
+        self.experiment_process.start("/bin/bash", ["-lc", full_command])
 
-        self.experiment_process.start(
-            "/bin/bash",
-            ["-lc", full_command],
+    def experiment_process_error(self, error):
+        self.log_output.appendPlainText(
+            f"[PLAY ERROR] experiment_process={error}: "
+            f"{self.experiment_process.errorString()}"
         )
+        if error == QProcess.FailedToStart:
+            self.active_experiment = None
+        self.update_home_buttons()
+        self.update_gripper_buttons()
+        self.update_experiment_controls()
 
     def read_experiment_output(self):
         text = bytes(
@@ -7858,7 +7605,15 @@ class WorkcellUI(QMainWindow):
                 "",
             )
 
-            if direct_protocol == "single":
+            if metadata.get("experiment_variant") == "participant-selected":
+                selected_task = str(metadata.get("task", "")).strip().lower()
+                if selected_task in {"compound", "polishing", "full", "full_direct"}:
+                    task = "Full" if selected_task in {"full", "full_direct"} else selected_task.title()
+                else:
+                    # Preserve the legacy label for older participant-selected
+                    # trials that did not record an explicit task.
+                    task = "Full Direct - Participant"
+            elif direct_protocol == "single":
                 task = "Full Direct - One Rep"
             elif direct_protocol == "demo":
                 task = "Full Direct - Demo"
@@ -7878,8 +7633,10 @@ class WorkcellUI(QMainWindow):
             ).replace("_", " ").title()
 
         full_protocol_like = task in {
+            "Full",
             "Full Protocol",
             "Full Direct - One Rep",
+            "Full Direct - Participant",
             "Full Direct - Demo",
             "Full Direct",
         }
@@ -7905,9 +7662,13 @@ class WorkcellUI(QMainWindow):
             )
         ).replace("_", " ").title()
 
+        participant_text = (
+            f" | Participant: {metadata.get('reference_participant', 'unknown')}"
+            if metadata.get("experiment_variant") == "participant-selected" else ""
+        )
         return (
             f"{timestamp_text} | "
-            f"{task} | {hand} | {control} | {motion}"
+            f"{task} | {hand} | {control} | {motion}{participant_text}"
         )
 
     def refresh_analysis_trials(
@@ -9790,6 +9551,11 @@ class WorkcellUI(QMainWindow):
             QPushButton#startButton {
                 background: #2e7d32;
                 color: white;
+            }
+
+            QPushButton#startButton[experimentPlay="true"]:disabled {
+                background: #303134;
+                color: #777777;
             }
 
             QPushButton#stopButton {

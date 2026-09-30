@@ -23,9 +23,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from ur7e_tools.participant_reference_helpers import reference_helpers
 
 try:
     from PySide6.QtMultimedia import QSoundEffect
@@ -122,25 +125,12 @@ def resolve_gesture_directory(selected_path: Path, dataset_root: Path):
 
 
 def resolve_participant_directory(selected_path: Path, dataset_root: Path):
-    """Resolve a participant folder from it or any descendant dataset path."""
-    selected = Path(selected_path).expanduser()
-    root = Path(dataset_root).expanduser()
-
-    if selected.is_file():
-        selected = selected.parent
-
+    """Reuse the shared participant/descendant dataset resolver."""
     try:
-        selected_resolved = selected.resolve()
-        root_resolved = root.resolve()
-        relative = selected_resolved.relative_to(root_resolved)
-    except (OSError, ValueError):
+        helpers = reference_helpers()
+        return helpers.resolve_participant_directory(selected_path, dataset_root)
+    except (OSError, ImportError):
         return None
-
-    if not relative.parts:
-        return None
-
-    participant_dir = root_resolved / relative.parts[0]
-    return participant_dir if participant_dir.is_dir() else None
 
 
 def participant_id_from_directory(participant_dir: Path):
@@ -232,7 +222,11 @@ def scan_gesture_dataset(gesture_dir: Path):
     reference_ready = (
         reference_dir / "human_motion_reference_bimanual.csv"
     ).is_file()
-    ik_ready = (reference_dir / "robot1_task_space_ik.csv").is_file()
+    try:
+        filename = reference_helpers().MOTION_REFERENCE_FILENAME
+        ik_ready = (reference_dir / filename).is_file()
+    except (OSError, ImportError):
+        ik_ready = False
 
     return {
         "gesture_dir": gesture_dir,
@@ -391,6 +385,20 @@ class HumanReferencePanel(QFrame):
         row4.addWidget(self.sim_btn)
         lay.addLayout(row4)
 
+        self.initial_force_toggle = QToolButton()
+        self.initial_force_toggle.setText("▸ INITIAL FORCE REFERENCE")
+        self.initial_force_toggle.setCheckable(True)
+        self.initial_force_toggle.setAutoRaise(True)
+        self.initial_force_toggle.toggled.connect(self._toggle_initial_force_summary)
+        lay.addWidget(self.initial_force_toggle)
+
+        self.initial_force_label = QLabel("Initial force reference: unavailable")
+        self.initial_force_label.setWordWrap(True)
+        self.initial_force_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.initial_force_label.setFrameStyle(QFrame.StyledPanel)
+        self.initial_force_label.hide()
+        lay.addWidget(self.initial_force_label)
+
         self.start_btn.clicked.connect(self.start_trial)
         self.build_btn.clicked.connect(self.build_reference)
         self.replay_btn.clicked.connect(self.open_replay)
@@ -467,6 +475,7 @@ class HumanReferencePanel(QFrame):
             state["blocked_incomplete_reps"]
         )
         self.last_trial_dir = state["replay_dir"]
+        self.refresh_initial_force_summary()
 
         if self._recordings_complete:
             self.rep_label.setText("RECORDING COMPLETE")
@@ -836,7 +845,33 @@ class HumanReferencePanel(QFrame):
             self.status.setText("BUILD ERROR")
             self.build_btn.setEnabled(self._recordings_complete)
 
+    def _toggle_initial_force_summary(self, expanded):
+        self.initial_force_toggle.setText(
+            f"{'▾' if expanded else '▸'} INITIAL FORCE REFERENCE"
+        )
+        self.initial_force_label.setVisible(expanded)
+
+    def refresh_initial_force_summary(self):
+        path = self._selected_gesture_dir() / "reference" / "tension_summary.json"
+        try:
+            text = reference_helpers(self.project_root).initial_force_summary_text(path)
+        except (OSError, ImportError, ValueError):
+            text = "INITIAL FORCE REFERENCE\nInitial force reference: unavailable"
+        # Keep the shared summary data/semantics; adapt only its presentation.
+        lines = [line for line in text.splitlines() if line not in (
+            "INITIAL FORCE REFERENCE",
+            "Saved initial window (not the time-varying RC reference)",
+        )]
+        text = "\n".join(lines)
+        for axis in ("Fx", "Fy", "Fz"):
+            text = text.replace(f"{axis} mean:", f"{axis}:")
+        self.initial_force_label.setText(text)
+        self.initial_force_toggle.setChecked(False)
+        self._toggle_initial_force_summary(False)
+        self.initial_force_label.setToolTip(str(path))
+
     def open_replay(self):
+        self.refresh_initial_force_summary()
         reference_replay = (
             self._selected_gesture_dir()
             / "reference"
