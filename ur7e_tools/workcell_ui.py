@@ -31,7 +31,7 @@ from ur_dashboard_msgs.msg import RobotMode
 from visualization_msgs.msg import Marker, MarkerArray
 
 from PySide6.QtCore import QPoint, QProcess, QRect, QSettings, QSize, QTimer, Qt
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractScrollArea,
@@ -72,6 +72,124 @@ from ur7e_tools.nansense_live_widget import (
 )
 
 
+class CameraModeBox(QFrame):
+    """Clickable R/C box whose letter is rendered by QLabel."""
+
+    def __init__(self, letter, parent_header, mode_name, parent=None):
+        super().__init__(parent)
+        self._parent_header = parent_header
+        self._mode_name = mode_name
+
+        self.setFixedSize(22, 22)
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.letter_label = QLabel(letter)
+        self.letter_label.setAlignment(Qt.AlignCenter)
+        self.letter_label.setContentsMargins(0, 0, 0, 0)
+        self.letter_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self.letter_label)
+
+        self.update_style()
+
+    def set_letter_font(self, font):
+        self.letter_label.setFont(font)
+
+    def update_style(self):
+        selected = self._parent_header.mode() == self._mode_name
+        if not self.isEnabled():
+            bg = "#232629"
+            border = "#3f454a"
+            color = "#676d72"
+        elif selected:
+            bg = "#2f83b7"
+            border = "#4da3d9"
+            color = "#ffffff"
+        else:
+            bg = "#25292d"
+            border = "#596168"
+            color = "#f0f2f4"
+
+        self.setStyleSheet(
+            "QFrame {"
+            f" background: {bg};"
+            f" border: 1px solid {border};"
+            " border-radius: 4px;"
+            "}"
+            "QLabel {"
+            " background: transparent;"
+            " border: none;"
+            f" color: {color};"
+            " padding: 0px;"
+            " margin: 0px;"
+            "}"
+        )
+
+    def mousePressEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.LeftButton:
+            self._parent_header.set_mode(self._mode_name)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class CameraStreamModeHeader(QWidget):
+    """RGB/DEPTH title and R/C rendered with the same QLabel font."""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self._mode = "compressed"
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.setAlignment(Qt.AlignCenter)
+
+        self.title_label = QLabel(str(title))
+        self.title_label.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+        self.title_label.setContentsMargins(0, 0, 0, 0)
+        self.title_label.setStyleSheet(
+            "QLabel { background: transparent; padding: 0px; margin: 0px; }"
+        )
+
+        self.raw_box = CameraModeBox("R", self, "raw")
+        self.compressed_box = CameraModeBox("C", self, "compressed")
+
+        row.addWidget(self.title_label, 0, Qt.AlignVCenter)
+        row.addWidget(self.raw_box, 0, Qt.AlignVCenter)
+        row.addWidget(self.compressed_box, 0, Qt.AlignVCenter)
+
+        self.setFixedHeight(22)
+
+    def setFont(self, font):
+        super().setFont(font)
+        if hasattr(self, "title_label"):
+            self.title_label.setFont(font)
+            self.raw_box.set_letter_font(font)
+            self.compressed_box.set_letter_font(font)
+
+    def mode(self):
+        return self._mode
+
+    def set_mode(self, mode):
+        mode = "raw" if mode == "raw" else "compressed"
+        if self._mode != mode:
+            self._mode = mode
+        self.raw_box.update_style()
+        self.compressed_box.update_style()
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        if hasattr(self, "raw_box"):
+            self.raw_box.setEnabled(enabled)
+            self.compressed_box.setEnabled(enabled)
+            self.raw_box.update_style()
+            self.compressed_box.update_style()
+
+
 FORCE_BAR_LIMIT = 50.0
 TORQUE_BAR_LIMIT = 5.0
 WRENCH_UI_REFRESH_MS = 50
@@ -87,6 +205,8 @@ CAMERA_CONFIG = {
         "tf_prefix": "robot1_",
         "color_topic": "/robot1/camera/color/image_raw",
         "depth_topic": "/robot1/camera/depth/image_rect_raw",
+        "color_info_topic": "/robot1/camera/color/camera_info",
+        "depth_info_topic": "/robot1/camera/depth/camera_info",
     },
     "camera2": {
         "display_name": "Camera 2",
@@ -95,6 +215,8 @@ CAMERA_CONFIG = {
         "tf_prefix": "robot2_",
         "color_topic": "/robot2/camera/color/image_raw",
         "depth_topic": "/robot2/camera/depth/image_rect_raw",
+        "color_info_topic": "/robot2/camera/color/camera_info",
+        "depth_info_topic": "/robot2/camera/depth/camera_info",
     },
 }
 
@@ -1784,6 +1906,43 @@ class WorkcellUI(QMainWindow):
             self.camera_crop_processes[camera_key] = crop_process
 
         # -----------------------------------------------------
+        # Wrist RealSense rosbag recorders
+        # -----------------------------------------------------
+        # Recording is deliberately independent from camera START/STOP. A camera
+        # can stay LIVE while multiple short clips are opened and closed. Each
+        # recorder is launched in its own process group so STOP can gracefully
+        # finalize rosbag2 metadata with SIGINT.
+        self.camera_record_processes = {}
+        self.camera_record_stopping = {
+            key: False for key in CAMERA_CONFIG
+        }
+        self.camera_recording_paths = {
+            key: None for key in CAMERA_CONFIG
+        }
+        self.camera_recording_started_at = {
+            key: None for key in CAMERA_CONFIG
+        }
+
+        for camera_key in CAMERA_CONFIG:
+            record_process = QProcess(self)
+            record_process.setProcessChannelMode(QProcess.MergedChannels)
+            record_process.readyReadStandardOutput.connect(
+                lambda camera_key=camera_key:
+                self.read_camera_record_output(camera_key)
+            )
+            record_process.started.connect(
+                lambda camera_key=camera_key:
+                self.camera_record_process_started(camera_key)
+            )
+            record_process.finished.connect(
+                lambda exit_code, exit_status, camera_key=camera_key:
+                self.camera_record_process_finished(
+                    camera_key, exit_code, exit_status
+                )
+            )
+            self.camera_record_processes[camera_key] = record_process
+
+        # -----------------------------------------------------
         # Per-robot readiness state for the current UI-owned launch
         # -----------------------------------------------------
 
@@ -3325,6 +3484,43 @@ class WorkcellUI(QMainWindow):
         self.camera_preview_labels = {}
         self.camera_status_labels = {}
         self.camera_action_buttons = {}
+        self.camera_record_start_buttons = {}
+        self.camera_record_stop_buttons = {}
+        self.camera_record_status_labels = {}
+        self.camera_record_mode_headers = {}
+        self.camera_record_last_verify = {}
+
+        # Common recording controls. Individual REC/STOP buttons remain on each
+        # camera card for diagnostics and manual clip boundaries. REC BOTH starts
+        # two separate bags with a shared timestamp label.
+        camera_record_global_bar = QHBoxLayout()
+        camera_record_global_bar.setContentsMargins(7, 0, 7, 5)
+        camera_record_global_bar.setSpacing(5)
+        camera_record_global_bar.addWidget(QLabel("Camera recording:"))
+        camera_record_global_bar.addStretch(1)
+
+        self.camera_record_both_button = QPushButton("●  REC BOTH")
+        self.camera_record_both_button.setObjectName("cameraRecordBothButton")
+        self.camera_record_both_button.setEnabled(False)
+        self.camera_record_both_button.setToolTip(
+            "Start synchronized rosbag2 clips for Camera 1 and Camera 2."
+        )
+        self.camera_record_both_button.clicked.connect(
+            self.start_all_camera_recordings
+        )
+        camera_record_global_bar.addWidget(self.camera_record_both_button)
+
+        self.camera_stop_both_button = QPushButton("■  STOP BOTH")
+        self.camera_stop_both_button.setObjectName("cameraStopBothButton")
+        self.camera_stop_both_button.setEnabled(False)
+        self.camera_stop_both_button.setToolTip(
+            "Stop and finalize all active camera rosbag2 clips."
+        )
+        self.camera_stop_both_button.clicked.connect(
+            self.stop_all_camera_recordings
+        )
+        camera_record_global_bar.addWidget(self.camera_stop_both_button)
+        camera_column_layout.addLayout(camera_record_global_bar)
 
         for camera_key, config in CAMERA_CONFIG.items():
             camera_frame = QFrame()
@@ -3346,6 +3542,37 @@ class WorkcellUI(QMainWindow):
             )
             camera_header.addWidget(camera_button)
 
+            camera_record_start = QPushButton("●")
+            camera_record_start.setObjectName("recordStartButton")
+            camera_record_start.setFixedSize(26, 26)
+            camera_record_start.setEnabled(False)
+            camera_record_start.setToolTip(
+                f"Start a rosbag2 RGB + depth clip for {config['display_name']}."
+            )
+            camera_record_start.clicked.connect(
+                lambda checked=False, camera_key=camera_key:
+                self.start_camera_recording(camera_key)
+            )
+            camera_header.addWidget(camera_record_start)
+
+            camera_record_stop = QPushButton("■")
+            camera_record_stop.setObjectName("recordStopButton")
+            camera_record_stop.setFixedSize(26, 26)
+            camera_record_stop.setEnabled(False)
+            camera_record_stop.setToolTip(
+                f"Stop and finalize the current {config['display_name']} clip."
+            )
+            camera_record_stop.clicked.connect(
+                lambda checked=False, camera_key=camera_key:
+                self.stop_camera_recording(camera_key)
+            )
+            camera_header.addWidget(camera_record_stop)
+
+            camera_record_status = QLabel("")
+            camera_record_status.setMinimumWidth(66)
+            camera_record_status.setAlignment(Qt.AlignCenter)
+            camera_header.addWidget(camera_record_status)
+
             camera_status = QLabel("OFF")
             camera_status.setObjectName("connectionUnknown")
             camera_header.addWidget(camera_status)
@@ -3364,12 +3591,15 @@ class WorkcellUI(QMainWindow):
                 stream_frame.setObjectName("cameraStreamPanel")
                 stream_layout = QVBoxLayout(stream_frame)
                 stream_layout.setContentsMargins(0, 0, 0, 0)
-                stream_layout.setSpacing(3)
+                stream_layout.setSpacing(6)
 
-                title_label = QLabel(stream_title)
-                title_label.setObjectName("cameraStreamTitle")
-                title_label.setAlignment(Qt.AlignCenter)
-                stream_layout.addWidget(title_label)
+                mode_header = CameraStreamModeHeader(stream_title)
+                mode_header.setFont(self.font())
+                stream_layout.addWidget(mode_header)
+
+                self.camera_record_mode_headers[(camera_key, stream_name)] = (
+                    mode_header
+                )
 
                 preview = QLabel("STREAM INACTIVE")
                 preview.setObjectName("cameraPreviewPlaceholder")
@@ -3386,6 +3616,9 @@ class WorkcellUI(QMainWindow):
             self.camera_preview_labels[camera_key] = stream_previews
             self.camera_status_labels[camera_key] = camera_status
             self.camera_action_buttons[camera_key] = camera_button
+            self.camera_record_start_buttons[camera_key] = camera_record_start
+            self.camera_record_stop_buttons[camera_key] = camera_record_stop
+            self.camera_record_status_labels[camera_key] = camera_record_status
 
         self.camera_splitter.setStretchFactor(0, 1)
         self.camera_splitter.setStretchFactor(1, 1)
@@ -4317,6 +4550,10 @@ class WorkcellUI(QMainWindow):
             )
 
     def stop_camera(self, camera_key):
+        # A rosbag must be finalized before its source stream disappears.
+        if self.is_camera_recording(camera_key):
+            self.stop_camera_recording(camera_key)
+
         process = self.camera_processes[camera_key]
         crop_process = self.camera_crop_processes[camera_key]
         if (
@@ -4568,6 +4805,301 @@ class WorkcellUI(QMainWindow):
                 button.setEnabled(
                     self.setup_combo.currentText() == "Dual UR7e"
                 )
+
+        self.update_camera_recording_controls()
+
+    # =========================================================
+    # Wrist RealSense RGB MP4 + depth rosbag2 recording
+    # =========================================================
+
+    def is_camera_recording(self, camera_key):
+        process = self.camera_record_processes.get(camera_key)
+        return bool(
+            process is not None
+            and process.state() != QProcess.NotRunning
+        )
+
+    def _camera_recording_root(self):
+        # Reuse the existing Recording folder selector so all experiment data
+        # stays under one user-controlled root. Camera clips get their own
+        # subfolder and never enter the Git workspace by default.
+        folder = os.path.expanduser(
+            self.recording_folder_edit.text().strip()
+        )
+        if not folder:
+            folder = self.default_recording_folder
+        return os.path.join(folder, "camera_recordings")
+
+    def start_camera_recording(self, camera_key, session_tag=None):
+        if camera_key not in CAMERA_CONFIG:
+            return
+        if self.is_camera_recording(camera_key):
+            return
+
+        snapshot = self.wrench_listener.camera_snapshot()
+        if not (
+            self._camera_stream_fresh(camera_key, "color", snapshot)
+            and self._camera_stream_fresh(camera_key, "depth", snapshot)
+        ):
+            QMessageBox.warning(
+                self,
+                "Camera not live",
+                "Wait until both RGB and DEPTH are live before recording.",
+            )
+            return
+
+        # Persist any manually edited recording root before starting a clip.
+        self.save_recording_folder()
+        root = self._camera_recording_root()
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Recording folder",
+                f"Could not create/access camera recording folder:\n{exc}",
+            )
+            return
+
+        if session_tag is None:
+            session_tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+        output_dir = os.path.join(root, f"{camera_key}_{session_tag}")
+        # rosbag2 requires a new output directory. Extremely unlikely timestamp
+        # collisions are handled explicitly rather than overwriting old data.
+        suffix = 1
+        base_output_dir = output_dir
+        while os.path.exists(output_dir):
+            output_dir = f"{base_output_dir}_{suffix:02d}"
+            suffix += 1
+
+        config = CAMERA_CONFIG[camera_key]
+        recorder_backend = (
+            Path(__file__).resolve().parent / "camera_recording_backend.py"
+        )
+        if not recorder_backend.is_file():
+            QMessageBox.warning(
+                self,
+                "Camera recording backend",
+                f"Missing recorder backend:\n{recorder_backend}",
+            )
+            return
+
+        rgb_mode = self.camera_record_mode_headers[
+            (camera_key, "color")
+        ].mode()
+        depth_mode = self.camera_record_mode_headers[
+            (camera_key, "depth")
+        ].mode()
+
+        command = (
+            f"/usr/bin/python3 -u {shlex.quote(str(recorder_backend))} "
+            f"--camera-key {shlex.quote(camera_key)} "
+            f"--color-topic {shlex.quote(config['color_topic'])} "
+            f"--depth-topic {shlex.quote(config['depth_topic'])} "
+            f"--color-info-topic {shlex.quote(config['color_info_topic'])} "
+            f"--depth-info-topic {shlex.quote(config['depth_info_topic'])} "
+            f"--output-dir {shlex.quote(output_dir)} "
+            f"--rgb-mode {shlex.quote(rgb_mode)} "
+            f"--depth-mode {shlex.quote(depth_mode)} "
+            "--fps 30 --crf 20"
+        )
+        workspace_setup = os.path.expanduser(
+            "~/ros2_ws/install/setup.bash"
+        )
+        full_command = (
+            "source /opt/ros/humble/setup.bash"
+            f" && source {shlex.quote(workspace_setup)}"
+            f" && exec setsid {command}"
+        )
+
+        self.camera_record_stopping[camera_key] = False
+        self.camera_recording_paths[camera_key] = output_dir
+        self.camera_recording_started_at[camera_key] = time.monotonic()
+        self.log_output.appendPlainText(
+            f"\n[{config['display_name']} REC requested: {output_dir}]\n"
+            f"[RGB: {rgb_mode.upper()} | DEPTH: {depth_mode.upper()}]\n"
+            f"$ {command}"
+        )
+        self.camera_record_processes[camera_key].start(
+            "/bin/bash", ["-lc", full_command]
+        )
+        self.update_camera_recording_controls()
+
+    def stop_camera_recording(self, camera_key, silent=False):
+        process = self.camera_record_processes.get(camera_key)
+        if process is None or process.state() == QProcess.NotRunning:
+            return
+        if self.camera_record_stopping.get(camera_key):
+            return
+
+        self.camera_record_stopping[camera_key] = True
+        display_name = CAMERA_CONFIG[camera_key]["display_name"]
+        if not silent:
+            self.log_output.appendPlainText(
+                f"\n[{display_name} REC stopping...]"
+            )
+
+        pid = int(process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+        QTimer.singleShot(
+            180000,
+            lambda camera_key=camera_key:
+            self.force_stop_camera_recording_if_needed(camera_key),
+        )
+        self.update_camera_recording_controls()
+
+    def force_stop_camera_recording_if_needed(self, camera_key):
+        process = self.camera_record_processes.get(camera_key)
+        if process is None or process.state() == QProcess.NotRunning:
+            return
+        pid = int(process.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def camera_record_process_started(self, camera_key):
+        self.camera_recording_started_at[camera_key] = time.monotonic()
+        self.update_camera_recording_controls()
+
+    def camera_record_process_finished(
+        self, camera_key, exit_code, exit_status
+    ):
+        display_name = CAMERA_CONFIG[camera_key]["display_name"]
+        path = self.camera_recording_paths.get(camera_key)
+        was_stopping = self.camera_record_stopping.get(camera_key, False)
+
+        if was_stopping or exit_code == 0:
+            self.log_output.appendPlainText(
+                f"\n[{display_name} REC saved: {path}]"
+            )
+        else:
+            self.log_output.appendPlainText(
+                f"\n[{display_name} REC failed - exit code {exit_code}]"
+            )
+            QMessageBox.warning(
+                self,
+                "Camera recording error",
+                f"{display_name} camera recording stopped unexpectedly "
+                f"(exit code {exit_code}). Check ROS 2 output.",
+            )
+
+        self.camera_record_stopping[camera_key] = False
+        self.camera_recording_started_at[camera_key] = None
+        self.camera_recording_paths[camera_key] = None
+        self.update_camera_recording_controls()
+
+    def read_camera_record_output(self, camera_key):
+        process = self.camera_record_processes[camera_key]
+        text = bytes(process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if text:
+            display_name = CAMERA_CONFIG[camera_key]["display_name"]
+            for line in text.rstrip().splitlines():
+                if line.startswith("[VERIFY]"):
+                    self.camera_record_last_verify[camera_key] = line
+                    self.log_output.appendPlainText(
+                        f"[{display_name} VERIFIED] {line[len('[VERIFY] '):]}"
+                    )
+                else:
+                    self.log_output.appendPlainText(
+                        f"[{display_name} REC] {line}"
+                    )
+
+    def start_all_camera_recordings(self):
+        snapshot = self.wrench_listener.camera_snapshot()
+        ready = all(
+            self._camera_stream_fresh(key, "color", snapshot)
+            and self._camera_stream_fresh(key, "depth", snapshot)
+            for key in CAMERA_CONFIG
+        )
+        if not ready:
+            QMessageBox.warning(
+                self,
+                "Cameras not live",
+                "Both cameras need LIVE RGB and DEPTH streams before REC BOTH.",
+            )
+            return
+        if any(self.is_camera_recording(key) for key in CAMERA_CONFIG):
+            return
+
+        session_tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        for camera_key in CAMERA_CONFIG:
+            self.start_camera_recording(camera_key, session_tag=session_tag)
+
+    def stop_all_camera_recordings(self, silent=False):
+        for camera_key in CAMERA_CONFIG:
+            if self.is_camera_recording(camera_key):
+                self.stop_camera_recording(camera_key, silent=silent)
+
+    @staticmethod
+    def _format_camera_record_elapsed(seconds):
+        seconds = max(0, int(seconds))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def update_camera_recording_controls(self):
+        if not hasattr(self, "camera_record_start_buttons"):
+            return
+
+        snapshot = self.wrench_listener.camera_snapshot()
+        all_live = True
+        any_recording = False
+
+        for camera_key in CAMERA_CONFIG:
+            recording = self.is_camera_recording(camera_key)
+            stopping = self.camera_record_stopping.get(camera_key, False)
+            live = (
+                self._camera_stream_fresh(camera_key, "color", snapshot)
+                and self._camera_stream_fresh(camera_key, "depth", snapshot)
+            )
+            all_live = all_live and live
+            any_recording = any_recording or recording
+
+            self.camera_record_start_buttons[camera_key].setEnabled(
+                live and not recording
+            )
+            self.camera_record_stop_buttons[camera_key].setEnabled(
+                recording and not stopping
+            )
+
+            for stream_name in ("color", "depth"):
+                mode_header = self.camera_record_mode_headers.get(
+                    (camera_key, stream_name)
+                )
+                if mode_header is not None:
+                    mode_header.setEnabled(not recording)
+
+            label = self.camera_record_status_labels[camera_key]
+            if recording:
+                started = self.camera_recording_started_at.get(camera_key)
+                elapsed = 0.0 if started is None else time.monotonic() - started
+                label.setText(
+                    "FINALIZING" if stopping
+                    else f"● REC {self._format_camera_record_elapsed(elapsed)}"
+                )
+                label.setObjectName("recordingActive")
+            else:
+                label.setText("")
+                label.setObjectName("")
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+        self.camera_record_both_button.setEnabled(
+            all_live and not any_recording
+        )
+        self.camera_stop_both_button.setEnabled(any_recording)
 
     # =========================================================
     # Wrench CSV recording
@@ -9042,6 +9574,15 @@ class WorkcellUI(QMainWindow):
                 1000
             )
 
+        if hasattr(self, "camera_record_processes"):
+            self.stop_all_camera_recordings(silent=True)
+            for camera_key, process in self.camera_record_processes.items():
+                if process.state() != QProcess.NotRunning:
+                    process.waitForFinished(3000)
+                    if process.state() != QProcess.NotRunning:
+                        self.force_stop_camera_recording_if_needed(camera_key)
+                        process.waitForFinished(1000)
+
         if hasattr(self, "camera_processes"):
             for camera_key, process in self.camera_processes.items():
                 if process.state() != QProcess.NotRunning:
@@ -9376,9 +9917,21 @@ class WorkcellUI(QMainWindow):
                 font-weight: 900;
             }
 
+            QPushButton#cameraRecordBothButton {
+                color: #ff8a80;
+                font-weight: 800;
+            }
+
+            QPushButton#cameraStopBothButton {
+                color: #e8eaed;
+                font-weight: 800;
+            }
+
             QPushButton#recordStartButton:enabled:hover,
             QPushButton#recordStopButton:enabled:hover,
-            QPushButton#zeroIconButton:enabled:hover {
+            QPushButton#zeroIconButton:enabled:hover,
+            QPushButton#cameraRecordBothButton:enabled:hover,
+            QPushButton#cameraStopBothButton:enabled:hover {
                 background: #4a4d51;
                 border-color: #8a9096;
             }
