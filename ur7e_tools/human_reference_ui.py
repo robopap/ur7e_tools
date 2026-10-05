@@ -904,27 +904,42 @@ class HumanReferencePanel(QFrame):
         if self.sim_process and self.sim_process.state() != QProcess.NotRunning:
             return
 
-        gesture = self.gesture.currentText().strip().lower()
-        mode = self._mode()
-        reference_dir = self._selected_gesture_dir() / "reference"
-        start_dir = reference_dir if reference_dir.is_dir() else self.project_root
-
-        csv_name, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            f"Select {self.gesture.currentText()} Robot1 trajectory CSV",
-            str(start_dir),
-            "CSV trajectories (*.csv);;All files (*)",
-        )
-        if not csv_name:
+        participant = self.participant.text().strip()
+        if not participant:
+            QMessageBox.warning(
+                self,
+                "Participant",
+                "Enter participant ID.",
+            )
             return
 
-        csv_path = Path(csv_name).expanduser()
-        script = self.project_root / "task_space" / "execute_single_gesture.py"
-        if not csv_path.is_file() or not script.is_file():
+        gesture = self.gesture.currentText().strip().lower()
+        mode = self._mode()
+
+        reference_csv = (
+            self.dataset_root
+            / participant
+            / gesture
+            / "reference"
+            / "robot1_task_space_ik.csv"
+        )
+
+        if not reference_csv.is_file():
             QMessageBox.warning(
                 self,
                 "Single gesture run",
-                "Selected CSV or single-gesture runner is missing.",
+                "Robot1 reference trajectory is missing:\n\n"
+                f"{reference_csv}",
+            )
+            return
+
+        backend = self.project_root / "experiment_backend" / "right_hand.py"
+        if not backend.is_file():
+            QMessageBox.warning(
+                self,
+                "Single gesture run",
+                "Right-hand experiment backend is missing:\n\n"
+                f"{backend}",
             )
             return
 
@@ -932,14 +947,14 @@ class HumanReferencePanel(QFrame):
             answer = QMessageBox.question(
                 self,
                 "Confirm REAL robot motion",
+                f"Participant: {participant}\n"
                 f"Gesture: {self.gesture.currentText()}\n"
-                f"Robot CSV: {csv_path}\n\n"
-                "Robot1 will be checked/moved to the gesture q0 and Robot2 "
-                "to anchor over 5 s if required. The selected forward CSV "
-                "will then run on the real robot. Recording stops at the "
-                "forward trajectory end, before Robot1 returns to q0 in 1 s.\n\n"
+                f"Robot CSV: {reference_csv}\n\n"
+                "The canonical right-hand experiment backend will run this "
+                "single gesture on Robot1.\n\n"
                 "Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             if answer != QMessageBox.StandardButton.Yes:
@@ -948,28 +963,24 @@ class HumanReferencePanel(QFrame):
         args = [
             "--mode",
             mode,
-            "--gesture",
+            "--task",
             gesture,
-            "--csv",
-            csv_path,
             "--participant",
-            self.participant.text().strip() or "unknown",
+            participant,
         ]
-        if mode == "simulation":
-            args.append("--confirm-fake-hardware")
-        else:
-            args.extend(["--confirm-real-hardware", "--record-bag"])
 
-        cmd = (
-            f"cd {shlex.quote(str(self.project_root))} && "
-            f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
-            + " ".join(shlex.quote(str(x)) for x in args)
+        cmd = self._cmd(
+            "experiment_backend.right_hand",
+            args,
+            python_executable="/usr/bin/python3",
         )
 
         self._sim_active = True
         self._sim_log_tail = []
         self.status.setText(
-            "REAL RUN STARTING" if mode == "real" else "SIMULATION STARTING"
+            "REAL RUN STARTING"
+            if mode == "real"
+            else "SIMULATION STARTING"
         )
         self.sim_btn.setEnabled(False)
 
@@ -978,8 +989,13 @@ class HumanReferencePanel(QFrame):
         self.sim_process.readyReadStandardOutput.connect(
             self._simulation_output
         )
-        self.sim_process.finished.connect(self._simulation_finished)
-        self.sim_process.start("/bin/bash", ["-lc", cmd])
+        self.sim_process.finished.connect(
+            self._simulation_finished
+        )
+        self.sim_process.start(
+            "/bin/bash",
+            ["-lc", cmd],
+        )
 
     def _simulation_output(self):
         text = bytes(
