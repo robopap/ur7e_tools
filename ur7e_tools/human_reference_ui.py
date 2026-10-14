@@ -14,12 +14,16 @@ from PySide6.QtCore import QProcess, QTimer, Qt, QUrl
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QAbstractItemView,
     QComboBox,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QStyle,
@@ -268,11 +272,14 @@ class HumanReferencePanel(QFrame):
         self.current_rep = 1
         self.record_process = None
         self.build_process = None
+        self.train_process = None
         self.sim_process = None
         self.last_trial_dir = None
         self._trial_active = False
         self._build_active = False
+        self._train_active = False
         self._sim_active = False
+        self._train_log_tail = []
         self._sim_log_tail = []
         self._recordings_complete = False
         self._reference_ready = False
@@ -372,8 +379,17 @@ class HumanReferencePanel(QFrame):
         self.start_btn.setEnabled(False)
         self.build_btn = QPushButton("BUILD REFERENCE")
         self.build_btn.setEnabled(False)
+
+        self.train_btn = QPushButton("TRAIN MODEL")
+        self.train_btn.setEnabled(False)
+        self.train_btn.setToolTip(
+            "Train a 100 ms fixed-beta/fixed-phi SARIMAX wrench predictor "
+            "from exactly three selected participants."
+        )
+
         row3.addWidget(self.start_btn)
         row3.addWidget(self.build_btn)
+        row3.addWidget(self.train_btn)
         lay.addLayout(row3)
 
         row4 = QHBoxLayout()
@@ -401,6 +417,7 @@ class HumanReferencePanel(QFrame):
 
         self.start_btn.clicked.connect(self.start_trial)
         self.build_btn.clicked.connect(self.build_reference)
+        self.train_btn.clicked.connect(self.train_forecast_model)
         self.replay_btn.clicked.connect(self.open_replay)
         self.sim_btn.clicked.connect(self.run_selected_gesture)
         self.dataset_btn.clicked.connect(self.browse_dataset)
@@ -486,6 +503,9 @@ class HumanReferencePanel(QFrame):
         self.build_btn.setEnabled(
             self._recordings_complete and not self._build_active
         )
+        self.train_btn.setEnabled(
+            self._forecast_training_ready() and not self._train_active
+        )
         self.sim_btn.setEnabled(not self._sim_active)
 
         if self._loaded_gesture_dir is not None:
@@ -505,7 +525,12 @@ class HumanReferencePanel(QFrame):
             )
 
     def refresh_input_health(self):
-        if self._trial_active or self._build_active or self._sim_active:
+        if (
+            self._trial_active
+            or self._build_active
+            or self._train_active
+            or self._sim_active
+        ):
             return
 
         self.sim_btn.setText(
@@ -783,6 +808,342 @@ class HumanReferencePanel(QFrame):
         self._play(2)
         self.reload_selected_dataset()
 
+    def _eligible_forecast_training_participants(self):
+        """Participants with one complete raw recording for the selected gesture."""
+        gesture = self.gesture.currentText().strip().lower()
+        required = (
+            "metadata.json",
+            "nansense_raw.csv",
+            "robot2_ft_raw.csv",
+            "synchronized_90hz.csv",
+        )
+
+        eligible = []
+        if not self.dataset_root.is_dir():
+            return eligible
+
+        for participant_dir in sorted(self.dataset_root.iterdir()):
+            if not participant_dir.is_dir():
+                continue
+
+            rep_dir = participant_dir / gesture / "rep_01"
+            if (
+                rep_dir.is_dir()
+                and all((rep_dir / name).is_file() for name in required)
+            ):
+                eligible.append(participant_dir.name)
+
+        return eligible
+
+    def _forecast_training_ready(self):
+        return len(self._eligible_forecast_training_participants()) >= 3
+
+    def _select_three_training_participants(self):
+        participants = self._eligible_forecast_training_participants()
+
+        if len(participants) < 3:
+            QMessageBox.warning(
+                self,
+                "TRAIN MODEL",
+                "At least three complete participant recordings are required "
+                "for the selected gesture.\n\n"
+                "Each participant must contain rep_01 with:\n"
+                "metadata.json\n"
+                "nansense_raw.csv\n"
+                "robot2_ft_raw.csv\n"
+                "synchronized_90hz.csv",
+            )
+            return None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(
+            f"Select 3 training participants — {self.gesture.currentText()}"
+        )
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel(
+            "Select exactly three participants to train the proactive predictor."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        participant_list = QListWidget(dialog)
+        participant_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
+        for participant in participants:
+            participant_list.addItem(participant)
+        layout.addWidget(participant_list)
+
+        selected_label = QLabel("Selected: 0 / 3")
+        layout.addWidget(selected_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setEnabled(False)
+        layout.addWidget(buttons)
+
+        def refresh_selection():
+            count = len(participant_list.selectedItems())
+            selected_label.setText(f"Selected: {count} / 3")
+            ok_button.setEnabled(count == 3)
+
+        participant_list.itemSelectionChanged.connect(refresh_selection)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected = sorted(
+            item.text().strip()
+            for item in participant_list.selectedItems()
+            if item.text().strip()
+        )
+        return selected if len(selected) == 3 else None
+
+    def _forecast_training_id(self, participants):
+        participants = sorted(str(p).strip() for p in participants)
+        return (
+            "_".join(participants)
+            + "_60hz_100ms_1hz"
+        )
+
+    def _forecast_model_dir(self, gesture, participants):
+        return (
+            self.project_root
+            / "results"
+            / "wrench_models"
+            / gesture
+            / self._forecast_training_id(participants)
+        )
+
+    def _forecast_trainer_script(self):
+        candidates = (
+            self.project_root
+            / "experiment_backend"
+            / "train_live_wrench_predictor.py",
+            self.project_root
+            / "tools"
+            / "train_live_wrench_predictor.py",
+        )
+        for path in candidates:
+            if path.is_file():
+                return path
+        return None
+
+    def train_forecast_model(self):
+        if (
+            self.train_process
+            and self.train_process.state() != QProcess.NotRunning
+        ):
+            return
+
+        gesture = self.gesture.currentText().strip().lower()
+        participants = self._select_three_training_participants()
+        if participants is None:
+            return
+
+        trial_dirs = [
+            self.dataset_root / participant / gesture / "rep_01"
+            for participant in participants
+        ]
+
+        trainer = self._forecast_trainer_script()
+        if trainer is None:
+            QMessageBox.warning(
+                self,
+                "TRAIN MODEL",
+                "Training script not found.\n\nExpected one of:\n"
+                f"{self.project_root / 'experiment_backend' / 'train_live_wrench_predictor.py'}\n"
+                f"{self.project_root / 'tools' / 'train_live_wrench_predictor.py'}",
+            )
+            return
+
+        data_python = (
+            self.project_root
+            / ".venv_data"
+            / "bin"
+            / "python3"
+        )
+        if not data_python.is_file():
+            QMessageBox.warning(
+                self,
+                "TRAIN MODEL",
+                f"Scientific Python environment not found:\n{data_python}",
+            )
+            return
+
+        output_dir = self._forecast_model_dir(
+            gesture,
+            participants,
+        )
+        artifact = output_dir / "model_artifact.json"
+        training_id = self._forecast_training_id(participants)
+
+        if artifact.is_file():
+            answer = QMessageBox.question(
+                self,
+                "Retrain forecast model",
+                f"Training set: {training_id}\n"
+                f"Gesture: {gesture}\n\n"
+                f"A model already exists:\n{artifact}\n\n"
+                "Retrain and replace the files in this model folder?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        args = []
+        for trial_dir in trial_dirs:
+            args.extend(["--trial-dir", trial_dir])
+
+        # Keep the deployment preprocessing explicit and identical to the
+        # validated proactive prototype: 60 Hz model, 100 ms horizon,
+        # 2 Hz motion LPF, 1 Hz wrench LPF.
+        args.extend(
+            [
+                "--horizon-ms",
+                "100",
+                "--model-rate-hz",
+                "60",
+                "--motion-cutoff-hz",
+                "2.0",
+                "--wrench-cutoff-hz",
+                "1.0",
+                "--output",
+                output_dir,
+            ]
+        )
+
+        if trainer.parent.name == "experiment_backend":
+            # Run package code as a module so imports such as
+            # "from experiment_backend..." resolve from the project root.
+            trainer_entry = (
+                "-m experiment_backend."
+                + trainer.stem
+            )
+        else:
+            # Fallback for a standalone tools/ copy.
+            trainer_entry = shlex.quote(str(trainer))
+
+        command = (
+            f"cd {shlex.quote(str(self.project_root))} && "
+            f"{shlex.quote(str(data_python))} "
+            f"{trainer_entry} "
+            + " ".join(shlex.quote(str(x)) for x in args)
+        )
+
+        self._train_active = True
+        self._train_log_tail = []
+        self._active_training_output_dir = output_dir
+        self._active_training_id = training_id
+        self.status.setText("TRAINING MODEL...")
+        self.train_btn.setEnabled(False)
+
+        self.train_process = QProcess(self)
+        self.train_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.train_process.readyReadStandardOutput.connect(
+            self._forecast_training_output
+        )
+        self.train_process.finished.connect(
+            self._forecast_training_finished
+        )
+        self.train_process.start(
+            "/bin/bash",
+            ["-lc", command],
+        )
+
+    def _forecast_training_output(self):
+        if self.train_process is None:
+            return
+
+        output_text = bytes(
+            self.train_process.readAllStandardOutput()
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        for line in output_text.splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            self._train_log_tail.append(clean)
+            self._train_log_tail = self._train_log_tail[-40:]
+
+            if clean.startswith("LOAD "):
+                self.status.setText("TRAINING: LOADING")
+            elif clean.startswith("=== "):
+                self.status.setText(
+                    "TRAINING " + clean.strip("= ").upper()
+                )
+            elif clean == "TRAINING COMPLETE":
+                self.status.setText("MODEL READY")
+
+    def _forecast_training_finished(self, code, status):
+        del status
+        self._train_active = False
+
+        output_dir = getattr(
+            self,
+            "_active_training_output_dir",
+            None,
+        )
+        training_id = getattr(
+            self,
+            "_active_training_id",
+            "",
+        )
+
+        artifact = (
+            output_dir / "model_artifact.json"
+            if output_dir is not None
+            else None
+        )
+        report = (
+            output_dir / "training_report.json"
+            if output_dir is not None
+            else None
+        )
+
+        if (
+            code == 0
+            and artifact is not None
+            and report is not None
+            and artifact.is_file()
+            and report.is_file()
+        ):
+            self.status.setText("MODEL READY")
+            self.train_btn.setEnabled(
+                self._forecast_training_ready()
+            )
+            QMessageBox.information(
+                self,
+                "Forecast model ready",
+                f"Training: {training_id}\n\n"
+                f"Model:\n{artifact}\n\n"
+                f"Report:\n{report}",
+            )
+        else:
+            self.status.setText("TRAIN ERROR")
+            self.train_btn.setEnabled(
+                self._forecast_training_ready()
+            )
+            tail = "\n".join(self._train_log_tail[-12:])
+            QMessageBox.critical(
+                self,
+                "Forecast model training failed",
+                "The training process failed."
+                + (f"\n\nLast output:\n{tail}" if tail else ""),
+            )
+
     def build_reference(self):
         if (
             self.build_process
@@ -904,42 +1265,27 @@ class HumanReferencePanel(QFrame):
         if self.sim_process and self.sim_process.state() != QProcess.NotRunning:
             return
 
-        participant = self.participant.text().strip()
-        if not participant:
-            QMessageBox.warning(
-                self,
-                "Participant",
-                "Enter participant ID.",
-            )
-            return
-
         gesture = self.gesture.currentText().strip().lower()
         mode = self._mode()
+        reference_dir = self._selected_gesture_dir() / "reference"
+        start_dir = reference_dir if reference_dir.is_dir() else self.project_root
 
-        reference_csv = (
-            self.dataset_root
-            / participant
-            / gesture
-            / "reference"
-            / "robot1_task_space_ik.csv"
+        csv_name, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            f"Select {self.gesture.currentText()} Robot1 trajectory CSV",
+            str(start_dir),
+            "CSV trajectories (*.csv);;All files (*)",
         )
-
-        if not reference_csv.is_file():
-            QMessageBox.warning(
-                self,
-                "Single gesture run",
-                "Robot1 reference trajectory is missing:\n\n"
-                f"{reference_csv}",
-            )
+        if not csv_name:
             return
 
-        backend = self.project_root / "experiment_backend" / "right_hand.py"
-        if not backend.is_file():
+        csv_path = Path(csv_name).expanduser()
+        script = self.project_root / "task_space" / "execute_single_gesture.py"
+        if not csv_path.is_file() or not script.is_file():
             QMessageBox.warning(
                 self,
                 "Single gesture run",
-                "Right-hand experiment backend is missing:\n\n"
-                f"{backend}",
+                "Selected CSV or single-gesture runner is missing.",
             )
             return
 
@@ -947,14 +1293,14 @@ class HumanReferencePanel(QFrame):
             answer = QMessageBox.question(
                 self,
                 "Confirm REAL robot motion",
-                f"Participant: {participant}\n"
                 f"Gesture: {self.gesture.currentText()}\n"
-                f"Robot CSV: {reference_csv}\n\n"
-                "The canonical right-hand experiment backend will run this "
-                "single gesture on Robot1.\n\n"
+                f"Robot CSV: {csv_path}\n\n"
+                "Robot1 will be checked/moved to the gesture q0 and Robot2 "
+                "to anchor over 5 s if required. The selected forward CSV "
+                "will then run on the real robot. Recording stops at the "
+                "forward trajectory end, before Robot1 returns to q0 in 1 s.\n\n"
                 "Continue?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             if answer != QMessageBox.StandardButton.Yes:
@@ -963,24 +1309,28 @@ class HumanReferencePanel(QFrame):
         args = [
             "--mode",
             mode,
-            "--task",
+            "--gesture",
             gesture,
+            "--csv",
+            csv_path,
             "--participant",
-            participant,
+            self.participant.text().strip() or "unknown",
         ]
+        if mode == "simulation":
+            args.append("--confirm-fake-hardware")
+        else:
+            args.extend(["--confirm-real-hardware", "--record-bag"])
 
-        cmd = self._cmd(
-            "experiment_backend.right_hand",
-            args,
-            python_executable="/usr/bin/python3",
+        cmd = (
+            f"cd {shlex.quote(str(self.project_root))} && "
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+            + " ".join(shlex.quote(str(x)) for x in args)
         )
 
         self._sim_active = True
         self._sim_log_tail = []
         self.status.setText(
-            "REAL RUN STARTING"
-            if mode == "real"
-            else "SIMULATION STARTING"
+            "REAL RUN STARTING" if mode == "real" else "SIMULATION STARTING"
         )
         self.sim_btn.setEnabled(False)
 
@@ -989,13 +1339,8 @@ class HumanReferencePanel(QFrame):
         self.sim_process.readyReadStandardOutput.connect(
             self._simulation_output
         )
-        self.sim_process.finished.connect(
-            self._simulation_finished
-        )
-        self.sim_process.start(
-            "/bin/bash",
-            ["-lc", cmd],
-        )
+        self.sim_process.finished.connect(self._simulation_finished)
+        self.sim_process.start("/bin/bash", ["-lc", cmd])
 
     def _simulation_output(self):
         text = bytes(

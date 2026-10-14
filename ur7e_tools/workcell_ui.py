@@ -30,7 +30,7 @@ from tf2_ros import Buffer, TransformListener
 from ur_dashboard_msgs.msg import RobotMode
 from visualization_msgs.msg import Marker, MarkerArray
 
-from PySide6.QtCore import QPoint, QProcess, QRect, QSettings, QSize, QTimer, Qt
+from PySide6.QtCore import QEvent, QPoint, QProcess, QRect, QSettings, QSize, QTimer, Qt
 from PySide6.QtGui import QColor, QFontMetrics, QIcon, QImage, QPainter, QPixmap, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -277,27 +277,50 @@ PRIMARY_MOTION_CONTROLLER = "joint_trajectory_controller"
 
 DIRECT_EXPERIMENT_BACKENDS = {
     "Right": {
-        "Compound": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "compound"},
-        "Polishing": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "polishing"},
-        "Full": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "full"},
+        "Open-loop": {
+            "Compound": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "compound"},
+            "Polishing": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "polishing"},
+            "Full": {"filename": "right_hand.py", "module": "experiment_backend.right_hand", "task": "full"},
+        },
+        "Reactive": {
+            "Compound": {"filename": "right_hand_reactive.py", "module": "experiment_backend.right_hand_reactive", "task": "compound"},
+            "Polishing": {"filename": "right_hand_reactive.py", "module": "experiment_backend.right_hand_reactive", "task": "polishing"},
+            "Full": {"filename": "right_hand_reactive.py", "module": "experiment_backend.right_hand_reactive", "task": "full"},
+        },
+        "Proactive": {
+            "Compound": {"filename": "right_hand_proactive.py", "module": "experiment_backend.right_hand_proactive", "task": "compound"},
+            "Polishing": {"filename": "right_hand_proactive.py", "module": "experiment_backend.right_hand_proactive", "task": "polishing"},
+            "Full": {"filename": "right_hand_proactive.py", "module": "experiment_backend.right_hand_proactive", "task": "full"},
+        },
     },
     "Left": {
-        "Full": {"filename": "left_hand_direct.py", "module": "experiment_backend.left_hand_direct", "protocol": "single"},
+        "Open-loop": {
+            "Full": {"filename": "left_hand_direct.py", "module": "experiment_backend.left_hand_direct", "protocol": "single"},
+        },
     },
 }
 
 
 def direct_experiment_launch_spec(selection, real_mode):
-    """Return the canonical Open Loop backend for the current selection."""
+    """Return the canonical backend for the current experiment selection."""
     selection = tuple(selection)
     if len(selection) != 4:
         return None
+
     task, hand, control, motion = selection
-    if (control, motion) != ("Open-loop", "Task Space"):
+
+    if motion != "Task Space":
         return None
-    backend = DIRECT_EXPERIMENT_BACKENDS.get(hand, {}).get(task)
+
+    backend = (
+        DIRECT_EXPERIMENT_BACKENDS
+        .get(hand, {})
+        .get(control, {})
+        .get(task)
+    )
     if backend is None:
         return None
+
     return {
         "filename": backend["filename"],
         "module": backend["module"],
@@ -307,9 +330,15 @@ def direct_experiment_launch_spec(selection, real_mode):
     }
 
 
-def experiment_task_uses_ui_speed(task_name):
-    """Only the standalone Compound/Polishing runs use the UI speed spinbox."""
-    return task_name in {"Compound", "Polishing"}
+def experiment_selection_uses_ui_speed(selection):
+    """UI speed affects only Right-hand Open-loop standalone gestures."""
+    task, hand, control, motion = tuple(selection)
+    return (
+        hand == "Right"
+        and control == "Open-loop"
+        and motion == "Task Space"
+        and task in {"Compound", "Polishing"}
+    )
 
 
 def analysis_trial_sort_timestamp(trial_dir, metadata):
@@ -1803,6 +1832,30 @@ class WorkcellUI(QMainWindow):
         self.active_setup_motion = None
         self.setup_motion_output_buffer = ""
 
+        # Separate from arm and dual-UR7e motion processes.
+        self.ur3_gripper_process = QProcess(self)
+        self.ur3_gripper_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.ur3_gripper_process.finished.connect(self._ur3_gripper_finished)
+        self.ur3_gripper_process.readyReadStandardOutput.connect(
+            self._read_ur3_gripper_output
+        )
+
+        # Isolated Single-UR3 joystick process (no effect on UR7e).
+        self.ur3_jog_process = QProcess(self)
+        self.ur3_jog_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.ur3_jog_process.readyReadStandardOutput.connect(self._ur3_jog_output)
+        self.ur3_jog_process.finished.connect(self._ur3_jog_finished)
+        self.ur3_jog_armed = False
+        self.ur3_jog_axis = None
+        self.ur3_jog_selected_axis = "Z"
+        self.ur3_jog_keyboard_direction = None
+        self.ur3_jog_pending = False
+        QApplication.instance().installEventFilter(self)
+        QApplication.instance().applicationStateChanged.connect(self._ur3_jog_app_state_changed)
+        self.ur3_jog_timer = QTimer(self)
+        self.ur3_jog_timer.setInterval(50)
+        self.ur3_jog_timer.timeout.connect(self._ur3_jog_heartbeat)
+
         # -----------------------------------------------------
         # 2FG7 gripper commands
         # -----------------------------------------------------
@@ -2351,6 +2404,80 @@ class WorkcellUI(QMainWindow):
         ur3_layout.addLayout(
             ur3_actions_layout
         )
+
+        # UR3 Robotiq 2F-140: modifying setpoints never commands motion.
+        self.ur3_gripper_group = QGroupBox("UR3 Robotiq 2F-140")
+        grip_grid = QGridLayout(self.ur3_gripper_group)
+        self.ur3_gripper_position = QDoubleSpinBox()
+        self.ur3_gripper_position.setRange(0.0, 140.0)
+        self.ur3_gripper_position.setSingleStep(5.0)
+        self.ur3_gripper_position.setDecimals(1)
+        self.ur3_gripper_position.setSuffix(" mm")
+        self.ur3_gripper_position.setValue(140.0)
+        self.ur3_gripper_velocity = QSpinBox()
+        self.ur3_gripper_velocity.setRange(0, 100)
+        self.ur3_gripper_velocity.setSingleStep(5)
+        self.ur3_gripper_velocity.setSuffix(" %")
+        self.ur3_gripper_velocity.setValue(10)
+        self.ur3_gripper_force = QSpinBox()
+        self.ur3_gripper_force.setRange(0, 100)
+        self.ur3_gripper_force.setSingleStep(5)
+        self.ur3_gripper_force.setSuffix(" %")
+        self.ur3_gripper_force.setValue(30)
+        for column, (label, control) in enumerate((
+            ("Position", self.ur3_gripper_position),
+            ("Velocity", self.ur3_gripper_velocity),
+            ("Force", self.ur3_gripper_force),
+        )):
+            grip_grid.addWidget(QLabel(label), 0, column)
+            grip_grid.addWidget(control, 1, column)
+        self.ur3_gripper_move_button = QPushButton("MOVE GRIPPER")
+        self.ur3_gripper_move_button.clicked.connect(self.move_ur3_gripper)
+        self.ur3_gripper_move_button.setToolTip(
+            "Send the selected opening/speed/force ONCE. Editing values does not move."
+        )
+        grip_grid.addWidget(self.ur3_gripper_move_button, 1, 3)
+        self.ur3_gripper_info = QLabel("Setpoint only — not measured feedback")
+        grip_grid.addWidget(self.ur3_gripper_info, 2, 0, 1, 4)
+        ur3_layout.addWidget(self.ur3_gripper_group)
+        # UR3-only Cartesian deadman joystick. No commands until user arms it.
+        self.ur3_jog_group = QGroupBox("UR3 Cartesian Joystick (BASE)")
+        jog_grid = QGridLayout(self.ur3_jog_group)
+        self.ur3_jog_mode = QComboBox()
+        self.ur3_jog_mode.addItems(["position", "velocity"])
+        self.ur3_jog_speed = QDoubleSpinBox()
+        self.ur3_jog_speed.setRange(10., 50.)
+        self.ur3_jog_speed.setValue(10.)
+        self.ur3_jog_speed.setDecimals(1)
+        self.ur3_jog_speed.setSuffix(" mm/s")
+        self.ur3_jog_toggle = QPushButton("ARM JOYSTICK")
+        self.ur3_jog_toggle.clicked.connect(self._ur3_jog_toggle)
+        self.ur3_jog_status = QLabel("DISARMED — HOME available")
+        jog_grid.addWidget(QLabel("Controller"), 0, 0)
+        jog_grid.addWidget(self.ur3_jog_mode, 0, 1)
+        jog_grid.addWidget(QLabel("Linear speed"), 0, 2)
+        jog_grid.addWidget(self.ur3_jog_speed, 0, 3)
+        jog_grid.addWidget(self.ur3_jog_toggle, 0, 4)
+        jog_grid.addWidget(self.ur3_jog_status, 1, 0, 1, 5)
+        self.ur3_jog_key_label = QLabel("Keyboard: Z selected | X/Y/Z + ↑/↓ | Space: STOP")
+        jog_grid.addWidget(self.ur3_jog_key_label, 6, 0, 1, 6)
+        # Parallel translation/rotation columns. Same press/hold behavior.
+        jog_grid.addWidget(QLabel("Translation (mm/s)"), 2, 0, 1, 3)
+        jog_grid.addWidget(QLabel("Rotation"), 2, 3, 1, 3)
+        for col_base, axes in ((0, ("X", "Y", "Z")), (3, ("RX", "RY", "RZ"))):
+            for i, axis in enumerate(axes):
+                jog_grid.addWidget(QLabel(axis), 3 + i, col_base)
+                for offset, sign, text in ((1, 1, "+"), (2, -1, "−")):
+                    button = QPushButton(text)
+                    button.setFixedWidth(32)
+                    button.setEnabled(False)
+                    button.pressed.connect(lambda a=axis, d=sign: self._ur3_jog_press(a, d))
+                    button.released.connect(self._ur3_jog_release)
+                    jog_grid.addWidget(button, 3 + i, col_base + offset)
+                    if not hasattr(self, "ur3_jog_buttons"):
+                        self.ur3_jog_buttons = []
+                    self.ur3_jog_buttons.append(button)
+        ur3_layout.addWidget(self.ur3_jog_group)
 
         main_layout.addWidget(
             self.ur3_group
@@ -7244,6 +7371,10 @@ class WorkcellUI(QMainWindow):
             and motion_idle
             and single_ur3
         )
+        self.ur3_gripper_move_button.setEnabled(
+            system_running and single_ur3
+            and self.ur3_gripper_process.state() == QProcess.NotRunning
+        )
 
         dual_real = (
             dual
@@ -7418,6 +7549,216 @@ class WorkcellUI(QMainWindow):
         self.update_gripper_buttons()
         self.update_experiment_controls()
 
+    def move_ur3_gripper(self):
+        """Explicit one-shot command; never publish from spinbox value changes."""
+        if (self.setup_combo.currentText() != "Single UR3"
+                or self.system_state() != "RUNNING"
+                or self.ur3_gripper_process.state() != QProcess.NotRunning):
+            return
+        position = self.ur3_gripper_position.value()
+        velocity = self.ur3_gripper_velocity.value()
+        force = self.ur3_gripper_force.value()
+        real = self.mode_combo.currentText() == "Real Robot(s)"
+        if real:
+            choice = QMessageBox.question(
+                self, "Move real Robotiq 2F-140",
+                f"Command opening {position:.1f} mm, speed {velocity}%, "
+                f"force {force}%?\n\nKeep fingers and objects clear.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+            topic, typ = "/ur3_robotiq/command", "std_msgs/msg/Float64MultiArray"
+            value = f"{{data: [{position:.1f}, {velocity:.1f}, {force:.1f}]}}"
+        else:
+            topic, typ = "/robotiq_visual/position", "std_msgs/msg/Float64"
+            value = f"{{data: {position / 140.0:.6f}}}"
+        # CLI subprocess is intentionally short-lived and does not interact with
+        # the UI ROS executor. --once requires a matching subscriber.
+        command = ["ros2", "topic", "pub", "--once", topic, typ, value]
+        self.ur3_gripper_move_button.setEnabled(False)
+        self.ur3_gripper_info.setText("Publishing setpoint (not motion confirmation)...")
+        self.log_output.appendPlainText("\n$ " + shlex.join(command))
+        self.ur3_gripper_process.start(command[0], command[1:])
+        QTimer.singleShot(6000, self._ur3_gripper_publish_timeout)
+
+    def _ur3_gripper_publish_timeout(self):
+        if self.ur3_gripper_process.state() != QProcess.NotRunning:
+            self.log_output.appendPlainText("[UR3 GRIPPER: ROS subscriber timeout]")
+            self.ur3_gripper_process.kill()
+
+    def _read_ur3_gripper_output(self):
+        output = bytes(self.ur3_gripper_process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if output.strip():
+            self.log_output.appendPlainText(output.rstrip())
+
+    def _ur3_gripper_finished(self, exit_code, exit_status):
+        if exit_code == 0 and exit_status == QProcess.NormalExit:
+            self.ur3_gripper_info.setText("Setpoint published; physical motion unverified")
+        else:
+            self.ur3_gripper_info.setText("Publish failed — inspect log")
+        self.ur3_gripper_move_button.setEnabled(
+            self.setup_combo.currentText() == "Single UR3"
+            and self.system_state() == "RUNNING"
+        )
+
+    def _ur3_jog_app_state_changed(self, state):
+        if state != Qt.ApplicationActive:
+            self._ur3_jog_release()
+
+    def eventFilter(self, watched, event):
+        # Keyboard jog is active only while the Workcell UI has focus.
+        # Never hijack text fields, spin boxes, dropdowns or editable widgets.
+        if not hasattr(self, "ur3_jog_armed") or not self.ur3_jog_armed:
+            return super().eventFilter(watched, event)
+        if event.type() in (QEvent.WindowDeactivate, QEvent.ApplicationDeactivate):
+            self._ur3_jog_release()
+            return super().eventFilter(watched, event)
+        if not self.isActiveWindow() or self.setup_combo.currentText() != "Single UR3":
+            return super().eventFilter(watched, event)
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
+            if self.ur3_jog_keyboard_direction is not None:
+                self._ur3_jog_release()
+            return super().eventFilter(watched, event)
+        if event.type() not in (QEvent.KeyPress, QEvent.KeyRelease):
+            return super().eventFilter(watched, event)
+        key = event.key()
+        if key not in (Qt.Key_X, Qt.Key_Y, Qt.Key_Z, Qt.Key_Up, Qt.Key_Down, Qt.Key_Space):
+            return super().eventFilter(watched, event)
+        if event.isAutoRepeat():
+            return True
+        if event.type() == QEvent.KeyPress:
+            if key in (Qt.Key_X, Qt.Key_Y, Qt.Key_Z):
+                self._ur3_jog_release()
+                self.ur3_jog_selected_axis = {Qt.Key_X:"X", Qt.Key_Y:"Y", Qt.Key_Z:"Z"}[key]
+                self.ur3_jog_key_label.setText(
+                    f"Keyboard: {self.ur3_jog_selected_axis} selected | ↑/+ ↓/− | Space: STOP")
+            elif key == Qt.Key_Space:
+                self._ur3_jog_release()
+            else:
+                self._ur3_jog_release()
+                self.ur3_jog_keyboard_direction = key
+                self._ur3_jog_press(self.ur3_jog_selected_axis, 1 if key == Qt.Key_Up else -1)
+        elif key in (Qt.Key_Up, Qt.Key_Down) and self.ur3_jog_keyboard_direction == key:
+            self._ur3_jog_release()
+        return True
+
+    def _ur3_jog_send(self, command):
+        if self.ur3_jog_process.state() == QProcess.Running:
+            self.ur3_jog_process.write((command + "\n").encode("ascii"))
+
+    def _ur3_jog_toggle(self):
+        if self.ur3_jog_pending:
+            return
+        if self.ur3_jog_armed:
+            self._ur3_jog_release()
+            self.ur3_jog_pending = True
+            self.ur3_jog_toggle.setEnabled(False)
+            self.ur3_jog_status.setText("Restoring trajectory controller...")
+            self._ur3_jog_send("DISARM")
+            return
+        if self.setup_combo.currentText() != "Single UR3" or self.system_state() != "RUNNING":
+            QMessageBox.warning(self, "UR3 joystick", "Start the Single UR3 system first.")
+            return
+        if self.home_process.state() != QProcess.NotRunning:
+            QMessageBox.warning(self, "UR3 joystick", "HOME is currently running.")
+            return
+        answer = QMessageBox.question(
+            self, "UR3 joystick controller switch",
+            "Switch away from the HOME trajectory controller?\n"
+            "Keep the workspace clear and the physical stop within reach.\n"
+            "Never use the joystick when the robot is in contact with objects.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self.ur3_jog_pending = True
+        self.ur3_jog_toggle.setEnabled(False)
+        self.ur3_jog_mode.setEnabled(False)
+        if self.ur3_jog_process.state() == QProcess.Running:
+            self.ur3_jog_status.setText("Arming joystick...")
+            self._ur3_jog_send("ARM " + self.ur3_jog_mode.currentText())
+        elif self.ur3_jog_process.state() == QProcess.NotRunning:
+            self.ur3_jog_status.setText("Starting joystick process...")
+            self.ur3_jog_process.start("ros2", ["run", "ur7e_tools", "ur3_jog_backend"])
+        else:
+            # Avoid commands while QProcess is Starting / Stopping.
+            self.ur3_jog_pending = False
+            self.ur3_jog_toggle.setEnabled(True)
+            self.ur3_jog_mode.setEnabled(True)
+            self.ur3_jog_status.setText("Joystick process busy; retry")
+
+    def _ur3_jog_output(self):
+        output = bytes(self.ur3_jog_process.readAllStandardOutput()).decode("utf-8", "replace")
+        for line in output.splitlines():
+            if "READY —" in line and self.ur3_jog_pending:
+                self._ur3_jog_send("ARM " + self.ur3_jog_mode.currentText())
+            elif "ARMED " in line and "DISARMED" not in line:
+                self.ur3_jog_armed = True
+                self.ur3_jog_pending = False
+                for button in self.ur3_jog_buttons:
+                    button.setEnabled(True)
+                self.ur3_jog_toggle.setEnabled(True)
+                self.ur3_jog_toggle.setText("DISARM / RESTORE HOME")
+                self.ur3_jog_status.setText(line)
+                self.ur3_home_button.setEnabled(False)
+            elif "DISARMED " in line:
+                self.ur3_jog_armed = False
+                self.ur3_jog_pending = False
+                self._ur3_jog_release()
+                self.ur3_jog_toggle.setEnabled(True)
+                self.ur3_jog_toggle.setText("ARM JOYSTICK")
+                self.ur3_jog_mode.setEnabled(True)
+                self.ur3_jog_status.setText(line)
+                self.ur3_home_button.setEnabled(self.system_state() == "RUNNING")
+                for button in self.ur3_jog_buttons:
+                    button.setEnabled(False)
+                # Keep the ready backend alive so a different mode can be armed.
+            elif "ERROR" in line:
+                self.ur3_jog_pending = True
+                self.ur3_jog_toggle.setEnabled(False)
+                self._ur3_jog_release()
+                self.ur3_jog_status.setText(line)
+                self._ur3_jog_send("DISARM")
+                self.log_output.appendPlainText("[UR3 joystick] " + line)
+
+    def _ur3_jog_finished(self, code, status):
+        self.ur3_jog_timer.stop()
+        self.ur3_jog_axis = None
+        self.ur3_jog_keyboard_direction = None
+        self.ur3_jog_pending = False
+        self.ur3_jog_armed = False
+        for button in self.ur3_jog_buttons:
+            button.setEnabled(False)
+        # A crashed backend cannot guarantee the trajectory controller was restored.
+        self.ur3_jog_toggle.setEnabled(False)
+        self.ur3_jog_toggle.setText("ARM JOYSTICK")
+        self.ur3_jog_mode.setEnabled(True)
+        self.ur3_jog_status.setText("Backend stopped — verify controllers before restarting UI")
+        self.ur3_home_button.setEnabled(False)
+
+    def _ur3_jog_press(self, axis, sign):
+        if not self.ur3_jog_armed:
+            return
+        self.ur3_jog_axis = (axis, sign)
+        self._ur3_jog_heartbeat()
+        self.ur3_jog_timer.start()
+
+    def _ur3_jog_heartbeat(self):
+        if not self.ur3_jog_armed or self.ur3_jog_axis is None:
+            self._ur3_jog_release()
+            return
+        axis, sign = self.ur3_jog_axis
+        self._ur3_jog_send(f"JOG {axis} {sign} {self.ur3_jog_speed.value():.2f}")
+
+    def _ur3_jog_release(self):
+        self.ur3_jog_timer.stop()
+        self.ur3_jog_axis = None
+        self.ur3_jog_keyboard_direction = None
+        self._ur3_jog_send("STOP")
+
     def move_to_home(self, target):
         """Legacy UR3 HOME entry point; dual robots use saved_pose safely."""
 
@@ -7454,7 +7795,7 @@ class WorkcellUI(QMainWindow):
 
         command = (
             "ros2 run ur7e_tools home_pose "
-            "--target ur3 --move --duration 5.0"
+            "--target ur3 --move --duration 3.5"
         )
 
         full_command = (
@@ -7568,7 +7909,7 @@ class WorkcellUI(QMainWindow):
             f"--target {shlex.quote(robot)} "
             "--move "
             f"--pose {shlex.quote(pose_name)} "
-            "--duration 5.0 "
+            "--duration 3.5 "
             "--yes"
         )
 
@@ -7737,6 +8078,44 @@ class WorkcellUI(QMainWindow):
     def participant_reference_root(self):
         return Path("~/phd_polishing_experiments/results/human_reference").expanduser()
 
+    def proactive_model_root(self):
+        return Path(
+            "~/phd_polishing_experiments/results/wrench_models"
+        ).expanduser()
+
+    def discover_proactive_training_ids(self, task_name):
+        """Training IDs that have all models required by the selected task."""
+        root = self.proactive_model_root()
+
+        normalized = str(task_name).strip().lower()
+        if normalized in {"full", "full protocol"}:
+            gestures = ("compound", "polishing")
+        elif normalized == "compound":
+            gestures = ("compound",)
+        elif normalized == "polishing":
+            gestures = ("polishing",)
+        else:
+            return []
+
+        available_sets = []
+        for gesture in gestures:
+            gesture_root = root / gesture
+            ids = set()
+            if gesture_root.is_dir():
+                for directory in gesture_root.iterdir():
+                    if (
+                        directory.is_dir()
+                        and (directory / "model_artifact.json").is_file()
+                    ):
+                        ids.add(directory.name)
+            available_sets.append(ids)
+
+        if not available_sets:
+            return []
+
+        common = set.intersection(*available_sets)
+        return sorted(common)
+
     def participant_reference_helpers(self):
         return reference_helpers(Path("~/phd_polishing_experiments").expanduser())
 
@@ -7781,6 +8160,15 @@ class WorkcellUI(QMainWindow):
                     blockers.append("participant references: no participant has both required gesture files")
             except (OSError, ImportError, ValueError) as exc:
                 blockers.append(f"participant references: {exc}")
+
+            if selection[1] == "Right" and selection[2] == "Proactive":
+                training_ids = self.discover_proactive_training_ids(
+                    selection[0]
+                )
+                if not training_ids:
+                    blockers.append(
+                        "proactive training: no compatible trained model set"
+                    )
         return blockers
 
     def log_experiment_play_blockers(self, blockers):
@@ -7827,7 +8215,7 @@ class WorkcellUI(QMainWindow):
         )
         if hasattr(self, "experiment_speed_spin"):
             self.experiment_speed_spin.setEnabled(
-                experiment_task_uses_ui_speed(selection[0])
+                experiment_selection_uses_ui_speed(selection)
             )
 
         analysis_has_trial = (
@@ -7917,6 +8305,44 @@ class WorkcellUI(QMainWindow):
             QMessageBox.critical(self, "Participant references unavailable", str(exc))
             return
 
+        proactive_training_id = None
+        if selection[1] == "Right" and selection[2] == "Proactive":
+            training_ids = self.discover_proactive_training_ids(
+                selection[0]
+            )
+            if not training_ids:
+                message = (
+                    "No compatible trained proactive model set is available "
+                    f"for {selection[0]}."
+                )
+                self.log_output.appendPlainText(
+                    f"[PLAY BLOCKED] proactive training: {message}"
+                )
+                QMessageBox.critical(
+                    self,
+                    "Proactive training unavailable",
+                    message,
+                )
+                return
+
+            proactive_training_id, accepted = QInputDialog.getItem(
+                self,
+                "Select proactive training",
+                "Training set",
+                training_ids,
+                0,
+                False,
+            )
+            if not accepted:
+                self.log_output.appendPlainText(
+                    "[PLAY BLOCKED] proactive training selection cancelled"
+                )
+                return
+
+            self.log_output.appendPlainText(
+                f"Proactive training: {proactive_training_id}"
+            )
+
         speed_scale = float(self.experiment_speed_spin.value()) / 100.0
         self.log_output.appendPlainText("[PLAY] Runtime gates passed")
         self.log_output.appendPlainText(f"[PLAY] Selection: {selection}")
@@ -7927,8 +8353,18 @@ class WorkcellUI(QMainWindow):
                 self, "Run experiment",
                 "Run the following REAL experiment?\n\n"
                 f"{selection[0]} / {selection[1]} / {selection[2]} / {selection[3]}\n"
-                f"Participant: {reference_participant}\n\n"
-                + (f"Speed scale: {speed_scale:.2f} ×" if selection[1] == "Right" and selection[0] in {"Compound", "Polishing"} else "Backend protocol timing"),
+                f"Participant: {reference_participant}\n"
+                + (
+                    f"Training: {proactive_training_id}\n"
+                    if proactive_training_id
+                    else ""
+                )
+                + "\n"
+                + (
+                    f"Speed scale: {speed_scale:.2f} ×"
+                    if experiment_selection_uses_ui_speed(selection)
+                    else "Backend protocol timing"
+                ),
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
@@ -7946,17 +8382,35 @@ class WorkcellUI(QMainWindow):
         if selection[1] == "Right":
             backend_extra_args += " --task " + shlex.quote(direct_launch["task"])
             backend_extra_args += " --participant " + shlex.quote(reference_participant)
-            if selection[0] in {"Compound", "Polishing"}:
+            if selection[2] == "Proactive":
+                backend_extra_args += (
+                    " --training-id "
+                    + shlex.quote(proactive_training_id)
+                )
+            if experiment_selection_uses_ui_speed(selection):
                 backend_extra_args += f" --speed-scale {speed_scale:.2f}"
         else:
             backend_extra_args += " --protocol single --reference-participant " + shlex.quote(reference_participant)
 
         workspace_setup = os.path.expanduser("~/ros2_ws/install/setup.bash")
+
+        # Proactive runtime needs the scientific environment (pandas/scipy).
+        # OL/RC keep using the system ROS Python exactly as before.
+        if selection[1] == "Right" and selection[2] == "Proactive":
+            python_executable = project_root / ".venv_data" / "bin" / "python3"
+            if not python_executable.is_file():
+                message = f"Proactive Python environment not found:\n{python_executable}"
+                self.log_output.appendPlainText(f"[PLAY BLOCKED] {message}")
+                QMessageBox.critical(self, "Proactive environment unavailable", message)
+                return
+        else:
+            python_executable = Path("/usr/bin/python3")
+
         full_command = (
             "source /opt/ros/humble/setup.bash"
             f" && source {shlex.quote(workspace_setup)}"
             f" && cd {shlex.quote(str(project_root))}"
-            " && exec setsid /usr/bin/python3 -u -m "
+            f" && exec setsid {shlex.quote(str(python_executable))} -u -m "
             f"{shlex.quote(direct_launch['module'])}"
             f"{backend_extra_args}"
         )
@@ -7969,14 +8423,24 @@ class WorkcellUI(QMainWindow):
             return
 
         self.active_experiment = selection
-        speed_log = (f"Speed scale: {speed_scale:.2f} ×\n" if selection[1] == "Right" and selection[0] in {"Compound", "Polishing"} else "Speed: backend protocol timing\n")
+        speed_log = (
+            f"Speed scale: {speed_scale:.2f} ×\n"
+            if experiment_selection_uses_ui_speed(selection)
+            else "Speed: backend protocol timing\n"
+        )
         self.log_output.appendPlainText(
             "\n============================================================\n"
             "RUN EXPERIMENT\n"
             "============================================================\n"
             f"Mode: {self.mode_combo.currentText()}\n"
             f"Gesture: {selection[0]}\nHand: {selection[1]}\nControl: {selection[2]}\nMotion: {selection[3]}\n"
-            f"Participant: {reference_participant}\n{speed_log}Backend: {backend}\n"
+            f"Participant: {reference_participant}\n"
+            + (
+                f"Training: {proactive_training_id}\n"
+                if proactive_training_id
+                else ""
+            )
+            + f"{speed_log}Backend: {backend}\n"
         )
         self.run_experiment_button.setEnabled(False)
         self.robot1_home_button.setEnabled(False)
@@ -9099,6 +9563,14 @@ class WorkcellUI(QMainWindow):
         return True
 
     def stop_system(self):
+        # Stop UR3 jogging before shutting down the ROS controller manager.
+        if hasattr(self, "ur3_jog_process") and self.ur3_jog_process.state() != QProcess.NotRunning:
+            self._ur3_jog_release()
+            self._ur3_jog_send("DISARM")
+            self.ur3_jog_process.waitForFinished(1800)
+            if self.ur3_jog_process.state() != QProcess.NotRunning:
+                self.ur3_jog_process.terminate()
+                self.ur3_jog_process.waitForFinished(500)
 
         if (
             self.experiment_process.state()
@@ -9481,6 +9953,14 @@ class WorkcellUI(QMainWindow):
         self,
         event
     ):
+
+        if hasattr(self, "ur3_jog_process") and self.ur3_jog_process.state() != QProcess.NotRunning:
+            self._ur3_jog_release()
+            self._ur3_jog_send("DISARM")
+            self.ur3_jog_process.waitForFinished(1800)
+            if self.ur3_jog_process.state() != QProcess.NotRunning:
+                self.ur3_jog_process.terminate()
+                self.ur3_jog_process.waitForFinished(500)
 
         if hasattr(self, "lower_workspace_splitter"):
             self.settings.setValue(
