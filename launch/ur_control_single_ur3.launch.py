@@ -389,10 +389,7 @@ def launch_setup(context, *args, **kwargs):
         ],
     )
 
-    if use_fake_hardware.perform(context).lower() == "true":
-        rsp_joint_states_topic = "visual_joint_states"
-    else:
-        rsp_joint_states_topic = "joint_states"
+    rsp_joint_states_topic = "visual_joint_states"
 
     robot_state_publisher_node = Node(
         package="robot_state_publisher",

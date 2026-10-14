@@ -7,7 +7,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -23,6 +23,8 @@ def generate_launch_description():
     ur_type = LaunchConfiguration("ur_type")
 
     own_share = get_package_share_directory("ur7e_tools")
+
+    ur3_calibration = os.path.join(own_share, "config", "calibration", "ur3_cb.yaml")
 
     # ------------------------------------------------------------------
     # Vention workcell
@@ -86,10 +88,18 @@ def generate_launch_description():
         executable="robotiq_gripper_visualizer",
         name="robotiq_gripper_visualizer",
         output="screen",
-        condition=IfCondition(use_fake_hardware),
         parameters=[
             {"gripper_joint_name": "gripper_finger_joint"}
         ],
+    )
+
+    robotiq_controller = Node(
+        package="ur7e_tools",
+        executable="ur3_robotiq_controller",
+        name="ur3_robotiq_controller",
+        output="screen",
+        condition=UnlessCondition(use_fake_hardware),
+        parameters=[{"bind_host": "0.0.0.0", "port": 5001}],
     )
 
     robot = IncludeLaunchDescription(
@@ -97,6 +107,7 @@ def generate_launch_description():
         launch_arguments={
             "ur_type": ur_type,
             "robot_ip": robot_ip,
+            "kinematics_params_file": ur3_calibration,
 
             "tf_prefix": "",
             "base_x": "-0.38",
@@ -105,6 +116,8 @@ def generate_launch_description():
 
             "use_fake_hardware": use_fake_hardware,
             "fake_sensor_commands": "true",
+
+            "activate_joint_controller": "true",
 
             "initial_joint_controller":
                 "joint_trajectory_controller",
@@ -143,6 +156,7 @@ def generate_launch_description():
 
         workcell_state_publisher,
         robotiq_visualizer,
+        robotiq_controller,
         rviz_node,
         robot,
         

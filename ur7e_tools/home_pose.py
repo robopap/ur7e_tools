@@ -27,6 +27,10 @@ BASE_JOINTS = [
 
 
 TARGETS = {
+    "ur3": {
+        "namespace": "",
+        "prefix": "",
+    },
     "ur5": {
         "namespace": "",
         "prefix": "",
@@ -44,6 +48,9 @@ TARGETS = {
 
 
 CONFIG_FILES = {
+    "ur3": os.path.expanduser(
+        "~/ros2_ws/src/ur7e_tools/config/home_ur3.yaml"
+    ),
     "ur5": os.path.expanduser(
         "~/ros2_ws/src/ur7e_tools/config/home_ur5.yaml"
     ),
@@ -335,6 +342,7 @@ def main():
         "--target",
         required=True,
         choices=[
+            "ur3",
             "ur5",
             "robot1",
             "robot2",

@@ -45,6 +45,8 @@ setup(
             'home_pose = ur7e_tools.home_pose:main',
             'gripper_visualizer = ur7e_tools.gripper_visualizer:main',
             'robotiq_gripper_visualizer = ur7e_tools.robotiq_gripper_visualizer:main',
+            'ur3_robotiq_controller = ur7e_tools.ur3_robotiq_controller:main',
+            'ur3_jog_backend = ur7e_tools.ur3_jog_backend:main',
             'ft_sensor = ur7e_tools.ft_sensor_node:main',
         ],
     },
